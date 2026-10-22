@@ -11554,6 +11554,58 @@
         }
       }
     },
+    "/api/v1/streaming/program-status": {
+      "get": {
+        "tags": [
+          "streaming"
+        ],
+        "summary": "Program status",
+        "description": "Served route `GET /api/v1/streaming/program-status`. Handler: `handleProgramStatusV1`. Response payload is not registered in the robot schema registry; the generic success envelope documents only the envelope fields.",
+        "operationId": "get_api_v1_streaming_program_status",
+        "responses": {
+          "200": {
+            "description": "Successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/streaming/stats": {
       "get": {
         "tags": [

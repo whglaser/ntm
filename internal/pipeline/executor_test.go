@@ -1719,9 +1719,9 @@ func TestDetectAgentState_DryRun(t *testing.T) {
 	e := NewExecutor(cfg)
 
 	// DryRun mode should return empty string
-	result := e.detectAgentState("pane-1")
-	if result != "" {
-		t.Errorf("detectAgentState in DryRun = %q, want empty string", result)
+	result, source := e.detectAgentState("pane-1")
+	if result != "" || source != "" {
+		t.Errorf("detectAgentState in DryRun = (%q, %q), want empty", result, source)
 	}
 }
 
@@ -1730,9 +1730,9 @@ func TestDetectAgentState_EmptyPaneID(t *testing.T) {
 	e := NewExecutor(cfg)
 
 	// Empty paneID should return empty string
-	result := e.detectAgentState("")
-	if result != "" {
-		t.Errorf("detectAgentState with empty paneID = %q, want empty string", result)
+	result, source := e.detectAgentState("")
+	if result != "" || source != "" {
+		t.Errorf("detectAgentState with empty paneID = (%q, %q), want empty", result, source)
 	}
 }
 
@@ -2088,13 +2088,16 @@ func TestDetectAgentState_WithMockDetector(t *testing.T) {
 
 	e.detector = &mockDetector{
 		detectFunc: func(paneID string) (status.AgentStatus, error) {
-			return status.AgentStatus{State: status.StateIdle, PaneID: paneID}, nil
+			return status.AgentStatus{State: status.StateIdle, PaneID: paneID, StateSource: status.StateSourceOSC}, nil
 		},
 	}
 
-	result := e.detectAgentState("mock-pane")
+	result, source := e.detectAgentState("mock-pane")
 	if result != "idle" {
 		t.Errorf("detectAgentState() = %q, want %q", result, "idle")
+	}
+	if source != string(status.StateSourceOSC) {
+		t.Errorf("detectAgentState() source = %q, want osc", source)
 	}
 }
 
@@ -2110,7 +2113,7 @@ func TestDetectAgentState_WorkingState(t *testing.T) {
 		},
 	}
 
-	result := e.detectAgentState("mock-pane")
+	result, _ := e.detectAgentState("mock-pane")
 	if result != "working" {
 		t.Errorf("detectAgentState() = %q, want %q", result, "working")
 	}
@@ -2128,9 +2131,12 @@ func TestDetectAgentState_ErrorReturnsUnknown(t *testing.T) {
 		},
 	}
 
-	result := e.detectAgentState("mock-pane")
+	result, source := e.detectAgentState("mock-pane")
 	if result != "unknown" {
 		t.Errorf("detectAgentState() = %q, want %q", result, "unknown")
+	}
+	if source != "" {
+		t.Errorf("detectAgentState() source = %q, want empty on error", source)
 	}
 }
 

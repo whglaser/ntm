@@ -83,6 +83,19 @@ func (e ErrorType) String() string {
 	return string(e)
 }
 
+// StateSource identifies which evidence source produced an AgentStatus.State.
+// It makes the authority of a state estimate auditable: an "osc" state is the
+// agent's own OSC 7501 report, a "scrape" state is inferred from pane
+// content.
+type StateSource string
+
+const (
+	// StateSourceOSC means an OSC 7501 program-status report decided the state.
+	StateSourceOSC StateSource = "osc"
+	// StateSourceScrape means pane-content analysis decided the state.
+	StateSourceScrape StateSource = "scrape"
+)
+
 // AgentStatus represents the full status of an agent pane
 type AgentStatus struct {
 	// PaneID is the tmux pane identifier (e.g., "%0")
@@ -93,6 +106,9 @@ type AgentStatus struct {
 	AgentType string `json:"agent_type"`
 	// State is the current agent state
 	State AgentState `json:"state"`
+	// StateSource identifies which source decided State ("osc" or "scrape").
+	// Absent when the producing path does not participate in source reporting.
+	StateSource StateSource `json:"state_source,omitempty"`
 	// ErrorType categorizes the error if State == StateError
 	ErrorType ErrorType `json:"error_type,omitempty"`
 	// LastActive is when the pane last had output activity

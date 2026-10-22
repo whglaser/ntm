@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/dispatch"
+	"github.com/Dicklesworthstone/ntm/internal/programstatus"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
 	"github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
@@ -156,6 +157,12 @@ type Executor struct {
 	paneLockMu sync.Mutex
 	paneLocks  map[string]chan struct{}
 
+	// programStatusMu guards the OSC 7501 capture lifecycle (program_status.go).
+	programStatusMu       sync.Mutex
+	programStatusObserver *programstatus.Observer
+	programStatusStreams  *tmux.StreamManager
+	programStatusWrapped  bool
+
 	mailClients agentMailClientCache
 
 	// Renewal and explicit release share one owner so a heartbeat cannot
@@ -268,6 +275,8 @@ func (e *Executor) Run(ctx context.Context, workflow *Workflow, vars map[string]
 		cancel()
 		e.backgroundCommandWG.Wait()
 	}()
+	// Retire OSC 7501 pane taps when the run ends; the executor is reusable.
+	defer e.stopProgramStatusCapture()
 
 	// Initialize execution state
 	runID := e.config.RunID
@@ -405,6 +414,8 @@ func (e *Executor) Resume(ctx context.Context, workflow *Workflow, prior *Execut
 		cancel()
 		e.backgroundCommandWG.Wait()
 	}()
+	// Retire OSC 7501 pane taps when the run ends; the executor is reusable.
+	defer e.stopProgramStatusCapture()
 
 	e.stateMu.Lock()
 	e.backgroundCommandErrors = nil
@@ -1973,7 +1984,7 @@ func (e *Executor) executeAgentDelivery(ctx context.Context, step *Step, workflo
 		// has moved on.
 		if typ == "send" || typ == "timeout" {
 			result.Error.PaneOutput = e.captureErrorContext(result.PaneUsed, 50)
-			result.Error.AgentState = e.detectAgentState(result.PaneUsed)
+			result.Error.AgentState, result.Error.AgentStateSource = e.detectAgentState(result.PaneUsed)
 		}
 		return result
 	}
@@ -2006,6 +2017,11 @@ func (e *Executor) executeAgentDelivery(ctx context.Context, step *Step, workflo
 			paneID, agentType = record.PaneID, record.AgentType
 		}
 	}
+
+	// Start the OSC 7501 tap before the turn begins: pi reports a state
+	// change, so a tap attached after dispatch would miss working → done
+	// and leave only the unreliable scrape fallback.
+	e.ensureProgramStatusCapture(paneID)
 
 	release, err := e.acquirePaneLockCrossProcess(ctx, paneID)
 	if err != nil {
@@ -3937,16 +3953,18 @@ func (e *Executor) captureErrorContext(paneID string, lines int) string {
 	return output
 }
 
-// detectAgentState detects the current agent state for error context
-func (e *Executor) detectAgentState(paneID string) string {
+// detectAgentState detects the current agent state for error context. The
+// second result is the source that decided the state ("osc" or "scrape"),
+// empty when the detector does not report one.
+func (e *Executor) detectAgentState(paneID string) (string, string) {
 	if paneID == "" || e.config.DryRun {
-		return ""
+		return "", ""
 	}
 	state, err := e.detector.Detect(paneID)
 	if err != nil {
-		return "unknown"
+		return "unknown", ""
 	}
-	return string(state.State)
+	return string(state.State), string(state.StateSource)
 }
 
 // Validate validates a workflow without executing it
