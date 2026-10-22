@@ -3,6 +3,7 @@ package bv
 
 import (
 	"encoding/json"
+	"strings"
 	"time"
 )
 
@@ -18,10 +19,41 @@ type InsightsResponse struct {
 	Cycles [][]string `json:"Cycles,omitempty"`
 }
 
-// NodeScore represents a node with its metric score
+// NodeScore represents a node with its metric score. bv emits objects with
+// capitalized keys; beads_viewer_rust (bvr) emits either objects with
+// lowercase keys and a per-category metric name ("value" for hubs/
+// authorities, "score" for bottlenecks) or plain id strings (keystones,
+// orphans, critical path, slack). Decoding both here keeps one string element
+// from failing an entire insights response.
 type NodeScore struct {
 	ID    string  `json:"ID"`
 	Value float64 `json:"Value"`
+}
+
+// UnmarshalJSON accepts a bare id string or an object with ID plus either a
+// `value` or `score` metric.
+func (n *NodeScore) UnmarshalJSON(data []byte) error {
+	var id string
+	if err := json.Unmarshal(data, &id); err == nil {
+		*n = NodeScore{ID: id}
+		return nil
+	}
+	var wire struct {
+		ID    string   `json:"id"`
+		Value *float64 `json:"value"`
+		Score *float64 `json:"score"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	*n = NodeScore{ID: wire.ID}
+	switch {
+	case wire.Value != nil:
+		n.Value = *wire.Value
+	case wire.Score != nil:
+		n.Value = *wire.Score
+	}
+	return nil
 }
 
 // PriorityResponse contains priority recommendations
@@ -31,6 +63,7 @@ type PriorityResponse struct {
 }
 
 // PriorityRecommendation suggests priority adjustments
+// (bv) or triage-style next work (bvr --robot-priority).
 type PriorityRecommendation struct {
 	IssueID           string   `json:"issue_id"`
 	Title             string   `json:"title"`
@@ -40,6 +73,59 @@ type PriorityRecommendation struct {
 	Confidence        float64  `json:"confidence"`
 	Reasoning         []string `json:"reasoning"`
 	Direction         string   `json:"direction"` // "increase" or "decrease"
+}
+
+// UnmarshalJSON accepts bv's priority-adjustment shape
+// (issue_id/current_priority/suggested_priority/reasoning/direction) and
+// beads_viewer_rust (bvr)'s triage-style shape
+// (id/priority/reasons/impact_score; no suggested priority or direction).
+// bvr reuses its triage recommendation payload for --robot-priority, so
+// decoding only the legacy names left every IssueID empty and every priority
+// zero.
+func (p *PriorityRecommendation) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		IssueID           string   `json:"issue_id"`
+		ID                string   `json:"id"`
+		Title             string   `json:"title"`
+		CurrentPriority   *int     `json:"current_priority"`
+		SuggestedPriority *int     `json:"suggested_priority"`
+		Priority          *int     `json:"priority"`
+		ImpactScore       float64  `json:"impact_score"`
+		Confidence        float64  `json:"confidence"`
+		Reasoning         []string `json:"reasoning"`
+		Reasons           []string `json:"reasons"`
+		Direction         string   `json:"direction"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	p.IssueID = wire.IssueID
+	if p.IssueID == "" {
+		p.IssueID = wire.ID
+	}
+	p.Title = wire.Title
+	p.ImpactScore = wire.ImpactScore
+	p.Confidence = wire.Confidence
+	p.Reasoning = wire.Reasoning
+	if p.Reasoning == nil {
+		p.Reasoning = wire.Reasons
+	}
+	p.Direction = wire.Direction
+	switch {
+	case wire.CurrentPriority != nil:
+		p.CurrentPriority = *wire.CurrentPriority
+	case wire.Priority != nil:
+		p.CurrentPriority = *wire.Priority
+	}
+	switch {
+	case wire.SuggestedPriority != nil:
+		p.SuggestedPriority = *wire.SuggestedPriority
+	case wire.Priority != nil:
+		// bvr carries no suggested value; report the bead's own priority so
+		// consumers show a real number instead of zero.
+		p.SuggestedPriority = *wire.Priority
+	}
+	return nil
 }
 
 // PlanResponse contains parallel work plan
@@ -220,6 +306,7 @@ type BlockerToClear struct {
 }
 
 // ScoreBreakdown contains the components of a recommendation score
+// (normalized 0..1 criterion scores).
 type ScoreBreakdown struct {
 	Pagerank                float64 `json:"pagerank"`
 	Betweenness             float64 `json:"betweenness"`
@@ -232,6 +319,73 @@ type ScoreBreakdown struct {
 	TimeToImpactExplanation string  `json:"time_to_impact_explanation,omitempty"`
 	UrgencyExplanation      string  `json:"urgency_explanation,omitempty"`
 	RiskExplanation         string  `json:"risk_explanation,omitempty"`
+}
+
+// UnmarshalJSON accepts both shapes of a recommendation score breakdown:
+//
+//	object (bv): {"pagerank":0.42,"betweenness":0.1,...}
+//	rows (bvr):  [{"name":"PageRank","weight":0.22,"normalized":0.42,...}, ...]
+//
+// beads_viewer_rust keeps bv's robot flags but reports each criterion as a
+// row; decoding its rows as an object failed the whole triage response
+// ("cannot unmarshal array into Go struct field ... breakdown of type
+// bv.ScoreBreakdown"). Rows map by normalized criterion name, and the value
+// is `normalized` because that is the 0..1 scale bv's fields carried and
+// NTM's consumers threshold on (e.g. Betweenness > 0.1, markdown score rows).
+func (s *ScoreBreakdown) UnmarshalJSON(data []byte) error {
+	type alias ScoreBreakdown
+	var obj alias
+	if err := json.Unmarshal(data, &obj); err == nil {
+		*s = ScoreBreakdown(obj)
+		return nil
+	}
+
+	var rows []struct {
+		Name        string  `json:"name"`
+		Normalized  float64 `json:"normalized"`
+		Explanation string  `json:"explanation"`
+	}
+	if err := json.Unmarshal(data, &rows); err != nil {
+		return err
+	}
+	*s = ScoreBreakdown{}
+	for _, row := range rows {
+		switch normalizeBreakdownName(row.Name) {
+		case "pagerank":
+			s.Pagerank = row.Normalized
+		case "betweenness":
+			s.Betweenness = row.Normalized
+		case "blockerratio":
+			s.BlockerRatio = row.Normalized
+		case "staleness":
+			s.Staleness = row.Normalized
+		case "priorityboost":
+			s.PriorityBoost = row.Normalized
+		case "timetoimpact":
+			s.TimeToImpact = row.Normalized
+			s.TimeToImpactExplanation = row.Explanation
+		case "urgency":
+			s.Urgency = row.Normalized
+			s.UrgencyExplanation = row.Explanation
+		case "risk":
+			s.Risk = row.Normalized
+			s.RiskExplanation = row.Explanation
+		}
+	}
+	return nil
+}
+
+// normalizeBreakdownName folds a bvr criterion name ("PriorityBoost",
+// "time_to_impact") to a comparison key.
+func normalizeBreakdownName(name string) string {
+	var b strings.Builder
+	b.Grow(len(name))
+	for _, r := range strings.ToLower(strings.TrimSpace(name)) {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // ProjectHealth contains overall project health metrics
