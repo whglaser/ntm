@@ -79,6 +79,17 @@ type ExecutorConfig struct {
 
 	// ResumeOptions controls how Resume interprets prior persisted state.
 	ResumeOptions ResumeOptions
+
+	// IdleStablePolls is how many consecutive idle detections a completion
+	// wait requires before completing. Zero uses idleStablePolls (3). Raising
+	// it trades latency for tolerance of transient idle misreads; lowering it
+	// to 1 restores the old single-poll behavior and is not recommended.
+	IdleStablePolls int
+
+	// OutputStabilityWindow is how long every declared step output must be
+	// byte-identical before the artifact fallback completes a step. Zero uses
+	// DefaultOutputStabilityWindow. See Step.Outputs.
+	OutputStabilityWindow time.Duration
 }
 
 // MinProgressInterval is the minimum allowed progress interval to prevent ticker panics.
@@ -2018,11 +2029,6 @@ func (e *Executor) executeAgentDelivery(ctx context.Context, step *Step, workflo
 		}
 	}
 
-	// Start the OSC 7501 tap before the turn begins: pi reports a state
-	// change, so a tap attached after dispatch would miss working → done
-	// and leave only the unreliable scrape fallback.
-	e.ensureProgramStatusCapture(paneID)
-
 	release, err := e.acquirePaneLockCrossProcess(ctx, paneID)
 	if err != nil {
 		applyPaneLockFailure(&result, paneID, err)
@@ -2032,6 +2038,13 @@ func (e *Executor) executeAgentDelivery(ctx context.Context, step *Step, workflo
 	if e.stopBeforeDispatch(ctx, &result) {
 		return result
 	}
+
+	// Start the OSC 7501 tap and drop per-pane classification history only
+	// after the pane lock is held: a queued step targeting the same pane must
+	// not clear the state an in-flight step is waiting on. pi reports a state
+	// change, so the tap must be attached before the turn's prompt is pasted.
+	e.ensureProgramStatusCapture(paneID)
+	e.resetDetectorPaneState(paneID)
 	if !recorded {
 		endpoint := e.agentDeliveryEndpoint()
 		pane, err := e.agentDeliveryPane(ctx, paneID, 0, endpoint)
@@ -2200,7 +2213,7 @@ func (e *Executor) executeAgentDelivery(ctx context.Context, step *Step, workflo
 		deadline := time.Now().Add(timeout)
 		remaining := timeout
 		for {
-			if err := e.waitForIdle(ctx, paneID, remaining, collect); err != nil {
+			if err := e.waitForIdle(ctx, paneID, remaining, e.waitIdleOptionsForStep(step), collect); err != nil {
 				// Preserve partial output even when the deadline precedes the first
 				// idle poll. Cancellation never starts a new uncancelled capture.
 				if ctx.Err() == nil && e.checkpointFailure() == nil {
@@ -3264,13 +3277,25 @@ func submissionFailureMessage(err error) string {
 }
 
 // waitForIdle waits for an agent to return to a *stable* idle state: the
-// detector must report idle for idleStablePolls consecutive polls. Any
-// non-idle reading (or detector error) resets the streak.
+// detector must report idle for the configured idle streak (idleStablePolls
+// by default). Any non-idle reading (or detector error) resets the streak.
+//
+// opts also carries the declared-output fallback: when a step declares
+// outputs and every one of them has been byte-identical for the stability
+// window, the step completes even if the detector never reports idle. That
+// check is independent of pane state (and of the output-progress evidence),
+// so a stuck classification cannot block a step whose deliverable is already
+// on disk; a missing output can never complete it.
 //
 // This is only ever reached for a dispatch whose submission was confirmed:
 // idleness is meaningful evidence of completion for a prompt that is actually
 // running, and meaningless for one still sitting in the composer (ntm#320).
-func (e *Executor) waitForIdle(ctx context.Context, paneID string, timeout time.Duration, evidence ...func() (bool, error)) error {
+func (e *Executor) waitForIdle(ctx context.Context, paneID string, timeout time.Duration, opts waitIdleOptions, evidence ...func() (bool, error)) error {
+	stablePolls := opts.StablePolls
+	if stablePolls <= 0 {
+		stablePolls = idleStablePolls
+	}
+
 	ticker := time.NewTicker(e.config.ProgressInterval)
 	defer ticker.Stop()
 
@@ -3296,6 +3321,17 @@ func (e *Executor) waitForIdle(ctx context.Context, paneID string, timeout time.
 		case <-deadline.C:
 			return fmt.Errorf("timeout after %s", timeout)
 		case <-ticker.C:
+			// Artifact stability outranks pane state: the declared deliverable
+			// exists and stopped changing, so the step is complete even if the
+			// TUI still reads working (the answers-style stall).
+			if opts.Artifacts != nil && opts.Artifacts.satisfiedAt(time.Now()) {
+				slog.Info("pipeline.completion.artifact_stable",
+					"pane_id", paneID,
+					"paths", opts.Artifacts.watchedPaths(),
+					"window", opts.Artifacts.window,
+				)
+				return nil
+			}
 			fresh := true
 			for _, observe := range evidence {
 				ready, err := observe()
@@ -3311,7 +3347,7 @@ func (e *Executor) waitForIdle(ctx context.Context, paneID string, timeout time.
 			}
 			if state.State == status.StateIdle && fresh {
 				idleStreak++
-				if idleStreak >= idleStablePolls {
+				if idleStreak >= stablePolls {
 					return nil
 				}
 			} else {

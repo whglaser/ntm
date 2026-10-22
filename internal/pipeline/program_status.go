@@ -1,6 +1,8 @@
 package pipeline
 
 import (
+	"log/slog"
+
 	"github.com/Dicklesworthstone/ntm/internal/programstatus"
 	"github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
@@ -85,6 +87,24 @@ func (e *Executor) ensureProgramStatusCapture(paneID string) {
 	// optional authority is unavailable.
 	_ = e.programStatusStreams.StartStream(paneID)
 	e.programStatusMu.Unlock()
+}
+
+// resetDetectorPaneState drops per-pane classification history so a state
+// derived from a previous step cannot leak into this one (ntm-l6cuz.3). The
+// detector is wrapped (OSCDetector) in production, so the optional interface
+// is forwarded by the wrapper as well as implemented by UnifiedDetector.
+func (e *Executor) resetDetectorPaneState(paneID string) {
+	if paneID == "" {
+		return
+	}
+	if resetter, ok := e.detector.(interface{ ResetPane(string) }); ok {
+		resetter.ResetPane(paneID)
+		return
+	}
+	// A tracker that can only reset itself cannot be reached through the
+	// detector interface; record the gap instead of silently keeping stale
+	// classification state.
+	slog.Debug("pipeline.detector.reset_unavailable", "pane_id", paneID)
 }
 
 // stopProgramStatusCapture retires every tap started by
