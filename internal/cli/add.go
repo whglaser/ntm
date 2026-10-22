@@ -232,7 +232,7 @@ func resolveAddAgentCommandTemplate(agentType AgentType, pluginMap map[string]pl
 		return config.OmpCommandOrDefault(cfg.Agents.Omp), nil, nil
 	default:
 		if p, ok := pluginMap[string(agentType)]; ok {
-			return p.Command, p.Env, nil
+			return programStatusLaunchPrefix(agentType) + p.Command, p.Env, nil
 		}
 		return "", nil, fmt.Errorf("unknown agent type: %s", agentType)
 	}
