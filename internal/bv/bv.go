@@ -425,35 +425,48 @@ func CheckDrift(dir string) DriftResult {
 			}
 		}
 
-		switch code {
-		case 1:
-			// Could be critical drift or no baseline
-			if strings.Contains(message, "No baseline") {
-				return DriftResult{
-					Status:  DriftNoBaseline,
-					Message: message,
-				}
-			}
-			return DriftResult{
-				Status:  DriftCritical,
-				Message: message,
-			}
-		case 2:
-			return DriftResult{
-				Status:  DriftWarning,
-				Message: message,
-			}
-		default:
-			return DriftResult{
-				Status:  DriftStatus(code),
-				Message: message,
-			}
-		}
+		return classifyDriftExit(code, message)
 	}
 
 	return DriftResult{
 		Status:  DriftNoBaseline,
 		Message: err.Error(),
+	}
+}
+
+// classifyDriftExit maps a non-zero drift exit code and its message to a
+// DriftResult. bv reports an absent baseline as a message containing
+// "No baseline"; beads_viewer_rust (bvr) exits 1 with "failed to read
+// baseline: No such file or directory (os error 2)" and a "run
+// --save-baseline first" hint. Recognizing only bv's wording made every fresh
+// bvr workspace read as critical drift instead of no-baseline.
+func classifyDriftExit(code int, message string) DriftResult {
+	lowerMessage := strings.ToLower(message)
+	switch code {
+	case 1:
+		// Could be critical drift or no baseline
+		if strings.Contains(message, "No baseline") ||
+			(strings.Contains(lowerMessage, "baseline") &&
+				(strings.Contains(lowerMessage, "no such file") || strings.Contains(lowerMessage, "save-baseline"))) {
+			return DriftResult{
+				Status:  DriftNoBaseline,
+				Message: message,
+			}
+		}
+		return DriftResult{
+			Status:  DriftCritical,
+			Message: message,
+		}
+	case 2:
+		return DriftResult{
+			Status:  DriftWarning,
+			Message: message,
+		}
+	default:
+		return DriftResult{
+			Status:  DriftStatus(code),
+			Message: message,
+		}
 	}
 }
 
