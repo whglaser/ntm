@@ -4,6 +4,8 @@ package pipeline
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -378,5 +380,63 @@ func TestStartFrom_FromState_RestoresParallelChildOutputs(t *testing.T) {
 	}
 	if !strings.Contains(after.Output, "prior-research-output") || !strings.Contains(after.Output, "prior-prototype-output") {
 		t.Fatalf("after.Output = %q, want both prior child outputs substituted", after.Output)
+	}
+}
+
+// TestStartFrom_FromPersistedState_ReusesOutputsWithoutRerunning is the resume
+// playbook guard: a first run persists its outputs to the project state file,
+// the operator loads that run with LoadState and reruns with --start-from +
+// --from-state, and the skipped command must not execute again while its
+// persisted output still substitutes into the resumed step.
+func TestStartFrom_FromPersistedState_ReusesOutputsWithoutRerunning(t *testing.T) {
+	projectDir := t.TempDir()
+	workflow := func() *Workflow {
+		return &Workflow{
+			SchemaVersion: SchemaVersion,
+			Name:          "resume-persisted",
+			Settings:      DefaultWorkflowSettings(),
+			Steps: []Step{
+				{ID: "produce", Command: "printf 'run\n' >> produce-runs.txt; printf prior-output", OutputVar: "produced"},
+				{ID: "consume", DependsOn: []string{"produce"}, Command: "printf 'consumed %s' '${steps.produce.output}' > consume.txt"},
+			},
+		}
+	}
+
+	firstCfg := DefaultExecutorConfig("resume-session")
+	firstCfg.ProjectDir = projectDir
+	firstCfg.RunID = "run-resume-prior"
+	first, err := NewExecutor(firstCfg).Run(context.Background(), workflow(), nil, nil)
+	if err != nil || first.Status != StatusCompleted {
+		t.Fatalf("first run: %+v %v", first, err)
+	}
+
+	prior, err := LoadState(projectDir, "run-resume-prior")
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if prior.Steps["produce"].Output != "prior-output" {
+		t.Fatalf("persisted produce output = %q, want prior-output", prior.Steps["produce"].Output)
+	}
+
+	secondCfg := DefaultExecutorConfig("resume-session")
+	secondCfg.ProjectDir = projectDir
+	secondCfg.RunID = "run-resume-next"
+	secondCfg.StartFromStep = "consume"
+	secondCfg.StartFromState = prior
+	second, err := NewExecutor(secondCfg).Run(context.Background(), workflow(), nil, nil)
+	if err != nil || second.Status != StatusCompleted {
+		t.Fatalf("resumed run: %+v %v", second, err)
+	}
+
+	if got := second.Steps["produce"]; got.Status != StatusSkipped || got.Output != "prior-output" {
+		t.Fatalf("produce = %+v, want skipped with the persisted output", got)
+	}
+	runs, err := os.ReadFile(filepath.Join(projectDir, "produce-runs.txt"))
+	if err != nil || strings.Count(string(runs), "run\n") != 1 {
+		t.Fatalf("produce command ran again (runs=%q err=%v)", runs, err)
+	}
+	consumed, err := os.ReadFile(filepath.Join(projectDir, "consume.txt"))
+	if err != nil || string(consumed) != "consumed prior-output" {
+		t.Fatalf("consume = %q, %v; want the persisted output substituted", consumed, err)
 	}
 }
