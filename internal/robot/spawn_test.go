@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	agentpkg "github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
 	"github.com/Dicklesworthstone/ntm/internal/assignment"
 	"github.com/Dicklesworthstone/ntm/internal/bv"
@@ -923,6 +924,60 @@ func TestIsAgentReady_Patterns(t *testing.T) {
 					tc.output, tc.agentType, got, tc.expected)
 			}
 		})
+	}
+}
+
+// TestIsAgentReady_PluginPatterns pins the ntm-pnc64.2 fix: a registered
+// plugin agent's TUI (pi) matches none of the generic startup patterns, so
+// the ready-gate must consult the plugin's declared Idle/Working patterns.
+// Before that branch existed a healthy idle pi pane was "not ready" for the
+// entire gate and every respawn reported a false negative.
+func TestIsAgentReady_PluginPatterns(t *testing.T) {
+	// The exact pattern set installed by the pi plugin preset
+	// (~/.config/ntm/agents/pi.toml), verified against pi 1.3.0 chrome.
+	if err := agentpkg.RegisterPlugin(
+		"pi",
+		[]string{`^\s*─{4,}\s*$`},
+		[]string{`^\s*─{2,}\s*[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]`, `\(esc to interrupt\)`, `\(esc to cancel\)`},
+		nil,
+	); err != nil {
+		t.Fatalf("register pi plugin: %v", err)
+	}
+
+	// A pi composer at rest: two unadorned rules with the status row below.
+	const piIdle = "assistant transcript line\n\n" +
+		"────────────────────────────────────────\n\n" +
+		"────────────────────────────────────────\n" +
+		"~/proj (main)\n" +
+		"0.0%/1.0M (auto)  DeepSeek-V4.1-Flash\n"
+	// A live turn embeds the spinner in the top rule.
+	const piWorking = "assistant transcript line\n\n" +
+		"── ⠙ Working ────────────────────────────\n\n" +
+		"────────────────────────────────────────\n" +
+		"~/proj (main)\n" +
+		"0.0%/1.0M (auto)  DeepSeek-V4.1-Flash\n"
+
+	if !isAgentReady(piIdle, "pi") {
+		t.Fatal("idle pi composer must satisfy the ready-gate")
+	}
+	if !isAgentReady(piIdle, "PI") {
+		t.Fatal("type casing must still resolve the registered plugin")
+	}
+	if isAgentReady(piWorking, "pi") {
+		t.Fatal("pi pane with the Working spinner must not be ready")
+	}
+	if isAgentReady(piWorking+"Working (esc to interrupt)\n", "pi") {
+		t.Fatal("esc-hint work marker must veto readiness")
+	}
+	// While pi boots, the pane still shows the shell that typed the launch
+	// command; a bare shell prompt is not the agent TUI and must not count.
+	if isAgentReady("user@host:~$ ", "pi") {
+		t.Fatal("bare shell prompt must not satisfy a plugin ready-gate")
+	}
+	// Chrome that looks plugin-like without a registered type has no declared
+	// patterns to trust.
+	if isAgentReady(piIdle, "pnc64-unregistered") {
+		t.Fatal("unregistered type must not claim plugin readiness")
 	}
 }
 

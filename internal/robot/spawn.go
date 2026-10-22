@@ -33,12 +33,19 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/state"
 	statuspkg "github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
+	"github.com/Dicklesworthstone/ntm/internal/util"
 	"github.com/Dicklesworthstone/ntm/internal/worksource"
 )
 
 // readyWordRe matches "ready" as a whole word. A bare substring check also hit
 // "already", so lines like "Already up to date." read as an agent coming up.
 var readyWordRe = regexp.MustCompile(`\bready\b`)
+
+// pluginReadyScanLines bounds the trailing window scanned for a registered
+// plugin agent's declared Idle patterns. It matches the status package's
+// maxIdleScanLines so readiness and status agree on how far back idle chrome
+// may sit.
+const pluginReadyScanLines = 12
 
 // Pre-compiled prompt patterns for isAgentReady (anchored to end of lines or output).
 var promptPatterns = []*regexp.Regexp{
@@ -1860,19 +1867,38 @@ func waitForAgentsReadyWithCapture(
 // use the shared indicator substrings below; omp and OpenCode are decided by
 // their composers.
 func isAgentReady(output, agentType string) bool {
-	if tmux.AgentType(agentType).Canonical() == tmux.AgentOmp {
+	canonical := tmux.AgentType(agentType).Canonical()
+	if canonical == tmux.AgentOmp {
 		// omp paints nothing for ~1s after launch, then draws its banner and
 		// its status-line composer box in the same frame. The box (not a
 		// banner substring such as "Welcome back!") is the signal that a
 		// typed prompt will land in the composer.
 		return agentpkg.ParseOmpComposer(output).Found
 	}
-	if tmux.AgentType(agentType).Canonical() == tmux.AgentOpencode {
+	if canonical == tmux.AgentOpencode {
 		// OpenCode draws its bar-framed composer (with the "Ask anything"
 		// hint while empty) once the TUI accepts input. The generic
 		// indicators below would also fire on the launching shell's prompt
 		// or on the "OpenCode" splash, before the composer exists.
 		return tmux.OpencodeComposerVisible(output) || strings.Contains(strings.ToLower(output), "ask anything")
+	}
+	// Registered plugin agents (ntm#260) paint only their own chrome, which
+	// none of the generic patterns below match: a healthy idle pi pane stayed
+	// "not ready" for the whole gate, so every respawn reported a false
+	// negative while the pane was up and idle (ntm-pnc64.2). Their declared
+	// readiness patterns are the authority here — a live Working pattern
+	// vetoes readiness, and an Idle pattern must match in the trailing window.
+	// This deliberately does not reuse statuspkg.DetectIdleFromOutput, which
+	// also honours generic shell prompt lines: a just-relaunched plugin pane
+	// still shows the shell that typed the launch command, and that bare
+	// prompt is not the agent TUI.
+	if pluginType := agentpkg.AgentType(canonical); agentpkg.IsPluginType(pluginType) {
+		if agentpkg.PluginActivelyWorking(output, pluginType, 0) {
+			return false
+		}
+		tail := util.GetLastNLines(output, pluginReadyScanLines)
+		idle, declared := agentpkg.PluginIdlePromptShowing(tail, pluginType)
+		return declared && idle
 	}
 	lower := strings.ToLower(output)
 
