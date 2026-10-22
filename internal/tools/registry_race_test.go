@@ -21,10 +21,10 @@ func TestRegistry_ParallelRace(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// Concurrently call GetAllInfo and GetHealthReport
+	// Concurrently call GetAllInfoExcept and GetHealthReport
 	go func() {
 		defer wg.Done()
-		reg.GetAllInfo(context.Background())
+		reg.GetAllInfoExcept(context.Background(), nil)
 	}()
 
 	go func() {

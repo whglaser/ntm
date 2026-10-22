@@ -45,7 +45,6 @@ internal/bundle/manifest.go:Manifest.TotalSize	bd-ld4j2	reachable only through R
 internal/bundle/manifest.go:Manifest.Validate	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/cass/health.go:Client.Health	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/cass/health.go:Client.IsHealthy	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/cass/inject.go:QueryCASS	ntm-1ko3j	dead on all three GOOS at HEAD fed08c91; tested-but-unwired wrapper around queryCASSContext — wire to a surface or delete
 internal/cass/search.go:Client.SearchForContext	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/cass/search.go:Client.SearchQuick	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/cass/types.go:Capabilities.HasConnector	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
@@ -436,8 +435,6 @@ internal/tools/rch.go:RCHAdapter.HasHealthyWorkers	bd-ld4j2	reachable only throu
 internal/tools/rch.go:RCHAdapter.InvalidateAvailabilityCache	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tools/rch.go:RCHAdapter.IsAvailable	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tools/rch.go:RCHAdapter.SelectWorker	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tools/registry.go:GetAllInfo	ntm-1ko3j	dead on all three GOOS at HEAD fed08c91; package-level wrapper with only test callers — wire to the tools surface or delete
-internal/tools/registry.go:Registry.GetAllInfo	ntm-1ko3j	dead on all three GOOS at HEAD fed08c91; retained wrapper around GetAllInfoExcept with only test callers — wire or delete
 internal/tools/ru.go:RUAdapter.Doctor	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tools/ru.go:RUAdapter.GetStatus	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tools/ru.go:RUAdapter.Sync	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
@@ -500,8 +497,6 @@ internal/tui/theme/theme.go:Theme.Gradient	bd-ld4j2	reachable only through RTA's
 internal/tutorial/animations.go:Particle.Render	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tutorial/model.go:Model.GetCurrentSlide	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tutorial/model.go:Model.IsTransitioning	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/util/text.go:ExtractNewOutput	ntm-1ko3j	dead on all three GOOS at HEAD fed08c91; correctly tested diff helper with only _test.go callers — wire to the pane-delta path or delete
-internal/util/text.go:suffixPrefixOverlap	ntm-1ko3j	dead on all three GOOS at HEAD fed08c91; helper reached only from ExtractNewOutput and its tests — resolve with the ExtractNewOutput decision
 internal/workflow/template.go:WorkflowTemplate.GetAgentsByRole	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/workflow/template.go:WorkflowTemplate.GetRoles	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/workflow/trigger.go:ManualTrigger.Type	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
