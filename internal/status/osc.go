@@ -83,6 +83,17 @@ func (d *OSCDetector) Detect(paneID string) (AgentStatus, error) {
 	return fallbackStatus, nil
 }
 
+// ResetPane forwards a per-step classification reset to the wrapped detector
+// when it supports one. The wrapper must forward rather than implement its own
+// state: the executor resets through the detector interface, and without this
+// method the type assertion would fail and stale pane history would persist
+// across steps (ntm-l6cuz.3).
+func (d *OSCDetector) ResetPane(paneID string) {
+	if resetter, ok := d.fallback.(interface{ ResetPane(string) }); ok {
+		resetter.ResetPane(paneID)
+	}
+}
+
 // DetectAll returns statuses for every pane in session, with per-pane OSC
 // overrides where fresh reports exist.
 func (d *OSCDetector) DetectAll(session string) ([]AgentStatus, error) {

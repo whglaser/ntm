@@ -61,6 +61,43 @@ Today this is wired into:
 `ntm status`, `ntm wait`, and `ntm activity` still classify by scraping; the
 source-tagged detector is in place for them to adopt.
 
+## Completion robustness (hysteresis + artifact fallback)
+
+Pipeline completion waits are deliberately paranoid, because status detection
+is a screen-scrape heuristic (or, for pi, a change-driven report that a lost
+pipe can silence):
+
+- **Hysteresis**: the detector must report idle for a configurable number of
+  consecutive polls (`ExecutorConfig.IdleStablePolls`, default 3) before a
+  step completes. Any non-idle reading resets the streak, so a single
+transient idle frame cannot end a step early.
+- **Per-step reset**: when a pane lock is acquired for a new step, the
+  executor drops that pane's cached classification history (content
+  fingerprint and the OSC report left by the previous lifetime). A state
+  derived from the previous step cannot persist into the next one.
+- **Artifact stability**: a step may declare the files it is expected to
+  produce:
+
+  ```yaml
+  - id: answers
+    pane: "${vars.pane_reasoner}"
+    template: answers.md
+    timeout: 3h
+    outputs:
+      - planning/question-answers.md
+      - {name: graph, path: planning/question-graph.md}
+  ```
+
+  Once every declared path exists and its bytes have been identical for the
+  stability window (`ExecutorConfig.OutputStabilityWindow`, default 15s), the
+  step completes even if the pane still reads working. This is the
+  answers-style long step: the deliverable is on disk, and a stuck
+  classification must not burn the rest of the timeout. The check is
+  independent of pane state and of the output-progress gate; a path that
+  never appears can never complete the step, and deleting or rewriting an
+  output resets the window. Declared paths are variable-substituted exactly
+  like `Workflow.outputs`.
+
 ## Enabling reports
 
 pi only writes OSC 7501 after it believes the terminal supports it: it sends
@@ -71,13 +108,16 @@ tmux the pane must run with:
 PI_PROGRAM_STATUS=1
 ```
 
-Because panes inherit the tmux server's environment, the most durable way to
-set it is from the shell/profile that starts tmux (for example, add
-`export PI_PROGRAM_STATUS=1` to your shell profile). Do **not** put it in a
-plugin's `[agent.env]` unless you also accept that `ntm sessions resume` /
-automatic recovery will refuse to relaunch the pane: plugin environment values
-are intentionally not persisted in the launch specification. `PI_PROGRAM_STATUS=0`
-explicitly disables reports.
+ntm-spawned pi panes get that automatically: a pi plugin's spawn command is
+prefixed with `PI_PROGRAM_STATUS=1`, so the assignment is part of the
+persisted launch command and `ntm sessions resume` / automatic recovery
+replay it without a manual export. An explicit `PI_PROGRAM_STATUS=0` in the
+spawning environment is the off-switch.
+
+For a pi pane started outside ntm, export it from the shell/profile that
+starts tmux. Do **not** put it in a plugin's `[agent.env]`: plugin environment
+values are intentionally not persisted in the launch specification, and a
+spec that omits them is refused on replay.
 
 ## Troubleshooting
 

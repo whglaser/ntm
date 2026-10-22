@@ -400,6 +400,15 @@ type Step struct {
 	Wait    WaitCondition `yaml:"wait,omitempty" toml:"wait,omitempty" json:"wait,omitempty"` // completion, idle, time, none
 	Timeout Duration      `yaml:"timeout,omitempty" toml:"timeout,omitempty" json:"timeout,omitempty"`
 
+	// Outputs declares the artifacts this step is expected to produce. The
+	// completion wait treats them as an independent fallback (ntm-l6cuz.3):
+	// once every declared path exists and has been byte-identical for the
+	// output-stability window, the step completes even if pane-state
+	// detection never reports idle. Paths are variable-substituted at wait
+	// time exactly like Workflow.Outputs; a path that never appears can never
+	// complete the step.
+	Outputs []OutputDecl `yaml:"outputs,omitempty" toml:"outputs,omitempty" json:"outputs,omitempty"`
+
 	// Dependencies
 	DependsOn []string `yaml:"depends_on,omitempty" toml:"depends_on,omitempty" json:"depends_on,omitempty"`
 

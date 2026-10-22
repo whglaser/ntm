@@ -90,11 +90,25 @@ func TestAdHocStageCompletesOnOSCReportWhenScrapeNeverIdles(t *testing.T) {
 	}
 }
 
+// resetSpyDetector records per-step classification resets while behaving
+// like the idle stage detector.
+type resetSpyDetector struct {
+	stageIdleDetector
+	resets []string
+}
+
+func (d *resetSpyDetector) ResetPane(paneID string) {
+	d.resets = append(d.resets, paneID)
+}
+
 // TestAdHocStageProgramStatusCaptureSkipsInjectedClients pins the test
 // isolation contract: a mock tmux client must never cause a real pipe-pane
-// tap against the host server.
+// tap against the host server. It also proves the per-step classification
+// reset reaches the detector through the optional interface.
 func TestAdHocStageProgramStatusCaptureSkipsInjectedClients(t *testing.T) {
 	executor, client, _ := newStageDeliveryFixture(t)
+	detector := &resetSpyDetector{}
+	executor.SetDetector(detector)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
@@ -107,6 +121,9 @@ func TestAdHocStageProgramStatusCaptureSkipsInjectedClients(t *testing.T) {
 	executor.programStatusMu.Unlock()
 	if streams != nil {
 		t.Fatal("injected tmux client started a real OSC capture")
+	}
+	if len(detector.resets) != 1 || detector.resets[0] != client.pane.ID {
+		t.Fatalf("per-step resets = %v, want [%s]", detector.resets, client.pane.ID)
 	}
 }
 

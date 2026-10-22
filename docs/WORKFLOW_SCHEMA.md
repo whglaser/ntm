@@ -12,6 +12,7 @@ NTM workflows define multi-step automation pipelines for orchestrating AI agents
 - [Steps](#steps)
 - [Agent Selection](#agent-selection)
 - [Wait Configuration](#wait-configuration)
+- [Declared Step Outputs](#declared-step-outputs)
 - [Error Handling](#error-handling)
 - [Parallel Execution](#parallel-execution)
 - [Conditional Steps](#conditional-steps)
@@ -511,6 +512,37 @@ Define when a step is considered complete:
 | `idle` | Same as completion |
 | `time` | Wait for timeout duration only |
 | `none` | Fire and forget (don't wait) |
+
+## Declared Step Outputs
+
+A step may declare the files it is expected to produce. When every declared
+path exists and its bytes have been identical for the output-stability window
+(default 15s, `ExecutorConfig.OutputStabilityWindow`), the step completes even
+if the agent's pane never reads idle. This is the fallback for long steps
+whose agent finished writing its deliverable but whose pane state is stuck
+(the answers-style stall). A declared path that never appears can never
+complete a step, and rewriting or deleting an output restarts the window.
+
+```yaml
+- id: answers
+  pane: "${vars.pane_reasoner}"
+  template: answers.md
+  timeout: 3h
+  outputs:
+    - planning/question-answers.md              # bare path
+    - {name: graph, path: planning/question-graph.md}
+```
+
+Paths take the same forms as workflow-level `outputs` (bare string, single-key
+`{name: path}` shorthand, or `{name, path, description}`) and are
+variable-substituted the same way. The declaration is independent of
+`output_var` / `output_parse`, which capture the pane's text; `outputs`
+describes artifacts written to disk.
+
+Completion still requires a stable idle streak unless this fallback fires:
+the detector must report idle for the configured number of consecutive polls
+(`ExecutorConfig.IdleStablePolls`, default 3), and the executor resets a
+pane's cached classification history when it starts a new step on it.
 
 ## Error Handling
 
