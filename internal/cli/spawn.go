@@ -869,6 +869,29 @@ func validateSpawnAgentTypes(agents []FlatAgent, pluginMap map[string]plugins.Ag
 	return nil
 }
 
+// programStatusLaunchPrefix returns a persisted launch-command prefix that
+// switches on an agent CLI's Program Status Protocol channel when the CLI
+// requires an explicit opt-in. pi only emits OSC 7501 when
+// PI_PROGRAM_STATUS=1 (tmux never answers its capability query), so
+// ntm-launched pi panes otherwise produce no authoritative status reports at
+// all (ntm-bh677).
+//
+// The prefix is part of the rendered command and therefore part of the
+// persisted AgentLaunchSpec. Unlike plugin [agent.env] values it is not an
+// omitted environment input, so sessions save/resume and automatic recovery
+// replay it without a manual export. An explicit PI_PROGRAM_STATUS=0 in the
+// spawning process's environment is the documented off-switch and is
+// preserved.
+func programStatusLaunchPrefix(agentType AgentType) string {
+	if tmux.AgentType(agentType).Canonical() != tmux.AgentType("pi") {
+		return ""
+	}
+	if os.Getenv("PI_PROGRAM_STATUS") == "0" {
+		return ""
+	}
+	return "PI_PROGRAM_STATUS=1 "
+}
+
 // spawnAgentCommandTemplate resolves the launch command template and any env
 // vars for one agent type. Shared by the launch loop and the preflight
 // validation pass so both see identical template selection.
@@ -922,7 +945,7 @@ func spawnAgentCommandTemplate(agentType AgentType, pluginMap map[string]plugins
 		return config.OmpCommandOrDefault(cfg.Agents.Omp), nil, nil
 	default:
 		if p, ok := pluginMap[string(agentType)]; ok {
-			return p.Command, p.Env, nil
+			return programStatusLaunchPrefix(agentType) + p.Command, p.Env, nil
 		}
 		return "", nil, fmt.Errorf("unknown agent type %q", agentType)
 	}

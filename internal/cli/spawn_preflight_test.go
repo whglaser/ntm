@@ -7,7 +7,9 @@ import (
 	"testing"
 	"time"
 
+	agentpkg "github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/config"
+	"github.com/Dicklesworthstone/ntm/internal/plugins"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/tests/testutil"
 )
@@ -84,6 +86,58 @@ func TestSpawnAgentCommandTemplateUnknownType(t *testing.T) {
 
 	if _, _, err := spawnAgentCommandTemplate(AgentType("nope"), nil, ""); err == nil {
 		t.Fatal("expected error for unknown agent type")
+	}
+}
+
+// TestProgramStatusLaunchPrefixPersistsForPi pins ntm-bh677: ntm-spawned pi
+// panes carry a PI_PROGRAM_STATUS=1 assignment inside the persisted launch
+// command, so the authoritative OSC 7501 channel exists without the operator
+// exporting the variable, and sessions save/resume replay it. Other plugins
+// and the documented PI_PROGRAM_STATUS=0 off-switch are untouched.
+func TestProgramStatusLaunchPrefixPersistsForPi(t *testing.T) {
+	if err := agentpkg.RegisterPlugin("pi", nil, nil, nil); err != nil {
+		t.Fatalf("register pi plugin: %v", err)
+	}
+	pluginMap := map[string]plugins.AgentPlugin{
+		"pi":     {Name: "pi", Command: "pi --approve"},
+		"hermes": {Name: "hermes", Command: "hermes run"},
+	}
+
+	tmpl, env, err := spawnAgentCommandTemplate(AgentType("pi"), pluginMap, "")
+	if err != nil || env != nil {
+		t.Fatalf("pi template = (%q, %v, %v)", tmpl, env, err)
+	}
+	if tmpl != "PI_PROGRAM_STATUS=1 pi --approve" {
+		t.Fatalf("pi template = %q, want the persisted program-status prefix", tmpl)
+	}
+	rendered, err := config.GenerateAgentCommand(tmpl, config.AgentTemplateVars{AgentType: "pi"})
+	if err != nil {
+		t.Fatalf("render pi command: %v", err)
+	}
+	spec, err := captureAgentLaunchSpec(AgentType("pi"), rendered, "", "", "", "", "")
+	if err != nil {
+		t.Fatalf("capture pi launch spec: %v", err)
+	}
+	if !strings.HasPrefix(spec.Command, "PI_PROGRAM_STATUS=1 pi ") {
+		t.Fatalf("persisted pi command = %q, want the program-status prefix", spec.Command)
+	}
+	if err := spec.ValidateReplay(tmux.AgentType("pi")); err != nil {
+		t.Fatalf("prefixed pi launch spec must stay replay-safe: %v", err)
+	}
+	if len(spec.OmittedEnv) != 0 {
+		t.Fatalf("program-status prefix must not be persisted as omitted env: %+v", spec.OmittedEnv)
+	}
+
+	if got, _, err := resolveAddAgentCommandTemplate(AgentType("pi"), pluginMap, ""); err != nil || got != tmpl {
+		t.Fatalf("add pi template = (%q, %v), want %q", got, err, tmpl)
+	}
+	if got, _, _ := spawnAgentCommandTemplate(AgentType("hermes"), pluginMap, ""); got != "hermes run" {
+		t.Fatalf("non-pi plugin template = %q, want unchanged", got)
+	}
+
+	t.Setenv("PI_PROGRAM_STATUS", "0")
+	if got, _, _ := spawnAgentCommandTemplate(AgentType("pi"), pluginMap, ""); got != "pi --approve" {
+		t.Fatalf("PI_PROGRAM_STATUS=0 template = %q, want no prefix", got)
 	}
 }
 
