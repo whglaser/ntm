@@ -1,7 +1,10 @@
 package robot
 
 import (
+	"strings"
 	"testing"
+
+	"github.com/Dicklesworthstone/ntm/internal/agent"
 )
 
 func TestNewPatternLibrary(t *testing.T) {
@@ -1093,5 +1096,98 @@ func TestAgyTrustPromptClassifiesAsError(t *testing.T) {
 		if m.Pattern == "agy_trust_prompt" || m.Pattern == "agy_trust_option" {
 			t.Errorf("trust pattern matched normal agy output: %+v", m)
 		}
+	}
+}
+
+func TestPatternLibraryMatchPluginType(t *testing.T) {
+	// A registered agent plugin's readiness regexps must surface through both
+	// Match and MatchByCategory so robot state surfaces treat plugin panes
+	// like built-in panes (ntm#260).
+	if err := agent.RegisterPlugin("pluginready",
+		[]string{`^\s*─{4,}\s*$`},
+		[]string{`[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] Working`},
+		[]string{`^BOOM$`},
+	); err != nil {
+		t.Fatalf("register plugin: %v", err)
+	}
+
+	lib := NewPatternLibrary()
+
+	find := func(matches []PatternMatch, pattern string) *PatternMatch {
+		for i := range matches {
+			if matches[i].Pattern == pattern {
+				return &matches[i]
+			}
+		}
+		return nil
+	}
+
+	working := lib.Match("── ⠙ Working ──────────────────", "pluginready")
+	if m := find(working, "plugin_working"); m == nil || m.Category != CategoryThinking || m.State != StateThinking {
+		t.Fatalf("plugin working match = %+v, want plugin_working THINKING/thinking", working)
+	}
+
+	idle := lib.MatchByCategory("────────────────────────────────", "pluginready", CategoryIdle)
+	if m := find(idle, "plugin_idle"); m == nil || m.State != StateWaiting {
+		t.Fatalf("plugin idle MatchByCategory = %+v, want plugin_idle WAITING", idle)
+	}
+
+	errs := lib.MatchByCategory("BOOM", "pluginready", CategoryError)
+	if m := find(errs, "plugin_error"); m == nil || m.State != StateError {
+		t.Fatalf("plugin error MatchByCategory = %+v, want plugin_error ERROR", errs)
+	}
+
+	if matches := lib.Match("── ⠙ Working ──────────────────", "not-a-registered-plugin"); find(matches, "plugin_working") != nil {
+		t.Fatalf("unregistered type matched plugin patterns: %+v", matches)
+	}
+}
+
+func TestStateClassifier_PluginReadiness(t *testing.T) {
+	if err := agent.RegisterPlugin("plugincls",
+		[]string{`^\s*─{4,}\s*$`},
+		[]string{`[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] Working`},
+		[]string{`^BOOM$`},
+	); err != nil {
+		t.Fatalf("register plugin: %v", err)
+	}
+
+	idleOutput := strings.Join([]string{
+		"some transcript tail",
+		"────────────────────────────────────────────────",
+		" ",
+		"────────────────────────────────────────────────",
+		"0.0%/1.0M (auto)  model",
+	}, "\n")
+	idle := NewStateClassifier("plugin-cls-idle", &ClassifierConfig{AgentType: "plugincls"})
+	idleActivity, err := idle.ClassifyWithOutput(idleOutput)
+	if err != nil {
+		t.Fatalf("classify plugin idle frame: %v", err)
+	}
+	if idleActivity.State != StateWaiting {
+		t.Fatalf("idle plugin state = %s, want %s; patterns=%v", idleActivity.State, StateWaiting, idleActivity.DetectedPatterns)
+	}
+
+	workingOutput := strings.Join([]string{
+		"── ⠙ Working ────────────────────────────────────",
+		" ",
+		"────────────────────────────────────────────────",
+	}, "\n")
+	working := NewStateClassifier("plugin-cls-working", &ClassifierConfig{AgentType: "plugincls"})
+	workingActivity, err := working.ClassifyWithOutput(workingOutput)
+	if err != nil {
+		t.Fatalf("classify plugin working frame: %v", err)
+	}
+	if workingActivity.State != StateThinking {
+		t.Fatalf("working plugin state = %s, want %s; patterns=%v", workingActivity.State, StateThinking, workingActivity.DetectedPatterns)
+	}
+
+	errOutput := "Error: provider exploded\nfiller\nfiller\nBOOM"
+	errClassifier := NewStateClassifier("plugin-cls-error", &ClassifierConfig{AgentType: "plugincls"})
+	errActivity, err := errClassifier.ClassifyWithOutput(errOutput)
+	if err != nil {
+		t.Fatalf("classify plugin error frame: %v", err)
+	}
+	if errActivity.State != StateError {
+		t.Fatalf("error plugin state = %s, want %s; patterns=%v", errActivity.State, StateError, errActivity.DetectedPatterns)
 	}
 }

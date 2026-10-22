@@ -42,7 +42,7 @@ func ResumeLaunchCommand(provider, sessionID, command string, opts ResumeLaunchO
 		}
 	}
 	switch provider {
-	case "claude", "codex", "gemini", "antigravity", "omp":
+	case "claude", "codex", "gemini", "antigravity", "omp", "pi":
 	default:
 		return "", fmt.Errorf("provider %q does not support settings-preserving native resume", provider)
 	}
@@ -111,7 +111,9 @@ func ResumeLaunchCommand(provider, sessionID, command string, opts ResumeLaunchO
 		if flag == "--" {
 			return "", errors.New("saved launch ends provider option parsing")
 		}
-		if provider != "codex" && (provider != "antigravity" && (flag == "--resume" || flag == "-r") || flag == "--conversation" && provider == "antigravity") {
+		piSelector := provider == "pi" && (flag == "--session" || flag == "--session-id")
+		nativeSelector := provider != "codex" && (provider != "antigravity" && (flag == "--resume" || flag == "-r") || flag == "--conversation" && provider == "antigravity")
+		if piSelector || nativeSelector {
 			if selectorStart >= 0 {
 				return "", errors.New("saved launch has multiple resume selectors")
 			}
@@ -171,6 +173,12 @@ func ResumeLaunchCommand(provider, sessionID, command string, opts ResumeLaunchO
 	selector := "--resume " + shellQuote(sessionID)
 	if provider == "antigravity" {
 		selector = "--conversation " + shellQuote(sessionID)
+	}
+	if provider == "pi" {
+		// Pi resumes a session file/id via --session (exact local match, then
+		// unique prefix). --session-id would silently CREATE the session if it
+		// is missing, which is not resume semantics.
+		selector = "--session " + shellQuote(sessionID)
 	}
 	if provider == "codex" {
 		if codexResume {
@@ -259,6 +267,12 @@ func resumeOption(provider, flag string) resumeOptionKind {
 		}
 		booleans = "--auto-approve --no-tools --no-extensions --no-skills --no-prompt-templates --no-themes --offline"
 		values = "--model --provider --thinking --system-prompt --append-system-prompt --session-dir --tools --extension -e --skill --prompt-template --theme --smol --slow --plan"
+	case "pi":
+		if flag == "-c" || flag == "-r" || flag == "--fork" || flag == "--list-models" || flag == "--export" {
+			return resumeForbidden
+		}
+		booleans = "--approve -a --no-approve -na --offline --verbose --no-tools -nt --no-builtin-tools -nbt --no-extensions -ne --no-mcp --no-skills -ns --no-prompt-templates -np --no-themes --no-context-files -nc"
+		values = "--provider --model --api-key --system-prompt --append-system-prompt --mode --session-dir --name -n --models --thinking --tools -t --exclude-tools -xt --extension -e --skill --prompt-template --theme --use-theme --tui-mode"
 	}
 	for _, known := range strings.Fields(booleans) {
 		if known == flag {
@@ -329,6 +343,11 @@ func ResumeCommand(provider, sessionID string, preferCASR bool) string {
 		// approval flag matches ntm's fresh omp launch so a resumed pane
 		// does not stall on tool approvals. casr has no omp provider.
 		return "omp --auto-approve --resume " + shellQuote(sessionID)
+	case "pi":
+		// Pi resumes by session id, unique id prefix, or transcript path via
+		// --session; --approve matches ntm's fresh pi launch so a resumed pane
+		// does not stall on the project-trust prompt. casr has no pi provider.
+		return "pi --approve --session " + shellQuote(sessionID)
 	}
 	return ""
 }

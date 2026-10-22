@@ -1096,7 +1096,7 @@ func IsLiveBusy(scrollback string, agentType string, paneWidth int) bool {
 // paneWidth is the real tmux pane width (bd-eeifh); pass 0 when unknown.
 func isAIAgentLiveBusy(scrollback, agentType string, paneWidth int) bool {
 	canonicalType := agent.AgentType(agentType).Canonical()
-	if !canonicalType.IsValid() || canonicalType == agent.AgentTypeUser || canonicalType == agent.AgentTypeUnknown {
+	if (!canonicalType.IsValid() && !agent.IsPluginType(canonicalType)) || canonicalType == agent.AgentTypeUser || canonicalType == agent.AgentTypeUnknown {
 		return false
 	}
 	return IsLiveBusy(scrollback, string(canonicalType), paneWidth)

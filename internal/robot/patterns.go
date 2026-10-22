@@ -5,8 +5,10 @@ package robot
 import (
 	"regexp"
 	"sort"
+	"strings"
 	"sync"
 
+	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/errsig"
 )
 
@@ -307,6 +309,13 @@ func (lib *PatternLibrary) Match(content string, agentType string) []PatternMatc
 		}
 	}
 
+	// Agent plugins declare their own readiness regexps (ntm#260). The agent
+	// parser honours them for --robot-tail, status observations, and dispatch;
+	// translating them into library matches here gives the robot
+	// StateClassifier surfaces (activity, dashboards, stall checks) the same
+	// view instead of classifying plugin panes UNKNOWN.
+	matches = append(matches, pluginPatternMatches(content, agentType)...)
+
 	return matches
 }
 
@@ -352,6 +361,14 @@ func (lib *PatternLibrary) MatchByCategory(content string, agentType string, cat
 				Category: p.Category,
 				Priority: p.Priority,
 			})
+		}
+	}
+
+	// Include the agent plugin's matching patterns for this category; see
+	// pluginPatternMatches.
+	for _, m := range pluginPatternMatches(content, agentType) {
+		if m.Category == category {
+			matches = append(matches, m)
 		}
 	}
 
@@ -489,6 +506,50 @@ func isKnownAgentPatternType(agentType string) bool {
 	case "claude", "codex", "gemini", "antigravity", "grok", "cursor", "windsurf", "aider", "oc", "omp", "ollama":
 		return true
 	default:
+		return agent.IsPluginType(agent.AgentType(agentType))
+	}
+}
+
+// pluginPatternMatches translates a registered agent plugin's readiness
+// regexps into PatternMatch entries so the robot classifier sees plugin panes
+// exactly like built-in agent panes. Semantics follow the agent parser's
+// helpers (ntm#260): every regexp is matched per line against the
+// ANSI-stripped capture; the caller's content windows and the classifier's
+// live-tail filters decide freshness. Working is reported as THINKING so it
+// outranks co-present composer chrome, error as ERROR, and idle as WAITING.
+func pluginPatternMatches(content, agentType string) []PatternMatch {
+	patterns, ok := agent.LookupPluginPatterns(agent.AgentType(agentType))
+	if !ok || !patterns.Declared() {
+		return nil
+	}
+
+	matchesAnyLine := func(patterns []*regexp.Regexp) bool {
+		for _, line := range strings.Split(content, "\n") {
+			line = strings.TrimRight(line, "\r")
+			for _, re := range patterns {
+				if re.MatchString(line) {
+					return true
+				}
+			}
+		}
 		return false
 	}
+
+	var matches []PatternMatch
+	if matchesAnyLine(patterns.Error) {
+		matches = append(matches, PatternMatch{
+			Pattern: "plugin_error", State: StateError, Category: CategoryError, Priority: 300,
+		})
+	}
+	if matchesAnyLine(patterns.Working) {
+		matches = append(matches, PatternMatch{
+			Pattern: "plugin_working", State: StateThinking, Category: CategoryThinking, Priority: 250,
+		})
+	}
+	if matchesAnyLine(patterns.Idle) {
+		matches = append(matches, PatternMatch{
+			Pattern: "plugin_idle", State: StateWaiting, Category: CategoryIdle, Priority: 90,
+		})
+	}
+	return matches
 }
