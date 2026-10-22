@@ -44,18 +44,23 @@ type backgroundRequest struct {
 // List the serializable execution options explicitly: ExecutorConfig also has
 // an in-process function hook, which must never be silently lost on re-exec.
 type backgroundExecutorConfig struct {
-	Session          string          `json:"session"`
-	ProjectDir       string          `json:"project_dir"`
-	WorkflowFile     string          `json:"workflow_file"`
-	RunID            string          `json:"run_id"`
-	DefaultTimeout   time.Duration   `json:"default_timeout"`
-	GlobalTimeout    time.Duration   `json:"global_timeout"`
-	ProgressInterval time.Duration   `json:"progress_interval"`
-	PaneLockWait     time.Duration   `json:"pane_lock_wait"`
-	Verbose          bool            `json:"verbose,omitempty"`
-	StartFromStep    string          `json:"start_from_step,omitempty"`
-	StartFromState   *ExecutionState `json:"start_from_state,omitempty"`
-	ResumeOptions    ResumeOptions   `json:"resume_options,omitempty"`
+	Session          string        `json:"session"`
+	ProjectDir       string        `json:"project_dir"`
+	WorkflowFile     string        `json:"workflow_file"`
+	RunID            string        `json:"run_id"`
+	DefaultTimeout   time.Duration `json:"default_timeout"`
+	GlobalTimeout    time.Duration `json:"global_timeout"`
+	ProgressInterval time.Duration `json:"progress_interval"`
+	PaneLockWait     time.Duration `json:"pane_lock_wait"`
+	// IdleStablePolls and OutputStabilityWindow carry the completion-wait
+	// robustness knobs (ntm-l6cuz.3) across the background re-exec; zero means
+	// the package defaults.
+	IdleStablePolls       int             `json:"idle_stable_polls,omitempty"`
+	OutputStabilityWindow time.Duration   `json:"output_stability_window,omitempty"`
+	Verbose               bool            `json:"verbose,omitempty"`
+	StartFromStep         string          `json:"start_from_step,omitempty"`
+	StartFromState        *ExecutionState `json:"start_from_state,omitempty"`
+	ResumeOptions         ResumeOptions   `json:"resume_options,omitempty"`
 }
 
 func (c backgroundExecutorConfig) executorConfig() ExecutorConfig {
@@ -63,6 +68,7 @@ func (c backgroundExecutorConfig) executorConfig() ExecutorConfig {
 		Session: c.Session, ProjectDir: c.ProjectDir, WorkflowFile: c.WorkflowFile, RunID: c.RunID,
 		DefaultTimeout: c.DefaultTimeout, GlobalTimeout: c.GlobalTimeout,
 		ProgressInterval: c.ProgressInterval, PaneLockWait: c.PaneLockWait,
+		IdleStablePolls: c.IdleStablePolls, OutputStabilityWindow: c.OutputStabilityWindow,
 		Verbose: c.Verbose, StartFromStep: c.StartFromStep, StartFromState: c.StartFromState,
 		ResumeOptions: c.ResumeOptions,
 	}
@@ -144,6 +150,7 @@ func startDetachedPipeline(workflow *Workflow, vars map[string]interface{}, cfg 
 			Session: cfg.Session, ProjectDir: root, WorkflowFile: snapshot, RunID: cfg.RunID,
 			DefaultTimeout: cfg.DefaultTimeout, GlobalTimeout: cfg.GlobalTimeout,
 			ProgressInterval: cfg.ProgressInterval, PaneLockWait: cfg.PaneLockWait,
+			IdleStablePolls: cfg.IdleStablePolls, OutputStabilityWindow: cfg.OutputStabilityWindow,
 			Verbose: cfg.Verbose, StartFromStep: cfg.StartFromStep, StartFromState: cfg.StartFromState,
 			ResumeOptions: cfg.ResumeOptions,
 		}, Variables: prepared,

@@ -75,10 +75,6 @@ func Execute(ctx context.Context, p Pipeline) error {
 func (e *Executor) executeAdHocStage(ctx context.Context, stage Stage, paneID, previousOutput string, previous AgentDeliveryState) (AgentDeliveryState, error) {
 	agentType := normalizeAgentType(stage.AgentType)
 	record := AgentDeliveryState{Session: e.config.Session, PaneID: paneID, Endpoint: e.agentDeliveryEndpoint(), AgentType: agentType}
-	// Attach the OSC 7501 tap before the prompt is pasted (see executor.go's
-	// executeAgentDelivery): reports are change-driven, so a late tap would
-	// miss the working → done transition.
-	e.ensureProgramStatusCapture(paneID)
 	pane, err := e.agentDeliveryPane(ctx, paneID, 0, record.Endpoint)
 	if err != nil {
 		return record, err
@@ -99,6 +95,13 @@ func (e *Executor) executeAdHocStage(ctx context.Context, stage Stage, paneID, p
 	if normalizeAgentType(string(pane.Type)) != agentType || pane.IsServicePane() {
 		return record, fmt.Errorf("selected pane %s no longer matches stage agent %s", paneID, stage.AgentType)
 	}
+	// Attach the OSC 7501 tap and drop per-pane classification history only
+	// after the pane lock is held (see executor.go's executeAgentDelivery): a
+	// queued stage for the same pane must not clear the state this one waits
+	// on, and pi reports are change-driven, so the tap must exist before the
+	// prompt is pasted.
+	e.ensureProgramStatusCapture(paneID)
+	e.resetDetectorPaneState(paneID)
 	if err := e.tmuxClient().PrepareDelivery(ctx, pane, agentType); err != nil {
 		return record, fmt.Errorf("stage not dispatched: %w", err)
 	}
@@ -173,7 +176,7 @@ func (e *Executor) executeAdHocStage(ctx context.Context, stage Stage, paneID, p
 		return record, ctx.Err()
 	case <-timer.C:
 	}
-	if err := waitForIdle(ctx, e.detector, paneID, collect); err != nil {
+	if err := waitForIdle(ctx, e.detector, paneID, waitIdleOptions{StablePolls: e.config.IdleStablePolls}, collect); err != nil {
 		return record, fmt.Errorf("waiting for stage completion: %w", err)
 	}
 	// The last detector call may have outlived cancellation or pane respawn.
@@ -255,7 +258,7 @@ func normalizeAgentType(t string) string {
 	}
 }
 
-func waitForIdle(ctx context.Context, detector status.Detector, paneID string, evidence ...func() (bool, error)) error {
+func waitForIdle(ctx context.Context, detector status.Detector, paneID string, opts waitIdleOptions, evidence ...func() (bool, error)) error {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
@@ -264,6 +267,10 @@ func waitForIdle(ctx context.Context, detector status.Detector, paneID string, e
 	// Require a stable idle streak before declaring completion — a single
 	// idle reading can be a transient TUI misclassification (ntm#213). Keep
 	// in sync with Executor.waitForIdle.
+	stablePolls := opts.StablePolls
+	if stablePolls <= 0 {
+		stablePolls = idleStablePolls
+	}
 	idleStreak := 0
 	for {
 		select {
@@ -274,6 +281,9 @@ func waitForIdle(ctx context.Context, detector status.Detector, paneID string, e
 		case <-ticker.C:
 			if err := ctx.Err(); err != nil {
 				return err
+			}
+			if opts.Artifacts != nil && opts.Artifacts.satisfiedAt(time.Now()) {
+				return nil
 			}
 			fresh := true
 			for _, observe := range evidence {
@@ -293,7 +303,7 @@ func waitForIdle(ctx context.Context, detector status.Detector, paneID string, e
 			}
 			if s.State == status.StateIdle && fresh {
 				idleStreak++
-				if idleStreak >= idleStablePolls {
+				if idleStreak >= stablePolls {
 					return nil
 				}
 			} else {

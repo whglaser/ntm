@@ -432,6 +432,20 @@ func (d *UnifiedDetector) observePaneContent(paneID, output string, observedAt t
 	return observedAt, seen
 }
 
+// ResetPane drops the pane's cached content observation. The next Detect call
+// establishes a fresh baseline (hasHistory=false), so a state classification
+// derived from a previous step on the same pane cannot persist into the next
+// one (ntm-l6cuz.3). The pane's tmux activity timestamp is unaffected; only
+// this detector's pane-local history is retired.
+func (d *UnifiedDetector) ResetPane(paneID string) {
+	if paneID == "" {
+		return
+	}
+	d.paneContentMu.Lock()
+	delete(d.paneContent, paneID)
+	d.paneContentMu.Unlock()
+}
+
 // Detect returns the current status of a single pane.
 // Detection priority: error > idle > working > unknown
 func (d *UnifiedDetector) Detect(paneID string) (AgentStatus, error) {

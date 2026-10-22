@@ -320,7 +320,7 @@ func TestStageWaitCancellationWinsOverLateIdle(t *testing.T) {
 			cancel()
 		}
 	}}
-	if err := waitForIdle(ctx, detector, "%71"); !errors.Is(err, context.Canceled) {
+	if err := waitForIdle(ctx, detector, "%71", waitIdleOptions{}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("late final idle observation hid cancellation: %v", err)
 	}
 }

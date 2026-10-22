@@ -1752,7 +1752,7 @@ func TestWaitForIdle_ContextCancelled(t *testing.T) {
 	defer cancel()
 	cancel()
 
-	err := e.waitForIdle(ctx, "pane-1", 5*time.Second)
+	err := e.waitForIdle(ctx, "pane-1", 5*time.Second, waitIdleOptions{})
 
 	if err == nil {
 		t.Error("waitForIdle() should return error for cancelled context")
@@ -1773,7 +1773,7 @@ func TestWaitForIdle_ContextDeadline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
 
-	err := e.waitForIdle(ctx, "pane-1", 5*time.Second)
+	err := e.waitForIdle(ctx, "pane-1", 5*time.Second, waitIdleOptions{})
 
 	if err == nil {
 		t.Error("waitForIdle() should return error for deadline exceeded")
@@ -1959,7 +1959,7 @@ func TestWaitForIdle_SuccessfulDetection(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := e.waitForIdle(ctx, "mock-pane", 10*time.Second)
+	err := e.waitForIdle(ctx, "mock-pane", 10*time.Second, waitIdleOptions{})
 
 	if err != nil {
 		t.Fatalf("waitForIdle() should succeed when detector returns idle: %v", err)
@@ -1984,7 +1984,7 @@ func TestWaitForIdle_TimeoutWithMock(t *testing.T) {
 
 	ctx := context.Background()
 	started := time.Now()
-	err := e.waitForIdle(ctx, "mock-pane", 250*time.Millisecond)
+	err := e.waitForIdle(ctx, "mock-pane", 250*time.Millisecond, waitIdleOptions{})
 
 	if err == nil {
 		t.Fatal("waitForIdle() should return error on timeout")
@@ -2016,7 +2016,7 @@ func TestWaitForIdle_DetectorErrors(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := e.waitForIdle(ctx, "mock-pane", 10*time.Second)
+	err := e.waitForIdle(ctx, "mock-pane", 10*time.Second, waitIdleOptions{})
 
 	if err != nil {
 		t.Fatalf("waitForIdle() should succeed after transient errors: %v", err)
@@ -2045,7 +2045,7 @@ func TestWaitForIdle_RequiresStableIdleStreak(t *testing.T) {
 		},
 	}
 
-	err := e.waitForIdle(context.Background(), "mock-pane", 3*time.Second)
+	err := e.waitForIdle(context.Background(), "mock-pane", 3*time.Second, waitIdleOptions{})
 	if err == nil {
 		t.Fatal("waitForIdle() completed on flapping idle readings; a single idle poll must not count as completion")
 	}
@@ -2072,7 +2072,7 @@ func TestWaitForIdle_StableIdleCompletes(t *testing.T) {
 		},
 	}
 
-	if err := e.waitForIdle(context.Background(), "mock-pane", 10*time.Second); err != nil {
+	if err := e.waitForIdle(context.Background(), "mock-pane", 10*time.Second, waitIdleOptions{}); err != nil {
 		t.Fatalf("waitForIdle() should succeed on stable idle: %v", err)
 	}
 	if got := atomic.LoadInt32(&idleCount); got != idleStablePolls {
