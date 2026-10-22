@@ -41,10 +41,10 @@ func TestRegistryGetAllInfo(t *testing.T) {
 	r.Register(newMockAdapter(ToolBD, false))
 
 	ctx := context.Background()
-	infos := r.GetAllInfo(ctx)
+	infos := r.GetAllInfoExcept(ctx, nil)
 
 	if len(infos) != 2 {
-		t.Errorf("GetAllInfo() returned %d infos, want 2", len(infos))
+		t.Errorf("GetAllInfoExcept() returned %d infos, want 2", len(infos))
 	}
 
 	// Check that installed/uninstalled status is correct
@@ -126,11 +126,11 @@ func TestGlobalRegistryFunctions(t *testing.T) {
 		t.Errorf("Got adapter name %q, want %q", got.Name(), ToolBV)
 	}
 
-	// Test GetAllInfo
+	// Test GetAllInfoExcept
 	ctx := context.Background()
-	allInfo := GetAllInfo(ctx)
+	allInfo := GetAllInfoExcept(ctx, nil)
 	if len(allInfo) != 1 {
-		t.Errorf("GetAllInfo() returned %d infos, want 1", len(allInfo))
+		t.Errorf("GetAllInfoExcept() returned %d infos, want 1", len(allInfo))
 	}
 
 	// Test GetHealthReport
