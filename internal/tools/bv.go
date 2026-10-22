@@ -64,14 +64,22 @@ func (a *BVAdapter) Version(ctx context.Context) (Version, error) {
 
 	cmd := exec.CommandContext(ctx, a.BinaryName(), "--version")
 	cmd.WaitDelay = time.Second
-	var stdout bytes.Buffer
+	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
 		return Version{}, fmt.Errorf("failed to get bv version: %w", err)
 	}
 
-	return ParseStandardVersion(stdout.String())
+	// bv prints --version to stdout; beads_viewer_rust (bvr) prints
+	// "bvr 0.4.1 (...)" to stderr. Parsing only stdout reported 0.0.0 for
+	// bvr, which also made every version-gated capability disappear.
+	output := stdout.String()
+	if strings.TrimSpace(output) == "" {
+		output = stderr.String()
+	}
+	return ParseStandardVersion(output)
 }
 
 // Capabilities returns the list of bv capabilities
