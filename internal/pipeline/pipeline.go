@@ -145,7 +145,12 @@ func (e *Executor) executeAdHocStage(ctx context.Context, stage Stage, paneID, p
 		}
 		delta, err := agentDeliveryNewOutput(before, current)
 		if err != nil {
-			return false, err
+			if !agentDeliveryRedrawTolerated(record.AgentType) {
+				return false, err
+			}
+			// See executor.go: pi's whole-pane repaint at turn start is expected;
+			// the idle detector decides completion.
+			delta = ""
 		}
 		if len(record.Output)+len(delta) > agentDeliveryMaxOutputBytes {
 			return false, fmt.Errorf("stage response exceeds the %d-byte evidence limit", agentDeliveryMaxOutputBytes)

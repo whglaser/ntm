@@ -2019,7 +2019,13 @@ func (e *Executor) executeAgentDelivery(ctx context.Context, step *Step, workflo
 		}
 		delta, err := agentDeliveryNewOutput(record.BeforeOutput, current)
 		if err != nil {
-			return false, err
+			if !agentDeliveryRedrawTolerated(record.AgentType) {
+				return false, err
+			}
+			// pi repaints the pane when a turn starts; the idle detector, not
+			// the capture boundary, decides completion. Re-anchor and keep
+			// waiting instead of treating the repaint as an ambiguous delivery.
+			delta, record.BeforeOutput = "", current
 		}
 		if len(record.Output)+len(delta) > agentDeliveryMaxOutputBytes {
 			return false, fmt.Errorf("agent response exceeds the %d-byte recovery evidence limit", agentDeliveryMaxOutputBytes)
@@ -2185,6 +2191,15 @@ func normalizeAgentEcho(output string) string {
 		lines[i] = line
 	}
 	return strings.Join(strings.Fields(strings.Join(lines, "\n")), " ")
+}
+
+// agentDeliveryRedrawTolerated reports whether a lost capture boundary is an
+// expected full-pane repaint rather than an ambiguous delivery outcome. pi
+// clears and redraws its pane when a turn starts and during long tool calls,
+// so its completion is decided by the idle detector instead of a stable
+// transcript boundary.
+func agentDeliveryRedrawTolerated(agentType string) bool {
+	return strings.EqualFold(strings.TrimSpace(agentType), "pi")
 }
 
 // A retained complete-line overlap supports normal scrollback rollover.

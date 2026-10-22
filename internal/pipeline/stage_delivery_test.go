@@ -248,6 +248,55 @@ func TestAdHocStageRequiresMoreThanIdlePromptEcho(t *testing.T) {
 	}
 }
 
+// A pi turn-start repaint replaces the whole pane, so the saved delivery
+// boundary disappears before the answer arrives. pi is repaint-driven: the
+// stage must re-anchor on the new screen and let the idle detector decide
+// completion instead of failing with "saved agent output boundary is no
+// longer visible".
+func TestAdHocStageToleratesPiRepaint(t *testing.T) {
+	executor, client, detector := newStageDeliveryFixture(t)
+	client.pane.Type = tmux.AgentType("pi")
+	client.before = "pi banner\nold transcript"
+	// The first post-dispatch capture is a bare repaint; the answer lands in
+	// the next capture, after the stage has re-anchored on the repaint.
+	repaint := "pi banner\n\n> Review this\nWorking"
+	client.after = repaint
+	detector.onIdle = func(call int) {
+		if call == 1 {
+			client.after = repaint + "\nStage answer."
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	result, err := executor.executeAdHocStage(ctx, Stage{AgentType: "pi", Prompt: "Review this"}, client.pane.ID, "", AgentDeliveryState{})
+	if err != nil {
+		t.Fatalf("pi repaint failed the stage: %v", err)
+	}
+	if !strings.Contains(result.Output, "Stage answer.") {
+		t.Fatalf("repainted answer lost: %+v", result)
+	}
+}
+
+// The same replacement screen for an append-only agent stays an ambiguous
+// boundary refusal: its saved delivery can no longer be verified, so the
+// stage must stop rather than guess which text is the response.
+func TestAdHocStageRejectsRepaintForOtherAgents(t *testing.T) {
+	executor, client, detector := newStageDeliveryFixture(t)
+	detector.onIdle = func(call int) {
+		if call == 1 {
+			client.after = "replacement screen\nStage answer."
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := executor.executeAdHocStage(ctx, Stage{AgentType: "cc", Prompt: "Do the task"}, client.pane.ID, "", AgentDeliveryState{})
+	if err == nil || !strings.Contains(err.Error(), "saved agent output boundary is no longer visible") {
+		t.Fatalf("non-pi repaint was not refused: %v", err)
+	}
+}
+
 func TestAdHocStageRejectsReplacedResponse(t *testing.T) {
 	executor, client, detector := newStageDeliveryFixture(t)
 	detector.onIdle = func(call int) {

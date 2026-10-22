@@ -147,8 +147,12 @@ func closesAnotherBox(line string) bool {
 // composer is found the input is returned unchanged. A capture containing
 // only chrome has an empty transcript.
 func trimAgentChrome(lines []string, agentType string) []string {
-	if agent.AgentType(agentType).Canonical() == agent.AgentTypeOmp {
+	canonical := agent.AgentType(agentType).Canonical()
+	if canonical == agent.AgentTypeOmp {
 		return trimOmpChrome(lines)
+	}
+	if canonical == agent.AgentType("pi") {
+		return trimPiChrome(lines)
 	}
 	markers := composerMarkers(agentType)
 	if len(markers) == 0 || len(lines) == 0 {
@@ -209,6 +213,96 @@ func trimOmpChrome(lines []string) []string {
 		return lines
 	}
 	return lines[:cut]
+}
+
+// trimPiChrome drops pi's bottom-pinned composer chrome. Pi renders inline
+// (no alternate screen) and pins a two-rule composer box to the bottom of the
+// pane; the top rule is plain at idle and carries the spinner/activity text
+// while a turn runs, and one or two status rows sit below the bottom rule:
+//
+//	── ⠙ Working ─────────────
+//
+//	──────────────────────────
+//	~/projects/demo (main)
+//	0.0%/1.0M (auto)  DeepSeek-V4.1-Flash
+//
+// The prompt/draft occupies the rows between the rules. Cutting at the top
+// rule leaves the append-only transcript above the composer, which is what
+// delivery-boundary comparison needs across composer redraws.
+func trimPiChrome(lines []string) []string {
+	start := len(lines) - piChromeScanLines
+	if start < 0 {
+		start = 0
+	}
+	bottom := -1
+	for i := len(lines) - 1; i >= start; i-- {
+		if isPiRuleLine(lines[i], false) {
+			bottom = i
+			break
+		}
+	}
+	if bottom < 0 {
+		return lines
+	}
+	cut := -1
+	for i := bottom - 1; i >= 0; i-- {
+		if isPiRuleLine(lines[i], true) {
+			cut = i
+			break
+		}
+	}
+	if cut < 0 {
+		return lines
+	}
+	// The shell launch command ntm types to start pi sits above the startup
+	// banner. pi clears that block when the first turn starts, but keeps the
+	// banner, so a saved pre-dispatch capture can only stay a prefix of later
+	// captures if the transcript begins at the banner.
+	for i := 0; i < cut; i++ {
+		if isPiBannerLine(lines[i]) {
+			return lines[i:cut]
+		}
+	}
+	return lines[:cut]
+}
+
+// isPiBannerLine recognizes the first line of pi's startup header
+// (\" ▀▀█  v1.3.0\"), which the TUI keeps above the transcript.
+func isPiBannerLine(line string) bool {
+	trimmed := strings.TrimSpace(StripANSI(line))
+	return strings.HasPrefix(trimmed, "▀▀█") && strings.Contains(trimmed, "v")
+}
+
+// piChromeScanLines bounds how far above the bottom of the capture the
+// composer's bottom rule is looked for; the two status rows sit below it.
+const piChromeScanLines = 8
+
+// isPiRuleLine reports whether line is a pi composer rule. Plain rules hold
+// only box-drawing dashes and whitespace. allowText additionally accepts the
+// working top rule, which embeds a spinner frame and activity text between
+// dash runs.
+func isPiRuleLine(line string, allowText bool) bool {
+	trimmed := strings.TrimSpace(StripANSI(line))
+	if trimmed == "" {
+		return false
+	}
+	runes := []rune(trimmed)
+	if runes[0] != '─' {
+		return false
+	}
+	dashes := 0
+	for _, r := range runes {
+		switch {
+		case r == '─':
+			dashes++
+		case r == ' ' || r == '\t':
+		case allowText:
+			// Embedded activity text between dash runs.
+		default:
+			return false
+		}
+	}
+	return dashes >= 4
 }
 
 // AgentTranscript removes recognized pinned composer and footer chrome while
