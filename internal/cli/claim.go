@@ -340,9 +340,15 @@ func validateSoftClaimBeadID(beadID string) (string, error) {
 		return "", fmt.Errorf("bead ID is required")
 	}
 	for _, r := range beadID {
-		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_') {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.') {
 			return "", fmt.Errorf("invalid bead ID %q", beadID)
 		}
+	}
+	// beads sub-issue IDs are dot-suffixed (e.g. ntm-l6cuz.2), so dots are
+	// valid -- but the ID is also the claim file's basename, so it must stay a
+	// safe path component: no leading/trailing dot and no ".." traversal.
+	if strings.HasPrefix(beadID, ".") || strings.HasSuffix(beadID, ".") || strings.Contains(beadID, "..") {
+		return "", fmt.Errorf("invalid bead ID %q", beadID)
 	}
 	return beadID, nil
 }
