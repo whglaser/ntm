@@ -87,6 +87,12 @@ Current NTM                          Future NTM
 
 **Status: Shipped** — `ntm activity`, `ntm wait`, `--robot-activity`, and `--robot-wait` are live.
 
+NTM can also prefer the agent's own OSC 7501 program-status reports over
+chrome scraping. That authoritative path is live for pipeline completion waits
+and `ntm serve` stream decoding, and the source-tagged detector is ready for
+`ntm activity`/`ntm wait` to adopt: see
+[program-status.md](program-status.md).
+
 ### Problem Statement
 
 NTM is currently "blind" after sending a prompt. It cannot answer:

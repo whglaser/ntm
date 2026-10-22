@@ -1,6 +1,6 @@
 {
   "source": "chi-router-walk",
-  "count": 180,
+  "count": 181,
   "endpoints": [
     {
       "method": "GET",
@@ -881,6 +881,11 @@
       "method": "POST",
       "path": "/api/v1/sessions/{sessionName}/rollback/",
       "handler": "handleRollback"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/streaming/program-status",
+      "handler": "handleProgramStatusV1"
     },
     {
       "method": "GET",
