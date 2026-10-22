@@ -370,7 +370,8 @@ func activityStateScope(session string, pane tmux.Pane) string {
 }
 
 func detectAgentTypeFromPane(pane tmux.Pane) string {
-	switch tmux.AgentType(pane.Type).Canonical() {
+	canonical := tmux.AgentType(pane.Type).Canonical()
+	switch canonical {
 	case tmux.AgentClaude:
 		return "claude"
 	case tmux.AgentCodex:
@@ -396,6 +397,11 @@ func detectAgentTypeFromPane(pane tmux.Pane) string {
 	case tmux.AgentUser:
 		return "user"
 	default:
+		// A registered agent plugin is its own type (ntm#260), mirroring the
+		// robot package's agentTypeString; anything else stays "unknown".
+		if agent.IsPluginType(agent.AgentType(canonical)) {
+			return strings.ToLower(strings.TrimSpace(string(canonical)))
+		}
 		return "unknown"
 	}
 }

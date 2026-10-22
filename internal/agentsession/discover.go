@@ -123,6 +123,8 @@ func ResumeProvider(agentType string) string {
 		return "antigravity"
 	case "omp", "oh-my-pi", "oh_my_pi", "ohmypi":
 		return "omp"
+	case "pi", "pi-coding-agent", "pi-cli":
+		return "pi"
 	default:
 		return ""
 	}
@@ -291,6 +293,8 @@ func (d *Discoverer) DiscoverContext(ctx context.Context, agentType, workDir str
 		info = discoverAntigravityContext(ctx, home, cleanWorkDir)
 	case "omp":
 		info = discoverOmpContext(ctx, home, cleanWorkDir, d.claimedSessions)
+	case "pi":
+		info = discoverPiContext(ctx, home, cleanWorkDir, d.claimedSessions)
 	}
 	if ctx.Err() != nil {
 		return nil
@@ -543,15 +547,18 @@ func providerCommandMarkers(provider string) []string {
 }
 
 func argvMatchesProvider(provider string, argv []string) bool {
-	if provider == "omp" {
-		// "omp" is a substring of unrelated commands (compiler, libomp,
-		// component): only the exact executable basename identifies it.
+	if provider == "omp" || provider == "pi" {
+		// "omp" (compiler, libomp, component) and "pi" (pip, api.py,
+		// compiler) are substrings of unrelated commands: only the exact
+		// executable basename identifies them. A shebang-invoked pi is
+		// `node /path/to/pi ...`, so the basename check must scan the first
+		// script arguments, not only argv[0].
 		limit := len(argv)
 		if limit > 4 {
 			limit = 4
 		}
 		for _, arg := range argv[:limit] {
-			if filepath.Base(strings.TrimSpace(arg)) == "omp" {
+			if filepath.Base(strings.TrimSpace(arg)) == provider {
 				return true
 			}
 		}
@@ -794,6 +801,8 @@ func resumedSessionID(provider string, argv []string) string {
 			return ""
 		}
 		return ompResumedSessionID(argv)
+	case "pi":
+		return piResumedSessionID(argv)
 	default:
 		return ""
 	}
@@ -939,6 +948,13 @@ func isProviderSessionFile(provider, path string) bool {
 		// omp holds its main transcript open for append; sub-agent
 		// transcripts (<AgentName>.jsonl) are open too but never match.
 		return OmpSessionID(path) != ""
+	case "pi":
+		// Pi main session transcripts are <timestamp>_<id>.jsonl under the
+		// agent's sessions directory; pi opens and closes them per append, so
+		// this path is a bonus and native-store discovery carries the weight.
+		return strings.HasSuffix(base, ".jsonl") &&
+			piSessionIDFromName(base) != "" &&
+			hasAncestor(filepath.Dir(path), "sessions", 4)
 	default:
 		return false
 	}
@@ -971,6 +987,8 @@ func infoFromSessionFile(agentType, provider, path string) *Info {
 		id = strings.TrimSuffix(filepath.Base(path), ".db")
 	case "omp":
 		id = OmpSessionID(path)
+	case "pi":
+		id = PiSessionID(path)
 	}
 	if id == "" {
 		return nil
@@ -1314,6 +1332,233 @@ func discoverOmpContext(ctx context.Context, home, workDir string, claimed map[s
 		AgentType:  "omp",
 		SessionID:  OmpSessionID(path),
 		Provider:   "omp",
+		SourcePath: path,
+		UpdatedAt:  mod,
+	}
+}
+
+// piSessionNamePattern matches a Pi main session transcript name,
+// <fileTimestamp>_<session-id>.jsonl (e.g.
+// 2026-10-20T19-27-54-994Z_01a15ac8-da71-77e3-b2f3-357c7f4eca8e.jsonl).
+// The id after the underscore is either a UUIDv7 or a custom --session-id.
+var piSessionNamePattern = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T[0-9-]+Z_(.+)\.jsonl$`)
+
+// piSessionProbeLimit bounds how many of a store directory's newest-named
+// transcripts are stat'ed. Names sort by creation time, so a live pane's
+// session is among the newest without statting a project's whole history.
+const piSessionProbeLimit = 8
+
+type piSessionHeader struct {
+	Type string `json:"type"`
+	ID   string `json:"id"`
+	Cwd  string `json:"cwd"`
+}
+
+// PiSessionID returns the session id of a Pi session transcript path, or ""
+// for any other path. The session header is authoritative; the filename is
+// the fallback when the header cannot be read.
+func PiSessionID(path string) string {
+	if header, ok := readPiSessionHeader(path); ok {
+		if id := strings.TrimSpace(header.ID); id != "" {
+			return id
+		}
+	}
+	return piSessionIDFromName(filepath.Base(path))
+}
+
+func piSessionIDFromName(name string) string {
+	m := piSessionNamePattern.FindStringSubmatch(name)
+	if m == nil {
+		return ""
+	}
+	return m[1]
+}
+
+// readPiSessionHeader parses the first JSONL line of a Pi session file. It is
+// bounded: a session header is the first line and never approaches 64 KiB.
+func readPiSessionHeader(path string) (piSessionHeader, bool) {
+	file, err := os.Open(path)
+	if err != nil {
+		return piSessionHeader{}, false
+	}
+	defer file.Close()
+	head := make([]byte, 64*1024)
+	n, _ := io.ReadFull(file, head)
+	line := head[:n]
+	if idx := bytes.IndexByte(line, '\n'); idx >= 0 {
+		line = line[:idx]
+	}
+	var header piSessionHeader
+	if json.Unmarshal(bytes.TrimSpace(line), &header) != nil || header.Type != "session" {
+		return piSessionHeader{}, false
+	}
+	return header, true
+}
+
+func piSessionCwd(path string) (string, bool) {
+	header, ok := readPiSessionHeader(path)
+	if !ok || strings.TrimSpace(header.Cwd) == "" {
+		return "", false
+	}
+	return filepath.Clean(header.Cwd), true
+}
+
+// PiSessionRoots returns the Pi session stores a pane launched with this
+// environment can write to, most specific first:
+// PI_CODING_AGENT_SESSION_DIR, then the default <home>/.pi/agent/sessions.
+// Missing directories are tolerated by the scanners.
+func PiSessionRoots(home string, getenv func(string) string) []string {
+	var roots []string
+	if getenv != nil {
+		if dir := strings.TrimSpace(getenv("PI_CODING_AGENT_SESSION_DIR")); dir != "" {
+			roots = append(roots, dir)
+		}
+	}
+	if home != "" {
+		roots = append(roots, filepath.Join(home, ".pi", "agent", "sessions"))
+	}
+	return roots
+}
+
+// NewestPiSessionForCwd locates the Pi session most likely belonging to a pane
+// working in workDir. Pi groups sessions into one <encoded-cwd> directory per
+// working directory (custom PI_CODING_AGENT_SESSION_DIR stores may also be
+// flat), so each directory is gated by the session-header cwd of its
+// newest-named transcript. Within matching directories, unclaimed sessions
+// compete by mtime: the newest modified after newerThan wins, else the newest
+// overall.
+func NewestPiSessionForCwd(roots []string, workDir string, newerThan time.Time, claimed map[string]bool) (string, time.Time) {
+	if workDir == "" {
+		return "", time.Time{}
+	}
+	workDir = filepath.Clean(workDir)
+	var newest, newestFresh string
+	var newestT, newestFreshT time.Time
+	seen := make(map[string]bool)
+	consider := func(dir string) {
+		dir = filepath.Clean(dir)
+		if seen[dir] {
+			return
+		}
+		seen[dir] = true
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return
+		}
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			if !e.IsDir() && piSessionNamePattern.MatchString(e.Name()) {
+				names = append(names, e.Name())
+			}
+		}
+		if len(names) == 0 {
+			return
+		}
+		sort.Sort(sort.Reverse(sort.StringSlice(names)))
+		if len(names) > piSessionProbeLimit {
+			names = names[:piSessionProbeLimit]
+		}
+		if cwd, ok := piSessionCwd(filepath.Join(dir, names[0])); !ok || cwd != workDir {
+			return
+		}
+		for _, name := range names {
+			path := filepath.Join(dir, name)
+			if claimed[sessionClaimKey("pi", piSessionIDFromName(name))] {
+				continue
+			}
+			info, err := os.Stat(path)
+			if err != nil {
+				continue
+			}
+			mt := info.ModTime()
+			if mt.After(newestT) {
+				newest, newestT = path, mt
+			}
+			if mt.After(newerThan) && mt.After(newestFreshT) {
+				newestFresh, newestFreshT = path, mt
+			}
+		}
+	}
+	for _, root := range roots {
+		if root == "" {
+			continue
+		}
+		consider(root)
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				consider(filepath.Join(root, e.Name()))
+			}
+		}
+	}
+	if newestFresh != "" {
+		return newestFresh, newestFreshT
+	}
+	return newest, newestT
+}
+
+// piResumedSessionID extracts the session a Pi process was started or resumed
+// with: `--session <id|path|prefix>`, `--session-id <id>` (exact, creating if
+// missing), or their inline forms. `--resume`/`-r` is the interactive picker
+// and `--continue`/`-c` names no id, so both yield "".
+func piResumedSessionID(argv []string) string {
+	if !argvMatchesProvider("pi", argv) {
+		return ""
+	}
+	for i := 0; i < len(argv); i++ {
+		var candidate string
+		switch {
+		case strings.HasPrefix(argv[i], "--session-id="):
+			candidate = strings.TrimPrefix(argv[i], "--session-id=")
+		case argv[i] == "--session-id":
+			if i+1 < len(argv) {
+				candidate = argv[i+1]
+			}
+		case strings.HasPrefix(argv[i], "--session="):
+			candidate = strings.TrimPrefix(argv[i], "--session=")
+		case argv[i] == "--session":
+			if i+1 < len(argv) {
+				candidate = argv[i+1]
+			}
+		default:
+			continue
+		}
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" || strings.HasPrefix(candidate, "-") {
+			return ""
+		}
+		if id := piSessionIDFromPath(candidate); id != "" {
+			return id
+		}
+		return candidate
+	}
+	return ""
+}
+
+// piSessionIDFromPath resolves a session path (or filename) to the id pi
+// stores in it; a bare id or unique prefix is returned by the caller as-is.
+func piSessionIDFromPath(candidate string) string {
+	if !strings.ContainsAny(candidate, `/\`) && !strings.HasSuffix(candidate, ".jsonl") {
+		return ""
+	}
+	return piSessionIDFromName(filepath.Base(candidate))
+}
+
+func discoverPiContext(ctx context.Context, home, workDir string, claimed map[string]bool) *Info {
+	if ctx.Err() != nil {
+		return nil
+	}
+	path, mod := NewestPiSessionForCwd(PiSessionRoots(home, os.Getenv), workDir, time.Time{}, claimed)
+	if path == "" || ctx.Err() != nil {
+		return nil
+	}
+	return &Info{
+		AgentType:  "pi",
+		SessionID:  PiSessionID(path),
+		Provider:   "pi",
 		SourcePath: path,
 		UpdatedAt:  mod,
 	}

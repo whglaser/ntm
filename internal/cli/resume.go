@@ -16,6 +16,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	dispatchsvc "github.com/Dicklesworthstone/ntm/internal/dispatch"
 	"github.com/Dicklesworthstone/ntm/internal/handoff"
+	"github.com/Dicklesworthstone/ntm/internal/plugins"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
 	sessionpkg "github.com/Dicklesworthstone/ntm/internal/session"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
@@ -73,15 +74,16 @@ type ResumeInjectInfo struct {
 
 func newResumeCmd() *cobra.Command {
 	var (
-		fromPath string
-		spawn    bool
-		inject   bool
-		dryRun   bool
-		ccCount  int
-		codCount int
-		gmiCount int
-		agyCount int
-		ompCount int
+		fromPath    string
+		spawn       bool
+		inject      bool
+		dryRun      bool
+		ccCount     int
+		codCount    int
+		gmiCount    int
+		agyCount    int
+		ompCount    int
+		pluginSpecs AgentSpecs
 	)
 
 	cmd := &cobra.Command{
@@ -107,7 +109,7 @@ Examples:
 			}
 			effectiveJSON := IsJSONOutput()
 			err := runResume(cmd, sessionName, fromPath, spawn, inject, dryRun,
-				resumeSpawnCounts{CC: ccCount, Cod: codCount, Gmi: gmiCount, Agy: agyCount, Omp: ompCount}, effectiveJSON)
+				resumeSpawnCounts{CC: ccCount, Cod: codCount, Gmi: gmiCount, Agy: agyCount, Omp: ompCount, Plugins: pluginSpecs}, effectiveJSON)
 			return outputResumeCommandError(cmd, resumeAction(spawn, inject), effectiveJSON, err)
 		},
 	}
@@ -122,16 +124,29 @@ Examples:
 	cmd.Flags().IntVar(&agyCount, "agy", 0, "Number of Antigravity agents to spawn (requires --spawn)")
 	cmd.Flags().IntVar(&ompCount, "omp", 0, "Number of Oh My Pi (omp) agents to spawn (requires --spawn)")
 
+	// Agent plugins get the same N[:model[:effort]] selector flags as
+	// `ntm spawn`, so `ntm resume <session> --spawn --pi=2` can bootstrap a
+	// handoff into plugin agent panes.
+	for _, p := range registerAgentPluginTypes(pluginAgentsDirForArgs(os.Args[1:])) {
+		registerPluginAgentFlags(cmd, p, &pluginSpecs)
+	}
+
 	return cmd
 }
 
 // resumeSpawnCounts carries the per-type agent counts for `resume --spawn`.
 type resumeSpawnCounts struct {
 	CC, Cod, Gmi, Agy, Omp int
+	// Plugins carries N[:model[:effort]] specs for agent plugins (e.g. --pi=2).
+	Plugins AgentSpecs
 }
 
 func (c resumeSpawnCounts) total() int {
-	return c.CC + c.Cod + c.Gmi + c.Agy + c.Omp
+	total := c.CC + c.Cod + c.Gmi + c.Agy + c.Omp
+	for _, spec := range c.Plugins {
+		total += spec.Count
+	}
+	return total
 }
 
 func runResume(cmd *cobra.Command, sessionName, fromPath string, spawn, inject, dryRun bool,
@@ -367,7 +382,7 @@ func spawnWithHandoff(cmd *cobra.Command, sessionName string, h *handoff.Handoff
 
 	// Validate counts
 	if counts.total() == 0 {
-		return fmt.Errorf("--spawn requires at least one agent count (--cc, --cod, --gmi, --agy, or --omp)")
+		return fmt.Errorf("--spawn requires at least one agent count (--cc, --cod, --gmi, --agy, --omp, or a plugin agent flag)")
 	}
 
 	// Format context for injection
@@ -392,6 +407,32 @@ func spawnWithHandoff(cmd *cobra.Command, sessionName string, h *handoff.Handoff
 		OmpCount:           counts.Omp,
 		UserPane:           true,
 		NoHooks:            true,
+	}
+	// resume --spawn calls the spawn lifecycle directly instead of the spawn
+	// command's RunE, so it must load the agent plugin map itself; otherwise
+	// every plugin selector (e.g. --pi=1) fails validation as an unknown type.
+	if loaded, loadErr := plugins.LoadAgentPlugins(pluginAgentsDirForArgs(os.Args[1:])); loadErr == nil {
+		pluginMap := make(map[string]plugins.AgentPlugin, len(loaded)*2)
+		for _, p := range loaded {
+			pluginMap[p.Name] = p
+			if p.Alias != "" {
+				pluginMap[p.Alias] = p
+			}
+		}
+		opts.PluginMap = pluginMap
+	}
+	if len(counts.Plugins) > 0 {
+		// Flatten built-ins and plugin specs together so per-type indexing,
+		// models, and reasoning effort survive into the launch loop.
+		specs := AgentSpecs{
+			{Type: AgentTypeClaude, Count: counts.CC},
+			{Type: AgentTypeCodex, Count: counts.Cod},
+			{Type: AgentTypeGemini, Count: counts.Gmi},
+			{Type: AgentTypeAntigravity, Count: counts.Agy},
+			{Type: AgentTypeOmp, Count: counts.Omp},
+		}
+		specs = append(specs, counts.Plugins...)
+		opts.Agents = specs.Flatten()
 	}
 
 	spawnFn := resumeSpawnLifecycle(jsonFormat)

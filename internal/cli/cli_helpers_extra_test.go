@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	agentpkg "github.com/Dicklesworthstone/ntm/internal/agent"
 	hookspkg "github.com/Dicklesworthstone/ntm/internal/hooks"
 	"github.com/Dicklesworthstone/ntm/internal/output"
 	"github.com/Dicklesworthstone/ntm/internal/persona"
@@ -83,6 +84,20 @@ func TestDetectAgentTypeFromPane(t *testing.T) {
 				t.Errorf("detectAgentTypeFromPane(%v) = %q, want %q", tc.pane.Type, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestDetectAgentTypeFromPaneRecognizesPluginType(t *testing.T) {
+	// A plugin type registered the way the root pre-run registers agents/
+	// *.toml presets must resolve to its own name, not "unknown": plugin
+	// panes were dropped from activity and --verify-boot observations because
+	// this mapping only knew built-in types (ntm#260).
+	if err := agentpkg.RegisterPlugin("pi", nil, nil, nil); err != nil {
+		t.Fatalf("register plugin: %v", err)
+	}
+	pane := tmux.Pane{Type: tmux.AgentType("pi")}
+	if got := detectAgentTypeFromPane(pane); got != "pi" {
+		t.Fatalf("detectAgentTypeFromPane(%q) = %q, want pi", pane.Type, got)
 	}
 }
 

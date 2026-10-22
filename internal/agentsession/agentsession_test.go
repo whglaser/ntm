@@ -63,6 +63,8 @@ func TestResumeProvider(t *testing.T) {
 		"antigravity":     "antigravity",
 		"antigravity-cli": "antigravity",
 		"AGY":             "antigravity",
+		"pi":              "pi",
+		"PI":              "pi",
 		"user":            "",
 		"cursor":          "",
 		"":                "",
@@ -128,6 +130,8 @@ func TestResumeCommandNative(t *testing.T) {
 		{"gemini", "g9", true, "gemini --resume 'g9'"},
 		{"antigravity", "uuid-9", false, "agy --conversation 'uuid-9' --model 'Gemini 4 Argon (High)'"},
 		{"antigravity", "uuid-9", true, "agy --conversation 'uuid-9' --model 'Gemini 4 Argon (High)'"},
+		{"pi", "uuid-pi", false, "pi --approve --session 'uuid-pi'"},
+		{"pi", "uuid-pi", true, "pi --approve --session 'uuid-pi'"},
 		{"claude", "", true, ""},
 		{"unknown", "x", true, ""},
 	}
@@ -190,6 +194,9 @@ func TestResumeLaunchCommandPreservesSettingsAndReplacesSelector(t *testing.T) {
 		{"antigravity existing", "antigravity", `agy --conversation=old-id --model 'Gemini 4 Argon (High)'`, `agy --conversation 'new-id' --model 'Gemini 4 Argon (High)'`},
 		{"omp settings", "omp", `omp --auto-approve --model 'provider/custom' --thinking high --append-system-prompt '/work/persona.md'`, `omp --auto-approve --model 'provider/custom' --thinking high --append-system-prompt '/work/persona.md' --resume 'new-id'`},
 		{"omp existing", "omp", `omp --auto-approve --resume=old-id --thinking high`, `omp --auto-approve --resume 'new-id' --thinking high`},
+		{"pi settings", "pi", `PI_SKIP_VERSION_CHECK='1' pi --approve --model 'provider/custom' --thinking high --append-system-prompt '/work/persona.md'`, `PI_SKIP_VERSION_CHECK='1' pi --approve --model 'provider/custom' --thinking high --append-system-prompt '/work/persona.md' --session 'new-id'`},
+		{"pi existing", "pi", `pi --approve --session old-id --thinking high`, `pi --approve --session 'new-id' --thinking high`},
+		{"pi inline session-id", "pi", `pi --approve --session-id=old-id --model custom`, `pi --approve --session 'new-id' --model custom`},
 		{"ntm memory wrapper", "claude", `systemd-run --user --scope -q -p MemoryMax=8192M claude --model custom --effort high`, `systemd-run --user --scope -q -p MemoryMax=8192M claude --model custom --effort high --resume 'new-id'`},
 	}
 	for _, tc := range cases {
@@ -1103,6 +1110,13 @@ func TestResumedSessionID(t *testing.T) {
 		{"gemini", []string{"gemini", "--resume", "latest"}, ""},
 		{"gemini", []string{"gemini", "--resume", "5"}, ""},
 		{"antigravity", []string{"agy", "--conversation", "agy-id", "--model", "x"}, "agy-id"},
+		{"pi", []string{"pi", "--approve", "--session", "01a15ac8-da71-77e3-b2f3-357c7f4eca8e"}, "01a15ac8-da71-77e3-b2f3-357c7f4eca8e"},
+		{"pi", []string{"pi", "--session-id", "custom.id"}, "custom.id"},
+		{"pi", []string{"pi", "--session-id=custom.id"}, "custom.id"},
+		{"pi", []string{"pi", "--session", "/home/u/.pi/agent/sessions/--p--/2026-10-20T19-27-54-994Z_01a15ac8-da71-77e3-b2f3-357c7f4eca8e.jsonl"}, "01a15ac8-da71-77e3-b2f3-357c7f4eca8e"},
+		{"pi", []string{"pi", "--resume"}, ""},
+		{"pi", []string{"pi", "-c"}, ""},
+		{"pi", []string{"rg", "--session", "x"}, ""},
 		{"codex", []string{"codex", "exec", "task"}, ""},
 		{"codex", []string{"rg", "resume", "not-a-session"}, ""},
 	}
@@ -1566,5 +1580,154 @@ func TestClaudeProcessSessionRejectsRecordsItCannotTrust(t *testing.T) {
 				t.Fatalf("binding = %+v, want none", info)
 			}
 		})
+	}
+}
+
+const (
+	piSessionUUID      = "01a15ac8-da71-77e3-b2f3-357c7f4eca8e"
+	piOtherSessionUUID = "01a15ac9-398d-71c7-ad2b-e2959d588253"
+	piSessionFileName  = "2026-10-20T19-27-54-994Z_" + piSessionUUID + ".jsonl"
+)
+
+func writePiSession(t *testing.T, dir, name, id, cwd string) string {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	header := `{"type":"session","version":3,"id":"` + id + `","timestamp":"2026-10-20T19-27-54.994Z","cwd":"` + cwd + `"}` + "\n"
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte(header), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func clearPiEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("PI_CODING_AGENT_SESSION_DIR", "")
+}
+
+func TestPiProcessArgvAndSessionFiles(t *testing.T) {
+	for _, argv := range [][]string{{"pi"}, {"/usr/bin/pi", "--approve"}, {"node", "/usr/bin/pi", "--approve"}} {
+		if !argvMatchesProvider("pi", argv) {
+			t.Errorf("argvMatchesProvider(pi, %q) = false", argv)
+		}
+	}
+	for _, argv := range [][]string{{"pip", "install"}, {"/usr/bin/ping"}, {"node", "api.py"}, {"zsh", "-l"}} {
+		if argvMatchesProvider("pi", argv) {
+			t.Errorf("argvMatchesProvider(pi, %q) = true; only the exact executable identifies pi", argv)
+		}
+	}
+
+	tests := []struct {
+		argv []string
+		want string
+	}{
+		{[]string{"pi", "--approve", "--session", "01a15ac8"}, "01a15ac8"},
+		{[]string{"pi", "--session-id", piSessionUUID}, piSessionUUID},
+		{[]string{"pi", "--session-id=" + piSessionUUID}, piSessionUUID},
+		{[]string{"pi", "--session", "/home/u/.pi/agent/sessions/--p--/" + piSessionFileName}, piSessionUUID},
+		{[]string{"pi", "--resume"}, ""}, // interactive picker
+		{[]string{"pi", "-c"}, ""},
+		{[]string{"node", "/usr/bin/pi", "--session", piSessionUUID}, piSessionUUID},
+		{[]string{"rg", "--session", "x"}, ""},
+	}
+	for _, test := range tests {
+		if got := resumedSessionID("pi", test.argv); got != test.want {
+			t.Errorf("resumedSessionID(pi, %q) = %q, want %q", test.argv, got, test.want)
+		}
+	}
+
+	root := filepath.Join(t.TempDir(), ".pi", "agent", "sessions", "--data-projects-demo--")
+	mainPath := writePiSession(t, root, piSessionFileName, piSessionUUID, "/data/projects/demo")
+	// The header id is authoritative even if the filename disagrees.
+	oddPath := writePiSession(t, root, "2026-10-20T19-28-00-000Z_not-the-uuid.jsonl", piOtherSessionUUID, "/data/projects/demo")
+	if !isProviderSessionFile("pi", mainPath) || !isProviderSessionFile("pi", oddPath) {
+		t.Fatalf("isProviderSessionFile: main=%v odd=%v", isProviderSessionFile("pi", mainPath), isProviderSessionFile("pi", oddPath))
+	}
+	if got := PiSessionID(oddPath); got != piOtherSessionUUID {
+		t.Fatalf("PiSessionID(odd) = %q, want header id %s", got, piOtherSessionUUID)
+	}
+	if isProviderSessionFile("pi", filepath.Join(t.TempDir(), "notes.jsonl")) {
+		t.Fatal("unrelated jsonl must not match")
+	}
+	info := processNodeSession("pi", "pi", []string{"node", "/usr/bin/pi", "--approve"}, func() []string {
+		return []string{mainPath}
+	})
+	if info == nil || info.SessionID != piSessionUUID || info.SourcePath != mainPath || info.AgentType != "pi" || info.Provider != "pi" {
+		t.Fatalf("pi process discovery = %+v, want %s from %s", info, piSessionUUID, mainPath)
+	}
+}
+
+func TestPiSessionRoots(t *testing.T) {
+	env := map[string]string{}
+	getenv := func(key string) string { return env[key] }
+	if got := PiSessionRoots("/home/u", getenv); !reflect.DeepEqual(got, []string{"/home/u/.pi/agent/sessions"}) {
+		t.Fatalf("default roots = %v", got)
+	}
+	env["PI_CODING_AGENT_SESSION_DIR"] = "/launch/sessions"
+	want := []string{"/launch/sessions", "/home/u/.pi/agent/sessions"}
+	if got := PiSessionRoots("/home/u", getenv); !reflect.DeepEqual(got, want) {
+		t.Fatalf("override roots = %v, want %v", got, want)
+	}
+	if got := PiSessionRoots("", getenv); !reflect.DeepEqual(got, []string{"/launch/sessions"}) {
+		t.Fatalf("home-less roots = %v", got)
+	}
+}
+
+func TestNewestPiSessionForCwd(t *testing.T) {
+	sessions := t.TempDir()
+	projDir := filepath.Join(sessions, "--data-proj--")
+	older := writePiSession(t, projDir, "2026-10-20T18-00-00-000Z_"+piOtherSessionUUID+".jsonl", piOtherSessionUUID, "/data/proj")
+	newest := writePiSession(t, projDir, piSessionFileName, piSessionUUID, "/data/proj")
+	writePiSession(t, filepath.Join(sessions, "--data-other--"), "2026-10-20T19-30-00-000Z_01a15ad0-0000-7000-8000-000000000000.jsonl", "01a15ad0-0000-7000-8000-000000000000", "/data/other")
+
+	past := time.Now().Add(-time.Hour)
+	future := time.Now().Add(time.Minute)
+	for path, at := range map[string]time.Time{older: past, newest: future} {
+		if err := os.Chtimes(path, at, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	roots := []string{filepath.Join(sessions, "missing"), sessions}
+	if got, _ := NewestPiSessionForCwd(roots, "/data/proj/", time.Time{}, nil); got != newest {
+		t.Errorf("newest = %q, want %q", got, newest)
+	}
+	claimed := map[string]bool{sessionClaimKey("pi", piSessionUUID): true}
+	if got, _ := NewestPiSessionForCwd(roots, "/data/proj", time.Time{}, claimed); got != older {
+		t.Errorf("with the newest claimed = %q, want %q", got, older)
+	}
+	if got, _ := NewestPiSessionForCwd(roots, "/data/nomatch", time.Time{}, nil); got != "" {
+		t.Errorf("unmatched cwd = %q, want none", got)
+	}
+	// Flat custom store layout: transcripts directly in the root.
+	flat := t.TempDir()
+	flatPath := writePiSession(t, flat, piSessionFileName, piSessionUUID, "/data/proj")
+	if got, _ := NewestPiSessionForCwd([]string{flat}, "/data/proj", time.Time{}, nil); got != flatPath {
+		t.Errorf("flat store = %q, want %q", got, flatPath)
+	}
+}
+
+func TestDiscoverPiNativeStore(t *testing.T) {
+	clearPiEnv(t)
+	home := t.TempDir()
+	dir := filepath.Join(home, ".pi", "agent", "sessions", "--data-projects-demo--")
+	first := writePiSession(t, dir, piSessionFileName, piSessionUUID, "/data/projects/demo")
+	second := writePiSession(t, dir, "2026-10-20T19-30-00-000Z_"+piOtherSessionUUID+".jsonl", piOtherSessionUUID, "/data/projects/demo")
+	older := time.Now().Add(-time.Minute)
+	if err := os.Chtimes(first, older, older); err != nil {
+		t.Fatal(err)
+	}
+
+	discoverer := nativeDiscoverer(home)
+	info := discoverer.Discover("pi", "/data/projects/demo", 0)
+	if info == nil || info.SessionID != piOtherSessionUUID || info.SourcePath != second || info.Source != DiscoverySourceNativeStore {
+		t.Fatalf("first pi pane = %+v, want %s", info, piOtherSessionUUID)
+	}
+	// Same-workspace panes are handed distinct unclaimed sessions.
+	next := discoverer.Discover("pi", "/data/projects/demo", 7)
+	if next == nil || next.SessionID != piSessionUUID {
+		t.Fatalf("second pi pane = %+v, want %s", next, piSessionUUID)
 	}
 }
