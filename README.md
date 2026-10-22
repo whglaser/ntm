@@ -731,6 +731,13 @@ program-status reports instead of chrome scraping (currently pi). See
 `PI_PROGRAM_STATUS=1` launch requirement, how `state_source` reports `osc` vs
 `scrape`, and troubleshooting.
 
+To start a **new** run at a later step while reusing the earlier steps' persisted
+outputs, pass `--start-from <step-id>` together with `--from-state <prior-run-id>`
+(both are required together; skipped steps are never dispatched). See
+[docs/pipeline-resume.md](docs/pipeline-resume.md) for the resume playbook, the
+difference from `ntm pipeline resume`, and the fail-closed verify-gate pattern
+that catches missing artifacts.
+
 Unknown submission outcomes, replaced pane processes or hosts, and missing output
 boundaries stop recovery with the receipt preserved. If you verify that the
 original agent received an uncertain submission, record that observation and
