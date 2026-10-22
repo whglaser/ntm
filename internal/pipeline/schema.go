@@ -1348,14 +1348,17 @@ type StepResult struct {
 
 // StepError contains detailed error information for a failed step
 type StepError struct {
-	Type       string      `json:"type"` // timeout, agent_error, crash, validation, routing, send, capture
-	Message    string      `json:"message"`
-	Details    string      `json:"details,omitempty"`     // Full error output
-	PaneOutput string      `json:"pane_output,omitempty"` // Last N lines from pane for debugging
-	AgentState string      `json:"agent_state,omitempty"` // Agent state at time of error
-	Attempt    int         `json:"attempt,omitempty"`     // Which retry attempt
-	Timestamp  time.Time   `json:"timestamp"`
-	Aggregated []StepError `json:"aggregated,omitempty"` // Nested foreach/parallel errors
+	Type       string `json:"type"` // timeout, agent_error, crash, validation, routing, send, capture
+	Message    string `json:"message"`
+	Details    string `json:"details,omitempty"`     // Full error output
+	PaneOutput string `json:"pane_output,omitempty"` // Last N lines from pane for debugging
+	AgentState string `json:"agent_state,omitempty"` // Agent state at time of error
+	// AgentStateSource records which source decided AgentState (osc|scrape)
+	// when the detector reports one; empty for detectors that do not.
+	AgentStateSource string      `json:"agent_state_source,omitempty"`
+	Attempt          int         `json:"attempt,omitempty"` // Which retry attempt
+	Timestamp        time.Time   `json:"timestamp"`
+	Aggregated       []StepError `json:"aggregated,omitempty"` // Nested foreach/parallel errors
 }
 
 // ExecutionState contains the complete state of a workflow execution

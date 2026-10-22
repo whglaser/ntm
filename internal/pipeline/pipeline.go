@@ -38,6 +38,9 @@ func Execute(ctx context.Context, p Pipeline) error {
 	var previousOutput string
 	var previousDelivery AgentDeliveryState
 	executor := NewExecutor(DefaultExecutorConfig(p.Session))
+	// Retire OSC 7501 pane taps when the shorthand chain ends; Execute is the
+	// run boundary for stage pipelines (they never pass through Run/Resume).
+	defer executor.stopProgramStatusCapture()
 
 	for i, stage := range p.Stages {
 		if err := ctx.Err(); err != nil {
@@ -72,6 +75,10 @@ func Execute(ctx context.Context, p Pipeline) error {
 func (e *Executor) executeAdHocStage(ctx context.Context, stage Stage, paneID, previousOutput string, previous AgentDeliveryState) (AgentDeliveryState, error) {
 	agentType := normalizeAgentType(stage.AgentType)
 	record := AgentDeliveryState{Session: e.config.Session, PaneID: paneID, Endpoint: e.agentDeliveryEndpoint(), AgentType: agentType}
+	// Attach the OSC 7501 tap before the prompt is pasted (see executor.go's
+	// executeAgentDelivery): reports are change-driven, so a late tap would
+	// miss the working → done transition.
+	e.ensureProgramStatusCapture(paneID)
 	pane, err := e.agentDeliveryPane(ctx, paneID, 0, record.Endpoint)
 	if err != nil {
 		return record, err

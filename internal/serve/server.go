@@ -50,6 +50,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/kernel"
 	"github.com/Dicklesworthstone/ntm/internal/pipeline"
 	"github.com/Dicklesworthstone/ntm/internal/policy"
+	"github.com/Dicklesworthstone/ntm/internal/programstatus"
 	"github.com/Dicklesworthstone/ntm/internal/redaction"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
 	"github.com/Dicklesworthstone/ntm/internal/robot/adapters"
@@ -106,7 +107,10 @@ type Server struct {
 	wsEventStoreOnce sync.Once
 
 	// Pane output streaming
-	streamManager   *tmux.StreamManager
+	streamManager *tmux.StreamManager
+	// programStatus decodes OSC 7501 (pi program status) reports out of
+	// streamed raw pane output and keeps the latest report per pane.
+	programStatus   *programstatus.Observer
 	spawnAgents     func(context.Context, robot.SpawnOptions) (*robot.SpawnOutput, error)
 	sendAgents      func(robot.SendOptions) (*robot.SendOutput, error)
 	interruptAgents func(robot.InterruptOptions) (*robot.InterruptOutput, error)
@@ -1283,7 +1287,11 @@ func New(cfg Config) *Server {
 
 	// Initialize pane output streaming
 	streamCfg := tmux.DefaultPaneStreamerConfig()
+	s.programStatus = programstatus.NewObserver()
 	s.streamManager = tmux.NewStreamManager(tmux.DefaultClient, func(event tmux.StreamEvent) {
+		// Decode any OSC 7501 program-status reports in the raw stream before
+		// publishing the bytes themselves.
+		s.observePaneProgramStatus(event)
 		// Publish pane output to WebSocket subscribers
 		// Topic format: panes:session:pane_idx
 		s.wsHub.Publish(streamTopicForTarget(event.Target), "pane.output", map[string]interface{}{
@@ -1443,6 +1451,10 @@ func (s *Server) buildRouter() chi.Router {
 
 		// Streaming stats endpoint
 		r.With(s.RequirePermission(PermReadHealth)).Get("/streaming/stats", s.handleStreamingStatsV1)
+
+		// Latest OSC 7501 program-status report per pane, captured from raw
+		// pipe-pane output (never from scraped pane content).
+		r.With(s.RequirePermission(PermReadHealth)).Get("/streaming/program-status", s.handleProgramStatusV1)
 
 		// Agents API - manage AI agents within sessions
 		r.Route("/sessions/{sessionId}/agents", func(r chi.Router) {
@@ -4374,8 +4386,96 @@ func (s *Server) handleStreamingStatsV1(w http.ResponseWriter, r *http.Request) 
 
 	stats := s.streamManager.Stats()
 	stats["active_targets"] = s.streamManager.ListActive()
+	if s.programStatus != nil {
+		stats["program_status_panes"] = s.programStatus.Len()
+	}
 
 	writeSuccessResponse(w, http.StatusOK, stats, reqID)
+}
+
+// observePaneProgramStatus decodes OSC 7501 reports from one raw pipe-pane
+// stream event and publishes them on the pane's stream topic.
+//
+// Polling events (IsFull) are rendered screen captures: terminals consume
+// OSC sequences, so a scrape can never contain one. Feeding them to the
+// parser would only waste work, so they are skipped — the reported status is
+// always the agent's own report, never a scrape.
+func (s *Server) observePaneProgramStatus(event tmux.StreamEvent) {
+	if s.programStatus == nil || event.IsFull || event.Target == "" || len(event.Lines) == 0 {
+		return
+	}
+	for _, line := range event.Lines {
+		// The line's trailing newline was stripped by the streamer and is not
+		// re-added: newlines never occur inside a protocol sequence (pi
+		// strips control characters), and dropping them keeps the parser
+		// correct no matter how a future tap chunks its reads.
+		for _, status := range s.programStatus.Observe(event.Target, []byte(line)) {
+			s.publishProgramStatus(status)
+		}
+	}
+}
+
+// publishProgramStatus broadcasts one decoded report to WebSocket
+// subscribers of the pane's stream topic.
+func (s *Server) publishProgramStatus(status programstatus.Event) {
+	s.wsHub.Publish(streamTopicForTarget(status.PaneID), "pane.status", map[string]interface{}{
+		"pane":        status.PaneID,
+		"state":       string(status.State),
+		"app":         status.App,
+		"kind":        status.Kind,
+		"message":     status.Message,
+		"source":      "osc",
+		"observed_at": status.ObservedAt.UTC().Format(time.RFC3339Nano),
+	})
+}
+
+// programStatusEntry is the REST representation of a stored report.
+type programStatusEntry struct {
+	Pane       string              `json:"pane"`
+	State      programstatus.State `json:"state,omitempty"`
+	App        string              `json:"app,omitempty"`
+	Kind       string              `json:"kind,omitempty"`
+	Message    string              `json:"message,omitempty"`
+	ObservedAt string              `json:"observed_at,omitempty"`
+}
+
+// handleProgramStatusV1 handles GET /api/v1/streaming/program-status.
+// It returns the latest OSC 7501 report observed on each streamed pane. An
+// optional ?pane= filter selects one target. Panes with no observed report
+// are absent rather than reported as unknown: callers fall back to their
+// scrape-based status source for those.
+func (s *Server) handleProgramStatusV1(w http.ResponseWriter, r *http.Request) {
+	reqID := requestIDFromContext(r.Context())
+	filter := strings.TrimSpace(r.URL.Query().Get("pane"))
+
+	statuses := make([]programStatusEntry, 0)
+	if s.programStatus != nil {
+		snapshot := s.programStatus.Snapshot()
+		panes := make([]string, 0, len(snapshot))
+		for paneID := range snapshot {
+			panes = append(panes, paneID)
+		}
+		sort.Strings(panes)
+		for _, paneID := range panes {
+			if filter != "" && paneID != filter {
+				continue
+			}
+			status := snapshot[paneID]
+			statuses = append(statuses, programStatusEntry{
+				Pane:       paneID,
+				State:      status.State,
+				App:        status.App,
+				Kind:       status.Kind,
+				Message:    status.Message,
+				ObservedAt: status.ObservedAt.UTC().Format(time.RFC3339Nano),
+			})
+		}
+	}
+
+	writeSuccessResponse(w, http.StatusOK, map[string]interface{}{
+		"statuses": statuses,
+		"count":    len(statuses),
+	}, reqID)
 }
 
 // =============================================================================
