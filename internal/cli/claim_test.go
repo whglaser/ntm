@@ -139,6 +139,27 @@ func TestSoftClaimRejectsUnsafeBeadIDAndTTL(t *testing.T) {
 	}
 }
 
+// Sub-issue IDs are the normal form for child beads (ntm-l6cuz.2) and the
+// serve-side bead pattern accepts them; the soft-claim validator must too,
+// without letting the ID escape the claim directory as a path component.
+func TestSoftClaimAcceptsSubIssueIDsAndRejectsTraversal(t *testing.T) {
+	projectDir := t.TempDir()
+	for _, id := range []string{"ntm-l6cuz.2", "bd-2euwg.1", "ntm-32yad"} {
+		claim, err := createSoftClaim(projectDir, id, "CrimsonCardinal", time.Minute)
+		if err != nil {
+			t.Fatalf("createSoftClaim(%q) = %v", id, err)
+		}
+		if claim.BeadID != id {
+			t.Fatalf("claim bead ID = %q, want %q", claim.BeadID, id)
+		}
+	}
+	for _, id := range []string{"..", ".", ".hidden", "ntm..l6cuz", "ntm-l6cuz.", "a/../b"} {
+		if _, err := createSoftClaim(projectDir, id, "CrimsonCardinal", time.Minute); err == nil {
+			t.Fatalf("unsafe bead ID %q succeeded", id)
+		}
+	}
+}
+
 func TestReadSoftClaimRejectsMalformedFile(t *testing.T) {
 	projectDir := t.TempDir()
 	claimPath := softClaimPath(projectDir, "ntm-invalid")
