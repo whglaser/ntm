@@ -1001,16 +1001,20 @@ func TestSessionObserverAppliesPaneLocalActivityBound(t *testing.T) {
 	second := first.Add(time.Minute)
 	nowValues := []time.Time{first, second}
 	nowIndex := 0
-	// A Gemini pane at its prompt: no agent-specific short-circuit, so its
-	// verdict is decided purely by the velocity gate.
-	const capture = "Analysis complete.\ngemini>"
+	// A Cursor pane at its prompt: Cursor has no live-frame short-circuit, so
+	// its verdict is decided purely by the velocity gate. (This fixture used
+	// Gemini when the test landed; that type later grew a pane-local live-frame
+	// arm that rightly outranks window activity for prompt/spinner captures —
+	// see TestGeminiTurnSharedObservation — so the prompt capture moved to a
+	// type where the velocity gate is still the deciding evidence.)
+	const capture = "Analysis complete.\ncursor>"
 
 	observer := NewSessionObserverWithDependencies(NewDetector(), DefaultSessionObserverConfig(DefaultConfig()), SessionObserverDependencies{
 		ListPanes: func(context.Context, string) ([]tmux.PaneActivity, error) {
 			// The window-scoped timestamp is always "now": the sibling pane in
 			// this window is chatty.
 			return []tmux.PaneActivity{{
-				Pane:         tmux.Pane{ID: "%7", WindowIndex: 0, Index: 1, Title: "s__gmi_1", Type: tmux.AgentGemini},
+				Pane:         tmux.Pane{ID: "%7", WindowIndex: 0, Index: 1, Title: "s__cursor_1", Type: tmux.AgentCursor},
 				LastActivity: nowValues[min(nowIndex, len(nowValues)-1)],
 			}}, nil
 		},
