@@ -1455,6 +1455,11 @@ func (e *Executor) executeCommand(ctx context.Context, step *Step, workflow *Wor
 			cmdCancel()
 			cleanup := waitCommandWithProcessGroupCleanup(cmdCtx, cmd)
 			commandSettled = cleanup.Settled
+			// The command may have finished before storage failed. Keep its
+			// captured output as in-memory evidence, matching the settled-path
+			// contract below: the sticky checkpoint error stops the workflow,
+			// but completed work must not lose its result.
+			result.Output = strings.TrimSpace(stdoutBuf.String())
 			result.Status, result.FinishedAt = StatusFailed, time.Now()
 			result.Error = stepRuntimeError(step, StepKindCommand, "checkpoint", err.Error(), "inspect the command group and restore durable storage before retrying", "")
 			return result

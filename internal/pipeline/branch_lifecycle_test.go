@@ -180,8 +180,12 @@ func TestBranchLifecycleCheckpointsBeforeChildDispatch(t *testing.T) {
 
 func TestBranchLifecycleCheckpointFailureStopsNextChild(t *testing.T) {
 	cfg := branchLifecycleConfig(t)
+	// Break the pipeline state directory itself, after emitting the command's
+	// output, so every later checkpoint fails deterministically. Damaging only
+	// the state file raced the launch journal, which could recreate it between
+	// the command's mv and mkdir.
 	workflow := branchLifecycleWorkflow(
-		Step{ID: "damage", Command: "mv .ntm/pipelines/run-branch-lifecycle.json saved-checkpoint; mkdir .ntm/pipelines/run-branch-lifecycle.json; printf retained"},
+		Step{ID: "damage", Command: "printf retained; mv .ntm/pipelines .ntm/pipelines-away; printf broken > .ntm/pipelines"},
 		Step{ID: "never", Command: "printf forbidden > forbidden"},
 	)
 	workflow.Settings.OnError = ErrorActionContinue
