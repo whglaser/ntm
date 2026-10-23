@@ -57,7 +57,11 @@ func TestControlledPipelineCheckpointFailureStopsDependents(t *testing.T) {
 		OnError:  ErrorActionContinue,
 		OnCancel: []Step{{ID: "release", Command: "printf released > cleanup"}},
 	}, Steps: []Step{
-		{ID: "break-storage", Command: "mv .ntm/pipelines/run-checkpoint.json .ntm/pipelines/previous.json.saved; mkdir .ntm/pipelines/run-checkpoint.json; printf done > first", OnError: ErrorActionContinue},
+		// Let the launch journal and launch checkpoint land before breaking the
+		// state path, so the completed work is real and the failure lands on the
+		// settlement checkpoint. Damaging first raced those writes and could turn
+		// the assertion below into a killed-mid-command failure.
+		{ID: "break-storage", Command: "sleep 0.2; mv .ntm/pipelines/run-checkpoint.json .ntm/pipelines/previous.json.saved; mkdir .ntm/pipelines/run-checkpoint.json; printf done > first", OnError: ErrorActionContinue},
 		{ID: "forbidden", DependsOn: []string{"break-storage"}, Command: "printf unsafe > downstream"},
 	}, PostPipelineSteps: []Step{{ID: "post", Command: "printf unsafe > post"}}}
 	events := make(chan ProgressEvent, 100)
