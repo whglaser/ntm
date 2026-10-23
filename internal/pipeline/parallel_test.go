@@ -290,24 +290,26 @@ func TestExecuteParallel_Concurrency(t *testing.T) {
 	cfg.DryRun = true
 	e := NewExecutor(cfg)
 	e.graph = NewDependencyGraph(workflow)
-	e.state = &ExecutionState{
-		RunID:      "test-run",
-		WorkflowID: "test-workflow",
-		Status:     StatusRunning,
-		StartedAt:  time.Now(),
-		Steps:      make(map[string]StepResult),
-		Variables:  make(map[string]interface{}),
-	}
 
 	step := &Step{
 		ID:       "parallel_group",
 		Parallel: ParallelSpec{Steps: parallelSteps},
 	}
 
-	// Run multiple times to catch potential race conditions
+	// Run multiple times to catch potential race conditions. Each pass gets a
+	// fresh execution state: resetting only Steps left the previous pass's
+	// ParallelState completion checkpoints behind, and a checkpoint whose saved
+	// child result is gone is correctly refused as contradictory replay
+	// evidence.
 	for i := 0; i < 5; i++ {
-		// Reset state
-		e.state.Steps = make(map[string]StepResult)
+		e.state = &ExecutionState{
+			RunID:      "test-run",
+			WorkflowID: "test-workflow",
+			Status:     StatusRunning,
+			StartedAt:  time.Now(),
+			Steps:      make(map[string]StepResult),
+			Variables:  make(map[string]interface{}),
+		}
 
 		result := e.executeParallel(context.Background(), step, workflow)
 
