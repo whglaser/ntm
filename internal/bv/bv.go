@@ -986,13 +986,68 @@ func isBeadsDBCorruptionError(err error) bool {
 	return false
 }
 
+// beadsRebuildPreservationRefusals are the signatures of br >= 0.7 refusing an
+// automatic JSONL rebuild because it cannot read unflushed local state
+// (tombstones) to prove preservation first. JSONL is the authoritative store,
+// so this refusal needs the explicit best-effort repair below rather than
+// leaving the guarded mutation permanently corrupt.
+var beadsRebuildPreservationRefusals = []string{
+	"sync_conflict",
+	"unflushed-state preservation could not be established",
+}
+
+// isBeadsRebuildPreservationRefusal reports whether err is br's preservation
+// refusal (not a generic rebuild failure such as malformed JSONL).
+func isBeadsRebuildPreservationRefusal(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	for _, signature := range beadsRebuildPreservationRefusals {
+		if strings.Contains(message, signature) {
+			return true
+		}
+	}
+	return false
+}
+
 // recoverCorruptBeadsDatabase runs br's supported JSONL-authoritative repair
 // (`br sync --import-only --rebuild`), which recreates the SQLite index from
 // JSONL and removes orphaned DB entries. br >= 0.2.19 requires an explicit
 // sync mode flag; --rebuild alone fails validation.
+//
+// br >= 0.7 refuses that rebuild when the database is too damaged to read the
+// tombstones it wants to prove are preserved (SYNC_CONFLICT). JSONL is the
+// authoritative store, so fall back to the explicit best-effort
+// `br doctor --repair`, which rebuilds from JSONL and verifies the database.
+// doctor exits 2 (fix_partial) when the rebuild verified the database but not
+// the unreadable preservation set; the bounded retry in
+// withBeadsCorruptionRecovery is the arbiter of whether the database is usable.
 func recoverCorruptBeadsDatabase(ctx context.Context, normalizedDir string) error {
 	_, err := runBdContext(ctx, normalizedDir, false, "sync", "--import-only", "--rebuild", "--json")
-	return err
+	if err == nil {
+		return nil
+	}
+	if !isBeadsRebuildPreservationRefusal(err) {
+		return err
+	}
+	slog.Warn("br refused the automatic JSONL rebuild because unreadable state makes preservation unverifiable; falling back to br doctor --repair",
+		"dir", normalizedDir)
+	_, doctorErr := runBdContext(ctx, normalizedDir, false, "doctor", "--repair", "--json")
+	if doctorErr == nil {
+		return nil
+	}
+	// br doctor exits 2 (fix_partial) after a JSONL rebuild that verified the
+	// database but could not verify preservation of state it could not read.
+	// Reaching here already means br is new enough to emit SYNC_CONFLICT, so
+	// exit 2 is doctor's partial-repair contract, not a usage error.
+	var exitErr *exec.ExitError
+	if errors.As(doctorErr, &exitErr) && exitErr.ExitCode() == 2 {
+		slog.Warn("br doctor --repair completed with a preservation warning; retrying the guarded mutation",
+			"dir", normalizedDir)
+		return nil
+	}
+	return doctorErr
 }
 
 // withBeadsCorruptionRecovery executes op and, when it fails with a
