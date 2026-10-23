@@ -1214,6 +1214,34 @@ func TestIsBeadsDBCorruptionError(t *testing.T) {
 	}
 }
 
+// TestIsBeadsRebuildPreservationRefusal pins the narrow gate for the doctor
+// fallback: only br's preservation refusal may route to the best-effort
+// repair, while ordinary rebuild failures (malformed JSONL, missing mode)
+// must surface unchanged.
+func TestIsBeadsRebuildPreservationRefusal(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"sync conflict code", errors.New(`br sync --import-only --rebuild --json: exit status 6: {"error":{"code":"SYNC_CONFLICT"}}`), true},
+		{"preservation prose", errors.New("Sync conflict: Automatic database recovery refused because unflushed-state preservation could not be established"), true},
+		{"malformed jsonl", errors.New("br sync --import-only --rebuild --json: exit status 1: invalid JSONL entry"), false},
+		{"missing mode flag", errors.New("br sync --import-only --rebuild --json: exit status 2: a sync mode is required"), false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := isBeadsRebuildPreservationRefusal(tc.err); got != tc.want {
+				t.Fatalf("isBeadsRebuildPreservationRefusal(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
 func assertRealBRStatusAndAssignee(t *testing.T, dir, beadID, wantStatus, wantAssignee string) {
 	t.Helper()
 	output := runRealBR(t, dir, "show", beadID, "--json")
