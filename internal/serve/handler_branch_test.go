@@ -9892,14 +9892,41 @@ func TestHandleExportCheckpoint_Download(t *testing.T) {
 
 // --- handleRollback: dry run with fake checkpoint ---
 
+// initRollbackGitRepo makes dir a git repository so rollback preflight can
+// resolve its worktree root. Dry runs only need the repository to exist; the
+// fake commit in the checkpoint metadata is never dereferenced.
+func initRollbackGitRepo(t *testing.T, dir string) string {
+	t.Helper()
+	for _, args := range [][]string{
+		{"git", "init"},
+		{"git", "config", "user.email", "test@test.com"},
+		{"git", "config", "user.name", "Test"},
+		{"git", "commit", "--allow-empty", "-m", "rollback fixture"},
+	} {
+		cmd := exec.Command(args[0], args[1:]...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git command %v failed: %v\n%s", args, err, out)
+		}
+	}
+	cmd := exec.Command("git", "rev-parse", "HEAD")
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git rev-parse HEAD: %v", err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
 func TestHandleRollback_DryRun(t *testing.T) {
 	s, _ := setupTestServer(t)
 
 	tmpHome := t.TempDir()
 	t.Setenv("HOME", tmpHome)
+	commit := initRollbackGitRepo(t, s.projectDirSnapshot())
 
 	cpDir := filepath.Join(tmpHome, ".local", "share", "ntm", "checkpoints", "test-session", "test-rb")
-	metadata := fmt.Sprintf(`{"version":1,"id":"test-rb","name":"rollback-test","session_name":"test-session","working_dir":%q,"created_at":"2025-01-01T00:00:00Z","pane_count":1,"git":{"commit":"abc12345def","branch":"main"}}`, s.projectDirSnapshot())
+	metadata := fmt.Sprintf(`{"version":1,"id":"test-rb","name":"rollback-test","session_name":"test-session","working_dir":%q,"created_at":"2025-01-01T00:00:00Z","pane_count":1,"git":{"commit":%q,"branch":"main"}}`, s.projectDirSnapshot(), commit)
 	writeCheckpointFixtureFromMetadataJSON(t, cpDir, metadata)
 
 	rctx := chi.NewRouteContext()
@@ -10243,9 +10270,11 @@ func TestHandleRollback_DryRunDirtyStash(t *testing.T) {
 	tmpHome := t.TempDir()
 	t.Setenv("HOME", tmpHome)
 
+	commit := initRollbackGitRepo(t, s.projectDirSnapshot())
+
 	cpDir := filepath.Join(tmpHome, ".local", "share", "ntm", "checkpoints", "rb-dirty", "cp-dirty")
 	// IsDirty=true to exercise the stash warning path
-	metadata := fmt.Sprintf(`{"version":1,"id":"cp-dirty","name":"dirty-test","session_name":"rb-dirty","working_dir":%q,"created_at":"2025-01-01T00:00:00Z","pane_count":1,"git":{"commit":"abc12345def67890","branch":"main","is_dirty":true}}`, s.projectDirSnapshot())
+	metadata := fmt.Sprintf(`{"version":1,"id":"cp-dirty","name":"dirty-test","session_name":"rb-dirty","working_dir":%q,"created_at":"2025-01-01T00:00:00Z","pane_count":1,"git":{"commit":%q,"branch":"main","is_dirty":true}}`, s.projectDirSnapshot(), commit)
 	writeCheckpointFixtureFromMetadataJSON(t, cpDir, metadata)
 
 	rctx := chi.NewRouteContext()
@@ -11181,7 +11210,7 @@ func TestHandleRollback_FakeGitCheckpointNoGit(t *testing.T) {
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("sessionName", "rb-git")
 
-	// Request non-dry-run rollback (will fail at git checkout since /tmp is not a git repo)
+	// Request non-dry-run rollback; the working directory is not a git repo.
 	body := `{"checkpoint_ref":"cp-git","dry_run":false,"no_stash":true}`
 	req := httptest.NewRequest("POST", "/api/v1/sessions/rb-git/rollback", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -11190,9 +11219,14 @@ func TestHandleRollback_FakeGitCheckpointNoGit(t *testing.T) {
 
 	s.handleRollback(rec, req)
 
-	// Should fail at git checkout (not a git repo)
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("expected 500 for git checkout in non-git dir, got %d: %s", rec.Code, rec.Body.String())
+	// Preflight resolves the git worktree root before any checkout, so a
+	// non-git working directory is refused with 400 and the repository is
+	// left unchanged instead of reaching a 500 git-checkout failure.
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for rollback in a non-git dir, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "not a git repository") {
+		t.Fatalf("expected a non-git refusal, got: %s", rec.Body.String())
 	}
 }
 
@@ -11204,8 +11238,10 @@ func TestHandleRollback_DryRunDirtyNoStash(t *testing.T) {
 	tmpHome := t.TempDir()
 	t.Setenv("HOME", tmpHome)
 
+	commit := initRollbackGitRepo(t, s.projectDirSnapshot())
+
 	cpDir := filepath.Join(tmpHome, ".local", "share", "ntm", "checkpoints", "rb-dns", "cp-dns")
-	metadata := fmt.Sprintf(`{"version":1,"id":"cp-dns","name":"dns-test","session_name":"rb-dns","working_dir":%q,"created_at":"2025-01-01T00:00:00Z","pane_count":1,"git":{"commit":"abc12345def67890abc12345def67890abc12345","branch":"main","is_dirty":true}}`, s.projectDirSnapshot())
+	metadata := fmt.Sprintf(`{"version":1,"id":"cp-dns","name":"dns-test","session_name":"rb-dns","working_dir":%q,"created_at":"2025-01-01T00:00:00Z","pane_count":1,"git":{"commit":%q,"branch":"main","is_dirty":true}}`, s.projectDirSnapshot(), commit)
 	writeCheckpointFixtureFromMetadataJSON(t, cpDir, metadata)
 
 	rctx := chi.NewRouteContext()
@@ -11603,7 +11639,7 @@ func TestHandleRollback_WithGitPatch(t *testing.T) {
 	}
 }
 
-func TestHandleRollback_WithInvalidGitPatchPathWarns(t *testing.T) {
+func TestHandleRollback_WithInvalidGitPatchPathRejected(t *testing.T) {
 	s, _ := setupTestServer(t)
 
 	tmpHome := t.TempDir()
@@ -11684,15 +11720,15 @@ func TestHandleRollback_WithInvalidGitPatchPathWarns(t *testing.T) {
 
 	s.handleRollback(rec, req)
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for path traversal, got %d: %s", rec.Code, rec.Body.String())
 	}
 	bodyStr := rec.Body.String()
-	if !strings.Contains(bodyStr, "patch load failed") {
-		t.Fatalf("expected patch load warning, got: %s", bodyStr)
+	if !strings.Contains(bodyStr, "invalid git patch path") || !strings.Contains(bodyStr, "path traversal") {
+		t.Fatalf("expected a path traversal refusal, got: %s", bodyStr)
 	}
-	if !strings.Contains(bodyStr, "invalid artifact path") {
-		t.Fatalf("expected invalid artifact path warning, got: %s", bodyStr)
+	if !strings.Contains(bodyStr, `"git_restored":false`) {
+		t.Fatalf("expected the repository to remain unchanged, got: %s", bodyStr)
 	}
 }
 
