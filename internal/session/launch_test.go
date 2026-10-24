@@ -456,3 +456,68 @@ exec /bin/sh -c "$3"
 		t.Fatalf("restore did not use its SSH target: calls=%s error=%v", transport, err)
 	}
 }
+
+func TestWaitForSavedLaunchTargetSettlesFreshShell(t *testing.T) {
+	t.Parallel()
+
+	expected := tmux.Pane{ID: "%7", PID: 4242, Type: tmux.AgentCodex, Command: "bash"}
+	observations := []bool{false, false, true} // starting, still starting, settled
+	calls := 0
+	list := func(context.Context, string) ([]tmux.Pane, error) {
+		pane := expected
+		if calls < len(observations) && !observations[calls] {
+			pane.Command = "node script.js" // a live child still owns the pane
+		}
+		calls++
+		return []tmux.Pane{pane}, nil
+	}
+	idle := func(pane tmux.Pane) bool { return strings.TrimSpace(pane.Command) == "bash" }
+
+	if err := waitForSavedLaunchTarget(t.Context(), "recovery", expected, list, idle, time.Second, time.Millisecond); err != nil {
+		t.Fatalf("fresh shell did not settle: %v", err)
+	}
+	if calls != len(observations) {
+		t.Fatalf("observations = %d, want %d", calls, len(observations))
+	}
+}
+
+func TestWaitForSavedLaunchTargetRefusesOccupiedPaneAfterSettle(t *testing.T) {
+	t.Parallel()
+
+	expected := tmux.Pane{ID: "%7", PID: 4242, Type: tmux.AgentCodex, Command: "bash"}
+	list := func(context.Context, string) ([]tmux.Pane, error) { return []tmux.Pane{expected}, nil }
+	idle := func(tmux.Pane) bool { return false }
+
+	err := waitForSavedLaunchTarget(t.Context(), "recovery", expected, list, idle, 20*time.Millisecond, time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "not an idle shell before launch") {
+		t.Fatalf("occupied pane was not refused after the settle window: %v", err)
+	}
+}
+
+func TestWaitForSavedLaunchTargetFailsFastOnIdentityChange(t *testing.T) {
+	t.Parallel()
+
+	expected := tmux.Pane{ID: "%7", PID: 4242, Type: tmux.AgentCodex, Command: "bash"}
+	replacement := expected
+	replacement.PID = 9999
+	list := func(context.Context, string) ([]tmux.Pane, error) { return []tmux.Pane{replacement}, nil }
+	idle := func(tmux.Pane) bool { return true }
+
+	err := waitForSavedLaunchTarget(t.Context(), "recovery", expected, list, idle, time.Second, time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "changed process or agent identity") {
+		t.Fatalf("replacement pane was not refused: %v", err)
+	}
+}
+
+func TestWaitForSavedLaunchTargetFailsFastWhenPaneDisappears(t *testing.T) {
+	t.Parallel()
+
+	expected := tmux.Pane{ID: "%7", PID: 4242, Type: tmux.AgentCodex, Command: "bash"}
+	list := func(context.Context, string) ([]tmux.Pane, error) { return nil, nil }
+	idle := func(tmux.Pane) bool { return true }
+
+	err := waitForSavedLaunchTarget(t.Context(), "recovery", expected, list, idle, time.Second, time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "disappeared before launch") {
+		t.Fatalf("vanished pane was not refused: %v", err)
+	}
+}

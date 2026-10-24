@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/agentsession"
 	"github.com/Dicklesworthstone/ntm/internal/audit"
@@ -186,6 +187,74 @@ func dispatchSavedLaunches(ctx context.Context, name string, launches []savedPan
 	return result, nil
 }
 
+// A pane created by restoreSession can still be starting its shell (rc files,
+// a transient child process) when dispatch begins. That is not an occupied
+// pane: the shell settles within moments, and identity checks stay strict. Wait
+// for the idle-shell condition for a bounded window before refusing so a
+// freshly restored pane does not fail the first resume attempt.
+const (
+	savedLaunchSettleTimeout = 3 * time.Second
+	savedLaunchSettlePoll    = 50 * time.Millisecond
+)
+
+// waitForSavedLaunchTarget re-reads the target pane until it is an idle shell.
+// It fails immediately when the pane disappears or its process/agent identity
+// changes, and after the bounded settle window when something still owns the
+// pane, so the occupied-pane guarantee is not weakened.
+func waitForSavedLaunchTarget(
+	ctx context.Context,
+	session string,
+	expected tmux.Pane,
+	listPanes func(context.Context, string) ([]tmux.Pane, error),
+	idleShell func(tmux.Pane) bool,
+	timeout, poll time.Duration,
+) error {
+	if ctx == nil {
+		return errors.New("saved launch validation requires a context")
+	}
+	if listPanes == nil || idleShell == nil {
+		return errors.New("saved launch validation requires pane observations")
+	}
+	if timeout <= 0 {
+		timeout = savedLaunchSettleTimeout
+	}
+	if poll <= 0 {
+		poll = savedLaunchSettlePoll
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		panes, err := listPanes(ctx, session)
+		if err != nil {
+			return fmt.Errorf("checking restored pane identity: %w", err)
+		}
+		found := false
+		for _, pane := range panes {
+			if pane.ID != expected.ID {
+				continue
+			}
+			found = true
+			if pane.PID != expected.PID || pane.Type != expected.Type {
+				return fmt.Errorf("pane %s changed process or agent identity before launch", expected.ID)
+			}
+			if idleShell(pane) {
+				return nil
+			}
+			break
+		}
+		if !found {
+			return fmt.Errorf("pane %s disappeared before launch", expected.ID)
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("pane %s is not an idle shell before launch", expected.ID)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(poll):
+		}
+	}
+}
+
 func validateSavedLaunchTarget(ctx context.Context, session string, expected tmux.Pane) error {
 	if expected.PID <= 0 {
 		return fmt.Errorf("pane %s has no recorded process identity before launch", expected.ID)
@@ -193,23 +262,8 @@ func validateSavedLaunchTarget(ctx context.Context, session string, expected tmu
 	if err := tmux.ValidatePaneLaunchBaselineLiveContext(ctx, session, expected.ID); err != nil {
 		return err
 	}
-	panes, err := tmux.GetPanesContext(ctx, session)
-	if err != nil {
-		return fmt.Errorf("checking restored pane identity: %w", err)
-	}
-	for _, pane := range panes {
-		if pane.ID != expected.ID {
-			continue
-		}
-		if pane.PID != expected.PID || pane.Type != expected.Type {
-			return fmt.Errorf("pane %s changed process or agent identity before launch", expected.ID)
-		}
-		if !pane.IdleShell() {
-			return fmt.Errorf("pane %s is not an idle shell before launch", expected.ID)
-		}
-		return nil
-	}
-	return fmt.Errorf("pane %s disappeared before launch", expected.ID)
+	return waitForSavedLaunchTarget(ctx, session, expected, tmux.GetPanesContext,
+		func(pane tmux.Pane) bool { return pane.IdleShell() }, savedLaunchSettleTimeout, savedLaunchSettlePoll)
 }
 
 // RestoreWithAgents preflights every saved launch before --force can destroy an
