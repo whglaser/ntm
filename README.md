@@ -740,6 +740,12 @@ restored even if the process stopped before saving the enclosing step result.
 Recognized composer and footer redraws are excluded from response evidence; an
 idle pane showing only the submitted prompt is not counted as completed work.
 
+Pipeline and wait completion can also come from the agent's own OSC 7501
+program-status reports instead of chrome scraping (currently pi). See
+[docs/program-status.md](docs/program-status.md) for the protocol, the
+`PI_PROGRAM_STATUS=1` launch requirement, how `state_source` reports `osc` vs
+`scrape`, and troubleshooting.
+
 Unknown submission outcomes, replaced pane processes or hosts, and missing output
 boundaries stop recovery with the receipt preserved. If you verify that the
 original agent received an uncertain submission, record that observation and
