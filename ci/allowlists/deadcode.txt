@@ -238,6 +238,7 @@ internal/scanner/types.go:ScanResult.FilterBySeverity	bd-ld4j2	reachable only th
 internal/scanner/types.go:ScanResult.TotalIssues	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/serve/redact.go:redactingResponseWriter.Push	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/serve/server.go:responseRecorder.Bytes	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
+internal/serve/ws_events.go:WSEventStore.GetSince	ntm-ou0nz	test-only single-topic wrapper of getSinceTopics (production replay calls getSinceTopics directly); delete + retarget tests or wire a real caller
 internal/state/routing_state.go:Store.SaveRoutingState	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/state/runtime_schema.go:AttentionReplayWindow.EarliestReplayCursor	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/state/runtime_schema.go:RuntimeHandoff.IsFresh	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
