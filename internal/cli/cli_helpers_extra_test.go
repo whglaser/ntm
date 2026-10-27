@@ -601,7 +601,7 @@ count = 1
 	}
 	for _, agent := range agents {
 		command, _, err := spawnAgentCommandTemplate(agent.Type, presets, "")
-		if err != nil || (agent.Type == "pi" && !strings.HasPrefix(command, "pi")) {
+		if err != nil || (agent.Type == "pi" && !strings.HasPrefix(command, programStatusLaunchPrefix(agent.Type)+"pi")) {
 			t.Fatalf("template agent %s has wrong command %q: %v", agent.Type, command, err)
 		}
 	}
