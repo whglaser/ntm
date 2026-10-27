@@ -194,7 +194,7 @@ func TestResumeSpawnOptionsPreservePluginModelsAndBuiltinCounts(t *testing.T) {
 		}
 	}
 	template, _, err := spawnAgentCommandTemplate(AgentType("pi"), opts.PluginMap, "")
-	if err != nil || template != plugin.Command {
+	if err != nil || template != programStatusLaunchPrefix(AgentType("pi"))+plugin.Command {
 		t.Fatalf("resume selected the wrong plugin command: %q, %v", template, err)
 	}
 	if opts.Agents[2].Model != "provider/model" || opts.Agents[2].ReasoningEffort != "high" || opts.Agents[4].Model != "other/model" || opts.Agents[4].ReasoningEffort != "low" {
