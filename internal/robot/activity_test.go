@@ -2,10 +2,12 @@ package robot
 
 import (
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/state"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
@@ -2950,5 +2952,40 @@ func TestRegisteredPluginActivityAndLiveBusy(t *testing.T) {
 		if got := isAIAgentPaneType(tc.agentType); got != tc.want {
 			t.Errorf("isAIAgentPaneType(%q) = %v, want %v", tc.agentType, got, tc.want)
 		}
+	}
+}
+
+// TestClassifyStatePluginIdleOutranksTruncatedFooterDots covers ntm-l6cuz.7: a
+// capture ending in pi's truncated stats footer matches dots_spinner (70), but
+// the plugin's declared idle pattern (92) is readiness evidence and must win.
+// A genuine spinner frame without the plugin idle signal still reads THINKING.
+func TestClassifyStatePluginIdleOutranksTruncatedFooterDots(t *testing.T) {
+	const pluginType = "pi-footer-classifier-fixture"
+	if err := agent.RegisterPlugin(pluginType, []string{`CH99\.2%`}, nil, nil); err != nil {
+		t.Fatalf("register fixture plugin: %v", err)
+	}
+
+	finished := NewStateClassifier("%7", &ClassifierConfig{AgentType: pluginType})
+	activity, err := finished.ClassifyWithOutput("↑99k ↓27k R1.4M CH99.2%...")
+	if err != nil || activity == nil {
+		t.Fatalf("classify finished footer: %+v, %v", activity, err)
+	}
+	if activity.State != StateWaiting {
+		t.Fatalf("finished pane state = %s (patterns %v), want waiting", activity.State, activity.DetectedPatterns)
+	}
+	if !slices.Contains(activity.DetectedPatterns, "plugin_idle") || !slices.Contains(activity.DetectedPatterns, "dots_spinner") {
+		t.Fatalf("fixture must match both patterns, got %v", activity.DetectedPatterns)
+	}
+	if activity.StateSource != "scrape" {
+		t.Fatalf("state source = %q, want scrape", activity.StateSource)
+	}
+
+	live := NewStateClassifier("%8", &ClassifierConfig{AgentType: pluginType})
+	activity, err = live.ClassifyWithOutput("Scanning repository layout ...")
+	if err != nil || activity == nil {
+		t.Fatalf("classify live spinner: %+v, %v", activity, err)
+	}
+	if activity.State != StateThinking {
+		t.Fatalf("live spinner state = %s (patterns %v), want thinking", activity.State, activity.DetectedPatterns)
 	}
 }

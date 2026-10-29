@@ -192,7 +192,21 @@ func outputWaitResponse(w io.Writer, response *robot.WaitResponse, cause error) 
 		}
 	} else {
 		fmt.Fprintf(w, "%s✗%s %s\n", colorize(t.Error), colorize(t.Text), response.Error)
-		if len(response.AgentsPending) > 0 {
+		if len(response.PendingEvidence) > 0 {
+			for _, agent := range response.PendingEvidence {
+				detail := agent.State
+				if agent.StateSource != "" {
+					detail += ", " + agent.StateSource
+				}
+				if len(agent.DetectedPatterns) > 0 {
+					detail += ", patterns: " + strings.Join(agent.DetectedPatterns, ",")
+				}
+				if agent.StateSince != "" {
+					detail += ", since " + agent.StateSince
+				}
+				fmt.Fprintf(w, "    %s: %s\n", agent.Pane, detail)
+			}
+		} else if len(response.AgentsPending) > 0 {
 			fmt.Fprintf(w, "    Pending: %s\n", strings.Join(response.AgentsPending, ", "))
 		}
 	}
