@@ -465,6 +465,7 @@ Agent types:
 - `codex` / `cod` / `openai`
 - `antigravity` / `agy` / `google-antigravity`
 - `gemini` / `gmi` / `google` (legacy)
+- `pi` (pi coding agent)
 
 ### By Pane Index
 
@@ -512,6 +513,30 @@ Define when a step is considered complete:
 | `idle` | Same as completion |
 | `time` | Wait for timeout duration only |
 | `none` | Fire and forget (don't wait) |
+
+### Pi-safe prompts
+
+`pi` renders a prompt as Markdown before echoing it, so the delivery receipt
+matches the rendered form rather than the raw text. Steps bound to `pi` with a
+wait condition therefore only accept prompts whose rendered echo is
+deterministic. `ntm pipeline lint` and `pipeline run --dry-run` reject a
+pi-bound `prompt`, `prompt_file`, or `template` before launch and name the
+first unsupported construct.
+
+Supported: plain paragraphs, `**emphasis**`, inline `` `code` ``, code fences,
+lists (markers are preserved), headings (levels 3+ keep their `#` markers),
+task lists, and links whose label equals its destination (`https://…`,
+`mailto:`).
+
+Unsupported (refused with the construct name): HTML blocks and raw HTML,
+thematic breaks (`---`), blockquotes, tables, images, math markers (`$`, `\(`,
+`\[`), and links whose label differs from the destination. `wait: none` steps
+skip the check because no echo is attributed.
+
+Template steps are checked after `<PARAM>` rendering and with `${…}` variable
+references replaced by a placeholder, so the literal template structure is
+what gets judged; a value substituted at run time can still change the
+rendered echo, which is why the delivery-time guard remains in place.
 
 ## Declared Step Outputs
 

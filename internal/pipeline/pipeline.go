@@ -126,7 +126,11 @@ func (e *Executor) executeAdHocStage(ctx context.Context, stage Stage, paneID, p
 	if agentType == "pi" {
 		piEcho, _, supported := status.PiPromptEcho(prompt)
 		if !supported {
-			return record, errors.New("stage not dispatched: pi prompt contains Markdown whose rendered echo cannot be attributed safely; simplify the prompt before retrying")
+			message := "stage not dispatched: pi prompt contains Markdown whose rendered echo cannot be attributed safely; simplify the prompt before retrying"
+			if reason := status.PiPromptEchoReason(prompt); reason != "" {
+				message = fmt.Sprintf("stage not dispatched: pi prompt contains Markdown whose rendered echo cannot be attributed safely (%s); simplify the prompt before retrying", reason)
+			}
+			return record, errors.New(message)
 		}
 		record.PiPromptEchoHash, record.PiPromptEchoLength = piEcho.Hash, piEcho.Length
 	}

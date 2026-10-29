@@ -4468,3 +4468,69 @@ func TestExecutor_Run_PopulatesOutputValidation(t *testing.T) {
 		t.Errorf("Missing = %v, want [%s]", state.OutputValidation.Missing, missing)
 	}
 }
+
+// TestExecutorRunDryRunRejectsUnattributablePiPrompt covers the --dry-run half
+// of ntm-l6cuz.6: the offline Run path refuses a pi-declared prompt whose
+// rendered echo cannot be attributed before any dispatch is attempted.
+func TestExecutorRunDryRunRejectsUnattributablePiPrompt(t *testing.T) {
+	cfg := DefaultExecutorConfig("test-session")
+	cfg.DryRun = true
+	e := NewExecutor(cfg)
+
+	workflow := &Workflow{
+		SchemaVersion: SchemaVersion,
+		Name:          "pi-dry-run-guard",
+		Settings:      DefaultWorkflowSettings(),
+		Steps: []Step{{
+			ID:     "hazard",
+			Agent:  "pi",
+			Prompt: "Inspect the source.\n\n<!-- operator note -->\n\nReport.",
+			Wait:   WaitCompletion,
+		}},
+	}
+
+	state, err := e.Run(context.Background(), workflow, nil, nil)
+	if err == nil || state.Status == StatusCompleted {
+		t.Fatalf("dry run completed an unattributable pi prompt: %+v, %v", state, err)
+	}
+	result, ok := state.Steps["hazard"]
+	if !ok || result.Error == nil || !strings.Contains(result.Error.Message, "HTMLBlock") {
+		t.Fatalf("dry-run failure = %+v, want HTMLBlock refusal naming the step", result)
+	}
+}
+
+// TestExecutorRunDryRunRejectsUnattributablePiTemplate covers the template
+// branch of the dry-run preflight: a pi-bound template whose rendered text
+// contains a thematic break is refused before dispatch.
+func TestExecutorRunDryRunRejectsUnattributablePiTemplate(t *testing.T) {
+	dir := t.TempDir()
+	templatePath := filepath.Join(dir, "lane.md")
+	if err := os.WriteFile(templatePath, []byte("Review the lane.\n\n---\n\nReport.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := DefaultExecutorConfig("test-session")
+	cfg.DryRun = true
+	e := NewExecutor(cfg)
+
+	workflow := &Workflow{
+		SchemaVersion: SchemaVersion,
+		Name:          "pi-dry-run-template-guard",
+		Settings:      DefaultWorkflowSettings(),
+		Steps: []Step{{
+			ID:       "hazard",
+			Agent:    "pi",
+			Template: templatePath,
+			Wait:     WaitCompletion,
+		}},
+	}
+
+	state, err := e.Run(context.Background(), workflow, nil, nil)
+	if err == nil || state.Status == StatusCompleted {
+		t.Fatalf("dry run completed an unattributable pi template: %+v, %v", state, err)
+	}
+	result, ok := state.Steps["hazard"]
+	if !ok || result.Error == nil || !strings.Contains(result.Error.Message, "ThematicBreak") {
+		t.Fatalf("dry-run template failure = %+v, want ThematicBreak refusal naming the step", result)
+	}
+}

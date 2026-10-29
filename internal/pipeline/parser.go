@@ -15,6 +15,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/Dicklesworthstone/ntm/internal/robot"
+	"github.com/Dicklesworthstone/ntm/internal/status"
 )
 
 // ParseError represents a validation or parsing error with location info
@@ -892,7 +893,122 @@ func LoadAndValidate(path string) (*Workflow, ValidationResult, error) {
 	}
 
 	result := Validate(workflow)
+	for _, piErr := range validatePiPromptEchoes(workflow, filepath.Dir(path)) {
+		result.addError(piErr)
+	}
 	return workflow, result, nil
+}
+
+// piPromptEchoVariableRef matches runtime variable references in a prompt or
+// template body. Lint has no runtime values, so it substitutes a fixed safe
+// token before checking the literal template structure.
+var piPromptEchoVariableRef = regexp.MustCompile(`\$\{[^}]*\}`)
+
+// validatePiPromptEchoes scans statically pi-bound prompt and template steps
+// and reports each one whose delivered text pi's renderer would echo in a
+// form the delivery receipt cannot attribute. baseDir resolves prompt_file
+// and template references the same way the executor does; prompts that cannot
+// be resolved at lint time are left to the delivery-time guard instead of
+// being reported here (ntm-l6cuz.6).
+func validatePiPromptEchoes(w *Workflow, baseDir string) []ParseError {
+	if w == nil {
+		return nil
+	}
+	var errs []ParseError
+	check := func(step *Step, field string) {
+		if step == nil || step.Wait == WaitNone || NormalizeAgentType(step.Agent) != "pi" {
+			return
+		}
+		kind, text := "", ""
+		switch {
+		case step.Prompt != "":
+			kind, text = "prompt", step.Prompt
+		case step.PromptFile != "":
+			content, ok := readWorkflowTextFile(step.PromptFile, baseDir)
+			if !ok {
+				return
+			}
+			kind, text = "prompt_file", content
+		case step.Template != "":
+			content, ok := readWorkflowTextFile(step.Template, baseDir)
+			if !ok {
+				return
+			}
+			rendered, err := RenderTemplate(content, step.Params, step.Args, ReservedPlaceholders("", ""))
+			if err != nil {
+				// Unresolved template parameters are reported by the runtime
+				// template step; this check only judges echo attribution.
+				return
+			}
+			kind, text = "template", rendered
+		default:
+			return
+		}
+		reason := status.PiPromptEchoReason(piPromptEchoVariableRef.ReplaceAllString(text, "value"))
+		if reason == "" {
+			return
+		}
+		errs = append(errs, ParseError{
+			Field:   field + "." + kind,
+			Message: fmt.Sprintf("step %q is bound to pi but its %s contains %s, which pi's rendered echo cannot attribute; simplify the prompt or set wait: none", step.ID, kind, reason),
+			Hint:    "pi echoes its rendered Markdown, so prompts must stay inside the supported subset; see docs/WORKFLOW_SCHEMA.md (Pi-safe prompts).",
+		})
+	}
+	piPromptSteps(w.Steps, "steps", check)
+	piPromptSteps(w.PostPipelineSteps, "post_pipeline_steps", check)
+	piPromptSteps(w.Settings.OnCancel, "settings.on_cancel", check)
+	return errs
+}
+
+// piPromptSteps walks every nested step position validation can address and
+// calls check with a field path that names the step's location.
+func piPromptSteps(steps []Step, prefix string, check func(*Step, string)) {
+	for i := range steps {
+		step := &steps[i]
+		field := fmt.Sprintf("%s[%d]", prefix, i)
+		check(step, field)
+		piPromptSteps(step.OnSuccess, field+".on_success", check)
+		piPromptSteps(step.Parallel.Steps, field+".parallel", check)
+		for _, fc := range []*ForeachConfig{step.Foreach, step.ForeachPane} {
+			if fc == nil {
+				continue
+			}
+			body := fc.Steps
+			if len(body) == 0 {
+				body = fc.Body
+			}
+			piPromptSteps(body, field+".foreach", check)
+		}
+		if step.Loop != nil {
+			body := step.Loop.Steps
+			if len(body) == 0 {
+				body = step.Loop.Body
+			}
+			piPromptSteps(body, field+".loop", check)
+		}
+	}
+}
+
+// readWorkflowTextFile resolves a workflow-relative file reference. The
+// workflow directory wins over the process working directory so linting is
+// independent of where ntm is invoked; an unresolved file reports not-found
+// so the caller can skip the check instead of inventing an error.
+func readWorkflowTextFile(ref, baseDir string) (string, bool) {
+	candidates := make([]string, 0, 2)
+	if filepath.IsAbs(ref) {
+		candidates = append(candidates, ref)
+	} else {
+		if baseDir != "" {
+			candidates = append(candidates, filepath.Join(baseDir, ref))
+		}
+		candidates = append(candidates, ref)
+	}
+	for _, candidate := range candidates {
+		if data, err := os.ReadFile(candidate); err == nil {
+			return string(data), true
+		}
+	}
+	return "", false
 }
 
 // foreachBodyStepsForValidation returns the effective body steps for a
