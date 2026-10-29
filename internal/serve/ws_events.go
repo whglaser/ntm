@@ -237,20 +237,9 @@ func (s *WSEventStore) Store(topic, eventType string, data interface{}) (*WSStor
 	return event, nil
 }
 
-// GetSince retrieves events after the given sequence number.
-// The database is authoritative when configured: a ring can outlive retention
-// or miss events written by another store sharing the same runtime database.
-// Returns events and a boolean indicating if a cursor reset is needed.
-func (s *WSEventStore) GetSince(since int64, topic string, limit int) ([]WSStoredEvent, bool, error) {
-	var topics []string
-	if topic != "" {
-		topics = []string{topic}
-	}
-	return s.getSinceTopics(since, topics, limit)
-}
-
 // getSinceTopics applies every subscription pattern before the result limit.
-// An empty list selects all topics, as GetSince's empty topic has always done.
+// An empty list selects all topics, as the legacy single-topic wrapper's empty
+// topic always did.
 func (s *WSEventStore) getSinceTopics(since int64, topics []string, limit int) ([]WSStoredEvent, bool, error) {
 	if limit <= 0 {
 		limit = 1000
