@@ -35,6 +35,18 @@ func setupTestDB(t *testing.T) (*sql.DB, func()) {
 	return store.DB(), cleanup
 }
 
+// GetSince is the single-topic test adaptor for getSinceTopics. Production
+// replay always passes full subscription patterns; keeping this shape in a
+// test file removes the test-only wrapper from the production call graph
+// (ntm-ou0nz).
+func (s *WSEventStore) GetSince(since int64, topic string, limit int) ([]WSStoredEvent, bool, error) {
+	var topics []string
+	if topic != "" {
+		topics = []string{topic}
+	}
+	return s.getSinceTopics(since, topics, limit)
+}
+
 func TestWSEventStore_StoreAndRetrieve(t *testing.T) {
 	db, cleanup := setupTestDB(t)
 	defer cleanup()
