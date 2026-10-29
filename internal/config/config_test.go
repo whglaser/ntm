@@ -137,6 +137,7 @@ func TestExpandHome(t *testing.T) {
 }
 
 func TestGetProjectDirWithJustTilde(t *testing.T) {
+	t.Setenv("NTM_PROJECTS_BASE", "")
 	home, _ := os.UserHomeDir()
 	cfg := &Config{
 		ProjectsBase: "~",
@@ -151,6 +152,7 @@ func TestGetProjectDirWithJustTilde(t *testing.T) {
 }
 
 func TestGetProjectDir(t *testing.T) {
+	t.Setenv("NTM_PROJECTS_BASE", "")
 	cfg := &Config{
 		ProjectsBase: "/test/projects",
 	}
@@ -164,6 +166,7 @@ func TestGetProjectDir(t *testing.T) {
 }
 
 func TestGetProjectDirWithTilde(t *testing.T) {
+	t.Setenv("NTM_PROJECTS_BASE", "")
 	home, _ := os.UserHomeDir()
 	cfg := &Config{
 		ProjectsBase: "~/projects",
@@ -174,6 +177,16 @@ func TestGetProjectDirWithTilde(t *testing.T) {
 
 	if dir != expected {
 		t.Errorf("Expected %s, got %s", expected, dir)
+	}
+}
+
+func TestGetProjectDirHonorsProjectsBaseEnv(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("NTM_PROJECTS_BASE", base)
+	cfg := &Config{ProjectsBase: "/ignored/by/env"}
+	want := filepath.Join(base, "myproject")
+	if got := cfg.GetProjectDir("myproject"); got != want {
+		t.Fatalf("GetProjectDir = %q, want %q (NTM_PROJECTS_BASE override)", got, want)
 	}
 }
 

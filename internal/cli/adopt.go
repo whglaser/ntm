@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
+	"os"
 	"strconv"
 	"strings"
 
@@ -11,6 +13,7 @@ import (
 
 	agentpkg "github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/output"
+	"github.com/Dicklesworthstone/ntm/internal/plugins"
 	"github.com/Dicklesworthstone/ntm/internal/spawnidentity"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/internal/tui/theme"
@@ -76,9 +79,55 @@ func newAdoptCmd() *cobra.Command {
 		dryRun   bool
 		byWindow bool
 	)
-	paneFlags := make(map[agentpkg.AgentType]*string, len(supportedAdoptTypes))
-	for _, spec := range supportedAdoptTypes {
-		paneFlags[spec.AgentType] = new(string)
+
+	// Agent-type flags are the built-ins plus one --<name> (and --<alias>) for
+	// every registered agent plugin, so `ntm adopt s --pi=1,2` works for the
+	// custom pi plugin the same way spawn/add/send accept --pi (ntm#260).
+	// Built-ins win collisions, mirroring spawn/add.
+	adoptTypes := append([]adoptTypeSpec{}, supportedAdoptTypes...)
+	flagOwner := make(map[string]agentpkg.AgentType, len(adoptTypes)+4)
+	for _, spec := range adoptTypes {
+		flagOwner[spec.Flag] = spec.AgentType
+	}
+	type adoptAliasFlag struct {
+		Flag        string
+		AgentType   agentpkg.AgentType
+		Description string
+	}
+	var aliasFlags []adoptAliasFlag
+	loadedPlugins, _ := plugins.LoadAgentPlugins(pluginAgentsDirForArgs(os.Args[1:]))
+	for _, plugin := range loadedPlugins {
+		name := strings.TrimSpace(plugin.Name)
+		if name == "" {
+			continue
+		}
+		agentType := agentpkg.AgentType(name)
+		description := strings.TrimSpace(plugin.Description)
+		if description == "" {
+			description = "Plugin agent panes"
+		}
+		if _, exists := flagOwner[name]; exists {
+			slog.Warn("skipping agent plugin flag that collides with an existing adopt flag; keeping built-in",
+				"plugin", name, "flag", "--"+name)
+			continue
+		}
+		adoptTypes = append(adoptTypes, adoptTypeSpec{Flag: name, AgentType: agentType, Description: description, Example: "0,1"})
+		flagOwner[name] = agentType
+		if alias := strings.TrimSpace(plugin.Alias); alias != "" {
+			if _, exists := flagOwner[alias]; exists {
+				slog.Warn("skipping agent plugin alias flag that collides with an existing adopt flag; keeping built-in",
+					"plugin", name, "alias", alias)
+				continue
+			}
+			aliasFlags = append(aliasFlags, adoptAliasFlag{Flag: alias, AgentType: agentType, Description: description + " (alias)"})
+			flagOwner[alias] = agentType
+		}
+	}
+	paneFlags := make(map[agentpkg.AgentType]*string, len(adoptTypes))
+	for _, spec := range adoptTypes {
+		if _, exists := paneFlags[spec.AgentType]; !exists {
+			paneFlags[spec.AgentType] = new(string)
+		}
 	}
 
 	cmd := &cobra.Command{
@@ -123,6 +172,9 @@ Examples:
   # Preview what would be changed
   ntm adopt my_session --windsurf=0 --aider=1 --ollama=2 --dry-run
 
+  # Registered agent plugins expose their own flags (e.g. pi from agents/pi.toml)
+  ntm adopt my_session --pi=1,2
+
   # Auto-rename panes based on agent type
   ntm adopt my_session --cc=0,1 --auto-name`,
 		Args: cobra.ExactArgs(1),
@@ -136,9 +188,9 @@ Examples:
 				// ignored. Exactly one agent flag must be set.
 				var selected agentpkg.AgentType
 				selectedCount := 0
-				for _, spec := range supportedAdoptTypes {
-					if cmd.Flags().Changed(spec.Flag) {
-						selected = spec.AgentType
+				for flagName, agentType := range flagOwner {
+					if cmd.Flags().Changed(flagName) {
+						selected = agentType
 						selectedCount++
 					}
 				}
@@ -151,12 +203,13 @@ Examples:
 					DryRun:       dryRun,
 					ByWindow:     true,
 					ByWindowType: selected,
+					Types:        adoptTypes,
 				}
 				return runAdopt(opts)
 			}
 
-			assignments := make(map[agentpkg.AgentType][]paneSpec, len(supportedAdoptTypes))
-			for _, spec := range supportedAdoptTypes {
+			assignments := make(map[agentpkg.AgentType][]paneSpec, len(adoptTypes))
+			for _, spec := range adoptTypes {
 				specs, err := parsePaneSpecs(*paneFlags[spec.AgentType])
 				if err != nil {
 					return fmt.Errorf("--%s: %w", spec.Flag, err)
@@ -169,18 +222,27 @@ Examples:
 				AutoName:        autoName,
 				DryRun:          dryRun,
 				PaneAssignments: assignments,
+				Types:           adoptTypes,
 			}
 
 			return runAdopt(opts)
 		},
 	}
 
-	for _, spec := range supportedAdoptTypes {
+	for _, spec := range adoptTypes {
 		cmd.Flags().StringVar(
 			paneFlags[spec.AgentType],
 			spec.Flag,
 			"",
 			fmt.Sprintf("Comma-separated pane indices for %s (e.g., %s)", spec.Description, spec.Example),
+		)
+	}
+	for _, alias := range aliasFlags {
+		cmd.Flags().StringVar(
+			paneFlags[alias.AgentType],
+			alias.Flag,
+			"",
+			fmt.Sprintf("Comma-separated pane indices for %s", alias.Description),
 		)
 	}
 	cmd.Flags().BoolVar(&autoName, "auto-name", true, "Automatically rename panes to NTM convention")
@@ -200,6 +262,12 @@ type AdoptOptions struct {
 	// Each paneSpec is either a bare index (resolved against the session,
 	// failing loud if ambiguous across windows) or an explicit window.pane.
 	PaneAssignments map[agentpkg.AgentType][]paneSpec
+
+	// Types is the flag/agent-type table the command was built with: the
+	// built-ins plus any registered plugin agent flags. runAdopt uses it so
+	// plugin panes adopt in the same deterministic order as built-ins. Nil
+	// falls back to supportedAdoptTypes for direct callers.
+	Types []adoptTypeSpec
 
 	// ByWindow, when true, ignores PaneAssignments and instead maps every
 	// window's sole pane to ByWindowType. This is the convenience path for
@@ -440,9 +508,20 @@ func runAdopt(opts AdoptOptions) error {
 
 	adoptedPanes := []AdoptedPaneInfo{}
 	counts := AdoptedAgentCounts{}
-	ntmIndex := make(map[agentpkg.AgentType]int, len(supportedAdoptTypes))
-	for _, spec := range supportedAdoptTypes {
+	types := opts.Types
+	if len(types) == 0 {
+		types = supportedAdoptTypes
+	}
+	// Dedupe by agent type so a plugin alias sharing its name's pane list is
+	// adopted once, in the order the command registered the flags.
+	adoptOrder := make([]agentpkg.AgentType, 0, len(types))
+	ntmIndex := make(map[agentpkg.AgentType]int, len(types))
+	for _, spec := range types {
+		if _, seen := ntmIndex[spec.AgentType]; seen {
+			continue
+		}
 		ntmIndex[spec.AgentType] = 1
+		adoptOrder = append(adoptOrder, spec.AgentType)
 	}
 
 	// Guard against adopting the same physical pane twice. validateAdoptAssignments
@@ -504,8 +583,8 @@ func runAdopt(opts AdoptOptions) error {
 		return nil
 	}
 
-	for _, spec := range supportedAdoptTypes {
-		if err := adoptType(opts.PaneAssignments[spec.AgentType], spec.AgentType); err != nil {
+	for _, agentType := range adoptOrder {
+		if err := adoptType(opts.PaneAssignments[agentType], agentType); err != nil {
 			result := &AdoptResult{Success: false, Session: opts.Session, Error: err.Error()}
 			return emitAdoptFailure(result)
 		}
