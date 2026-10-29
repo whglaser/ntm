@@ -1398,6 +1398,12 @@ type ExecutionState struct {
 	MailSends         map[string]MailSendState         `json:"mail_sends,omitempty"`
 	ReservationSteps  map[string]ReservationStepState  `json:"reservation_steps,omitempty"`
 
+	// OrphanedTurnDecisions records explicit operator decisions about turns
+	// that kept producing after their step stopped being observed
+	// (ntm-l6cuz.8). Decisions are append-only; adoption and stop never rewrite
+	// the delivery receipt or the step outcome.
+	OrphanedTurnDecisions []OrphanedTurnDecision `json:"orphaned_turn_decisions,omitempty"`
+
 	// OutputValidation records the post-run check of Workflow.Outputs (bd-3uqce).
 	// nil when the workflow declared no outputs or validation was skipped (e.g.
 	// dry-run, cancelled). Missing paths are diagnostic only — they never flip

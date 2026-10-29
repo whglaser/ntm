@@ -290,6 +290,8 @@ func (m *parallelDispatchTransport) VerifySubmission(ctx context.Context, _, _, 
 	return ctx.Err()
 }
 
+func (m *parallelDispatchTransport) InterruptPane(string, string) error { return nil }
+
 func TestParallelDispatchTemplateRetriesStayOnSelectedPane(t *testing.T) {
 	cfg := parallelDispatchConfig(t)
 	path := filepath.Join(cfg.ProjectDir, "instructions.md")

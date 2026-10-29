@@ -32,6 +32,10 @@ type TmuxClient interface {
 	// holding the payload after a bounded rescue, so the dispatch must NOT be
 	// treated as delivered and must never be waited on for completion.
 	VerifySubmission(ctx context.Context, target, message, agentType string, paneWidth int) error
+	// InterruptPane sends the agent-appropriate interrupt key (Ctrl+C) to a
+	// pane whose turn outlived its failed step (ntm-l6cuz.8). It never pastes
+	// prompt bytes.
+	InterruptPane(target, agentType string) error
 }
 
 type realTmuxClient struct{}
@@ -76,6 +80,10 @@ func (realTmuxClient) VerifySubmission(ctx context.Context, target, message, age
 	return dispatch.VerifyAgentSubmission(ctx, target, message, tmux.AgentType(agentType), paneWidth)
 }
 
+func (realTmuxClient) InterruptPane(target, agentType string) error {
+	return tmux.SendInterruptForAgent(target, tmux.AgentType(agentType))
+}
+
 // MockTmuxPaste records one PasteKeys call made against the mock.
 type MockTmuxPaste struct {
 	Target  string
@@ -98,6 +106,12 @@ type MockTmuxVerification struct {
 	PaneWidth int
 }
 
+// MockTmuxInterrupt records one InterruptPane call made against the mock.
+type MockTmuxInterrupt struct {
+	Target    string
+	AgentType string
+}
+
 // MockTmuxClient is a deterministic in-memory tmux substitute for executor tests.
 type MockTmuxClient struct {
 	mu           sync.Mutex
@@ -109,6 +123,7 @@ type MockTmuxClient struct {
 	// confirmed", which is what an agent that submits normally looks like.
 	verifier      func(target, message, agentType string) error
 	verifications []MockTmuxVerification
+	interrupts    []MockTmuxInterrupt
 }
 
 // SetSubmissionVerifier installs the outcome of future VerifySubmission calls.
@@ -264,6 +279,17 @@ func (m *MockTmuxClient) GetPanes(session string) ([]tmux.Pane, error) {
 		return panes[i].Index < panes[j].Index
 	})
 	return panes, nil
+}
+
+// InterruptPane records one interrupt call for a known pane.
+func (m *MockTmuxClient) InterruptPane(target, agentType string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.panes[target]; !ok {
+		return fmt.Errorf("mock tmux pane %q not found", target)
+	}
+	m.interrupts = append(m.interrupts, MockTmuxInterrupt{Target: target, AgentType: agentType})
+	return nil
 }
 
 // PasteKeys records the prompt and appends it to the target pane's output.

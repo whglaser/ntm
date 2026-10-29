@@ -336,6 +336,10 @@ func (c *timestampedTmuxClient) VerifySubmission(ctx context.Context, target, me
 	return c.inner.VerifySubmission(ctx, target, message, agentType, paneWidth)
 }
 
+func (c *timestampedTmuxClient) InterruptPane(target, agentType string) error {
+	return c.inner.InterruptPane(target, agentType)
+}
+
 func (c *timestampedTmuxClient) pasteTimes(target string) []time.Time {
 	c.mu.Lock()
 	defer c.mu.Unlock()

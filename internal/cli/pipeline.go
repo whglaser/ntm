@@ -943,7 +943,7 @@ Examples:
 // workflow. Ordinary resume interprets the original outcome and runs dependents.
 func newPipelineRecoverCmd() *cobra.Command {
 	var stepID, receipt, reason, outputFile string
-	var acceptDelivery, acceptCommand bool
+	var acceptDelivery, acceptCommand, adoptOrphan, stopOrphan bool
 	var exitCode int
 	cmd := &cobra.Command{
 		Use:   "recover <run-id>",
@@ -985,6 +985,14 @@ enclosing work already finished cannot use this recovery path.
 The same receipt, reason, exit code, and exact output
 replay the saved decision; changing any part is refused.
 
+A failed or cancelled step can leave its pane agent still working: ntm stops
+observing rather than killing the process. Inspection reports those turns as
+orphaned with a class: "generating" for a pane still producing, or
+"artifact_after_failure" for declared outputs written after the step stopped.
+--adopt-orphan records artifact provenance in the run state; --stop-orphan
+interrupts a verified generating pane. Neither action resends the prompt or
+restarts the step.
+
 Run from the project containing the saved pipeline state.
 
 Examples:
@@ -1015,15 +1023,27 @@ Examples:
 			if acceptDelivery && acceptCommand {
 				return fail(errors.New("--accept-delivery and --accept-command are mutually exclusive"))
 			}
+			decisions := 0
+			for _, selected := range []bool{acceptDelivery, acceptCommand, adoptOrphan, stopOrphan} {
+				if selected {
+					decisions++
+				}
+			}
+			if decisions > 1 {
+				return fail(errors.New("--accept-delivery, --accept-command, --adopt-orphan, and --stop-orphan are mutually exclusive"))
+			}
 			commandFields := cmd.Flags().Changed("exit-code") || cmd.Flags().Changed("output-file")
-			if !acceptDelivery && !acceptCommand && (cmd.Flags().Changed("step-id") || cmd.Flags().Changed("receipt") || cmd.Flags().Changed("reason") || commandFields) {
-				return fail(errors.New("recovery decision fields require --accept-delivery or --accept-command"))
+			if decisions == 0 && (cmd.Flags().Changed("step-id") || cmd.Flags().Changed("receipt") || cmd.Flags().Changed("reason") || commandFields) {
+				return fail(errors.New("recovery decision fields require --accept-delivery, --accept-command, --adopt-orphan, or --stop-orphan"))
 			}
 			if !acceptCommand && commandFields {
 				return fail(errors.New("--exit-code and --output-file require --accept-command"))
 			}
 			if (acceptDelivery || acceptCommand) && (strings.TrimSpace(stepID) == "" || strings.TrimSpace(receipt) == "" || strings.TrimSpace(reason) == "") {
 				return fail(errors.New("acceptance requires --step-id, --receipt, and a non-empty --reason"))
+			}
+			if (adoptOrphan || stopOrphan) && (strings.TrimSpace(stepID) == "" || strings.TrimSpace(reason) == "") {
+				return fail(errors.New("--adopt-orphan and --stop-orphan require --step-id and a non-empty --reason"))
 			}
 			if acceptCommand && (!cmd.Flags().Changed("exit-code") || !cmd.Flags().Changed("output-file") || strings.TrimSpace(outputFile) == "" || exitCode < 0 || exitCode > 255) {
 				return fail(errors.New("--accept-command requires an explicit --exit-code from 0 to 255 and --output-file"))
@@ -1109,6 +1129,35 @@ Examples:
 				fmt.Fprintln(cmd.OutOrStdout(), "Resume this run with 'ntm pipeline resume' to observe the original response and continue.")
 				return nil
 			}
+			if adoptOrphan || stopOrphan {
+				action, verb := pipeline.OrphanedTurnActionAdopt, "Adopted"
+				if stopOrphan {
+					action, verb = pipeline.OrphanedTurnActionStop, "Stopped"
+				}
+				var result *pipeline.OrphanedTurnActionResult
+				if action == pipeline.OrphanedTurnActionAdopt {
+					result, err = pipeline.AdoptOrphanedTurnContext(cmd.Context(), projectDir, runID, stepID, reason)
+				} else {
+					result, err = pipeline.StopOrphanedTurnContext(cmd.Context(), projectDir, runID, stepID, reason)
+				}
+				if err != nil {
+					return fail(err)
+				}
+				if jsonOutput {
+					return json.NewEncoder(cmd.OutOrStdout()).Encode(map[string]interface{}{
+						"success": true, "run_id": result.RunID, "workflow": result.WorkflowID,
+						"session": result.Session, "decision": result.Decision, "replayed": result.Replayed,
+						"resume_command": []string{"ntm", "pipeline", "resume", result.RunID, "--mode=continue"},
+					})
+				}
+				if result.Replayed {
+					verb = "Previously " + strings.ToLower(verb)
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "%s orphaned turn for step %s in run %s.\n",
+					verb, pipeline.SanitizeDescriptionForTerminal(result.Decision.StepID), pipeline.SanitizeDescriptionForTerminal(result.RunID))
+				fmt.Fprintln(cmd.OutOrStdout(), "The step outcome and delivery receipt are unchanged; resume will not resend this prompt.")
+				return nil
+			}
 			inspection, err := pipeline.InspectAgentDeliveryRecovery(cmd.Context(), projectDir, runID)
 			if err != nil {
 				return fail(err)
@@ -1117,10 +1166,15 @@ Examples:
 			if err != nil {
 				return fail(err)
 			}
+			orphans, err := pipeline.InspectOrphanedTurnsContext(cmd.Context(), projectDir, runID)
+			if err != nil {
+				return fail(err)
+			}
 			if jsonOutput {
 				return json.NewEncoder(cmd.OutOrStdout()).Encode(map[string]interface{}{
 					"success": true, "run_id": inspection.RunID, "workflow": inspection.WorkflowID,
 					"session": inspection.Session, "deliveries": inspection.Deliveries, "commands": commands.Commands,
+					"orphaned_turns": orphans.Turns,
 				})
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "Pipeline %s (%s)\n", pipeline.SanitizeDescriptionForTerminal(inspection.RunID), pipeline.SanitizeDescriptionForTerminal(inspection.Session))
@@ -1157,6 +1211,29 @@ Examples:
 			if len(commands.Commands) > 0 {
 				fmt.Fprintln(cmd.OutOrStdout(), "\nTo accept an unresolved foreground command, verify the original command and all descendants have finished, then supply --accept-command, --step-id, --receipt, --reason, --exit-code, and --output-file. Acceptance never runs the command.")
 			}
+			if len(orphans.Turns) == 0 {
+				fmt.Fprintln(cmd.OutOrStdout(), "\nNo orphaned turns: every failed or cancelled step's pane stopped producing before the run stopped observing it.")
+			} else {
+				fmt.Fprintln(cmd.OutOrStdout(), "\nOrphaned turns:")
+				for _, turn := range orphans.Turns {
+					fmt.Fprintf(cmd.OutOrStdout(), "  Step: %s  Class: %s  Pane verified: %t\n    Pane: %s (%s)  Step %s at %s\n",
+						pipeline.SanitizeDescriptionForTerminal(turn.StepID), pipeline.SanitizeDescriptionForTerminal(turn.Class), turn.PaneVerified,
+						pipeline.SanitizeDescriptionForTerminal(turn.PaneID), pipeline.SanitizeDescriptionForTerminal(turn.AgentType),
+						pipeline.SanitizeDescriptionForTerminal(turn.StepStatus), turn.FinishedAt.Format(time.RFC3339))
+					if turn.AgentState != "" {
+						fmt.Fprintf(cmd.OutOrStdout(), "    Agent state: %s (%s)  Last active: %s\n",
+							pipeline.SanitizeDescriptionForTerminal(turn.AgentState), pipeline.SanitizeDescriptionForTerminal(turn.StateSource), turn.LastActive.Format(time.RFC3339))
+					}
+					if turn.NewOutputBytes > 0 {
+						fmt.Fprintf(cmd.OutOrStdout(), "    New pane output: %d bytes\n", turn.NewOutputBytes)
+					}
+					for _, artifact := range turn.Artifacts {
+						fmt.Fprintf(cmd.OutOrStdout(), "    Artifact: %s (%s, %d bytes)\n",
+							pipeline.SanitizeDescriptionForTerminal(artifact.Path), artifact.ModTime.Format(time.RFC3339), artifact.Size)
+					}
+				}
+				fmt.Fprintln(cmd.OutOrStdout(), "\nAdopt post-failure artifacts with --adopt-orphan, or interrupt a generating turn with --stop-orphan, plus --step-id and --reason. Neither action resends the prompt or restarts the step.")
+			}
 			return nil
 		},
 	}
@@ -1166,7 +1243,9 @@ Examples:
 	cmd.Flags().BoolVar(&acceptCommand, "accept-command", false, "Attest that the original command and all descendants finished, and record their observed result")
 	cmd.Flags().IntVar(&exitCode, "exit-code", 0, "Observed command exit code (0 to 255); explicitly required with --accept-command")
 	cmd.Flags().StringVar(&outputFile, "output-file", "", "Regular file containing complete captured command output; explicitly required with --accept-command")
-	cmd.Flags().StringVar(&reason, "reason", "", "Observation confirming the original delivery or completed command outcome")
+	cmd.Flags().BoolVar(&adoptOrphan, "adopt-orphan", false, "Record post-failure artifact provenance for a failed or cancelled step's orphaned turn")
+	cmd.Flags().BoolVar(&stopOrphan, "stop-orphan", false, "Interrupt a verified pane whose turn is still generating after its step failed or was cancelled")
+	cmd.Flags().StringVar(&reason, "reason", "", "Observation confirming the original delivery, completed command outcome, or orphaned-turn decision")
 	return cmd
 }
 
