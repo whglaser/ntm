@@ -4585,6 +4585,13 @@ func ExpandHome(path string) string {
 // resolve to the same directory as the base session ("myproject").
 func (c *Config) GetProjectDir(session string) string {
 	base := ExpandHome(c.ProjectsBase)
+	// NTM_PROJECTS_BASE is documented as a runtime override for provisioning
+	// tools. Honor it at call time too, so callers that resolve directories
+	// after config load (quick/create/spawn) see the same base Load applied
+	// through its env-override pass.
+	if envBase := strings.TrimSpace(os.Getenv("NTM_PROJECTS_BASE")); envBase != "" {
+		base = ExpandHome(envBase)
+	}
 	return filepath.Join(base, SessionBase(session))
 }
 

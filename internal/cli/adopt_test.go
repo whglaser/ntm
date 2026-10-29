@@ -1,6 +1,9 @@
 package cli
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -171,6 +174,39 @@ func TestNewAdoptCmdSupportsAllAgentFlags(t *testing.T) {
 	}
 	if flag := cmd.Flags().Lookup("grok"); flag == nil || !strings.Contains(flag.Usage, "Grok Build") {
 		t.Fatalf("expected --grok flag with Grok Build help, got %+v", flag)
+	}
+}
+
+// TestAdoptPluginFlagsUseGlobalConfigFlag pins ntm#260 parity for adopt: a
+// plugin declared in the selected config's sibling agents/ directory exposes
+// --<name> and --<alias> pane flags, so `ntm adopt s --pi=...` works.
+func TestAdoptPluginFlagsUseGlobalConfigFlag(t *testing.T) {
+	root := repoRoot(t)
+	base := t.TempDir()
+	customPath := filepath.Join(base, "custom", "ntm.toml")
+	if err := os.MkdirAll(filepath.Dir(customPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(config dir) failed: %v", err)
+	}
+	if err := os.WriteFile(customPath, []byte(fmt.Sprintf("projects_base = %q\n", filepath.Join(base, "projects"))), 0o644); err != nil {
+		t.Fatalf("WriteFile(config) failed: %v", err)
+	}
+	agentsDir := filepath.Join(filepath.Dir(customPath), "agents")
+	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(agentsDir) failed: %v", err)
+	}
+	pluginBody := "[agent]\nname = \"reviewbot\"\nalias = \"rb\"\ncommand = \"echo reviewbot\"\ndescription = \"Review Bot\"\n"
+	if err := os.WriteFile(filepath.Join(agentsDir, "reviewbot.toml"), []byte(pluginBody), 0o644); err != nil {
+		t.Fatalf("WriteFile(agent plugin) failed: %v", err)
+	}
+
+	stdout, stderr, code := runNTM(t, root, "--config", customPath, "adopt", "--help")
+	if code != 0 {
+		t.Fatalf("adopt --help failed (code=%d): %s", code, stderr)
+	}
+	for _, flagName := range []string{"--reviewbot", "--rb"} {
+		if !strings.Contains(stdout, flagName) {
+			t.Fatalf("adopt --help output missing %s: %q", flagName, stdout)
+		}
 	}
 }
 
