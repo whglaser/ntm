@@ -718,3 +718,4 @@ internal/assignment/atomic.go:ReservationFunc.Reserve	permanent	adapter method m
 internal/context/pending.go:NewPendingRotationStoreWithPath	permanent	path-injecting constructor reached by internal/coordinator/rotation_test.go (tests of live rotation coordinator)
 internal/context/predictor.go:NewContextPredictor	permanent	constructor reached by tests/e2e/context_management_test.go (live context-management e2e coverage)
 internal/context/predictor.go:DefaultPredictorConfig	permanent	config constructor reached by tests/e2e/context_management_test.go (live context-management e2e coverage)
+internal/pipeline/mock.go:MockTmuxClient.InterruptPane	ntm-l6cuz.8	test-only tmux mock; implements TmuxClient.InterruptPane used by the orphaned-turn stop path; same class as the other MockTmuxClient entries
