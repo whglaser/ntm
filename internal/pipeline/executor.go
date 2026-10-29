@@ -1266,6 +1266,11 @@ func (e *Executor) executeStepOnce(ctx context.Context, step *Step, workflow *Wo
 	// reach the operator's terminal during --dry-run. Same attack class
 	// bd-82zsc patched for command steps.
 	if e.config.DryRun {
+		if err := e.refuseUnattributablePiPrompt(step, prompt); err != nil {
+			result.Status = StatusFailed
+			result.Error = stepRuntimeError(step, StepKindPrompt, "not_dispatched", err.Error(), "simplify the prompt before retrying", "")
+			return result
+		}
 		result.Status = StatusCompleted
 		result.Output = dryRunOutput(step, "Would execute: "+truncatePrompt(SanitizeDescriptionForTerminal(prompt), 100))
 		result.FinishedAt = time.Now()
@@ -1912,6 +1917,11 @@ func (e *Executor) executeTemplate(ctx context.Context, step *Step, workflow *Wo
 	result.AgentType = agentType
 
 	if e.config.DryRun {
+		if err := e.refuseUnattributablePiPrompt(step, rendered); err != nil {
+			result.Status = StatusFailed
+			result.Error = stepRuntimeError(step, StepKindTemplate, "not_dispatched", err.Error(), "simplify the prompt before retrying", "")
+			return result
+		}
 		result.Status = StatusCompleted
 		result.Output = dryRunOutput(step,
 			fmt.Sprintf("Would dispatch template %s (%d chars) to pane %s", step.Template, len(rendered), paneID))
@@ -2084,7 +2094,11 @@ func (e *Executor) executeAgentDelivery(ctx context.Context, step *Step, workflo
 			return fail("checkpoint", err)
 		}
 		if !piEchoSupported {
-			return fail("not_dispatched", errors.New("pi prompt contains Markdown whose rendered echo cannot be attributed safely; simplify the prompt before retrying"))
+			message := "pi prompt contains Markdown whose rendered echo cannot be attributed safely; simplify the prompt before retrying"
+			if reason := status.PiPromptEchoReason(prompt); reason != "" {
+				message = fmt.Sprintf("pi prompt contains Markdown whose rendered echo cannot be attributed safely (%s); simplify the prompt before retrying", reason)
+			}
+			return fail("not_dispatched", errors.New(message))
 		}
 		if err := e.tmuxClient().PrepareDelivery(ctx, pane, agentType); err != nil {
 			return fail("not_dispatched", err)
@@ -3117,6 +3131,22 @@ func (e *Executor) selectPane(ctx context.Context, step *Step) (paneID string, a
 	}
 
 	return result.Selected.PaneID, result.Selected.AgentType, nil
+}
+
+// refuseUnattributablePiPrompt is the dry-run preflight for the delivery
+// guard: a pi step whose rendered prompt cannot be echoed back can never
+// complete, so --dry-run reports it before launch instead of at paste time
+// (ntm-l6cuz.6). Non-pi and fire-and-forget steps are not affected.
+func (e *Executor) refuseUnattributablePiPrompt(step *Step, prompt string) error {
+	// Dry-run pane selection returns a placeholder agent type, so the static
+	// step declaration is the only usable pi signal here.
+	if step == nil || step.Wait == WaitNone || NormalizeAgentType(step.Agent) != "pi" {
+		return nil
+	}
+	if reason := status.PiPromptEchoReason(prompt); reason != "" {
+		return fmt.Errorf("pi prompt contains Markdown whose rendered echo cannot be attributed safely (%s); simplify the prompt before retrying", reason)
+	}
+	return nil
 }
 
 // resolvePrompt gets the prompt content from prompt or prompt_file

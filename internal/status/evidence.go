@@ -56,35 +56,66 @@ var piListMarker = regexp.MustCompile(`^(?:[0-9]{1,9}[.)]|[-+*])(?:[ \t]+|\r?\n|
 // be mistaken for an answer.
 // The returned text is transient and is not stored in delivery receipts.
 func PiPromptEcho(prompt string) (PromptEchoFingerprint, string, bool) {
+	fingerprint, visible, reason := piPromptEcho(prompt)
+	return fingerprint, visible, reason == ""
+}
+
+// PiPromptEchoReason reports why PiPromptEcho refuses a prompt using a
+// value-safe Markdown construct name (for example "HTMLBlock",
+// "ThematicBreak", "Table", "Text (math marker)", or "unstable link").
+// It returns "" when the prompt is supported. Lint and dry-run callers use
+// this to explain a refusal before any pane is touched.
+func PiPromptEchoReason(prompt string) string {
+	_, _, reason := piPromptEcho(prompt)
+	return reason
+}
+
+// piPromptEcho fingerprints a supported prompt and otherwise names the first
+// construct pi's renderer would transform in a way the echo matcher cannot
+// attribute.
+func piPromptEcho(prompt string) (PromptEchoFingerprint, string, string) {
 	const maxPromptBytes = 1 << 20
-	if len(prompt) == 0 || len(prompt) > maxPromptBytes {
-		return PromptEchoFingerprint{}, "", false
+	if len(prompt) == 0 {
+		return PromptEchoFingerprint{}, "", "empty prompt"
+	}
+	if len(prompt) > maxPromptBytes {
+		return PromptEchoFingerprint{}, "", "prompt larger than 1 MiB"
 	}
 	source := []byte(StripANSI(prompt))
 	parser := goldmark.New(goldmark.WithExtensions(extension.GFM)).Parser()
 	document := parser.Parse(text.NewReader(source))
 	var rendered strings.Builder
 	budget := 8192
-	if !renderPiPromptNode(document, source, &rendered, 0, &budget) {
-		return PromptEchoFingerprint{}, "", false
+	reason := ""
+	if !renderPiPromptNode(document, source, &rendered, 0, &budget, &reason) {
+		if reason == "" {
+			reason = "unsupported Markdown"
+		}
+		return PromptEchoFingerprint{}, "", reason
 	}
 	visible := strings.TrimSpace(rendered.String())
 	echo := NormalizeAgentEcho(visible)
 	if echo == "" || len(echo) > maxPromptBytes {
-		return PromptEchoFingerprint{}, "", false
+		return PromptEchoFingerprint{}, "", "rendered prompt is empty or too large"
 	}
 	digest := sha256.Sum256([]byte(echo))
-	return PromptEchoFingerprint{Hash: hex.EncodeToString(digest[:]), Length: len(echo)}, visible, true
+	return PromptEchoFingerprint{Hash: hex.EncodeToString(digest[:]), Length: len(echo)}, visible, ""
 }
 
-func renderPiPromptNode(node ast.Node, source []byte, out *strings.Builder, depth int, budget *int) bool {
-	if depth > 64 || *budget <= 0 {
+func renderPiPromptNode(node ast.Node, source []byte, out *strings.Builder, depth int, budget *int, reason *string) bool {
+	refuse := func(why string) bool {
+		if reason != nil && *reason == "" {
+			*reason = why
+		}
 		return false
+	}
+	if depth > 64 || *budget <= 0 {
+		return refuse("prompt complexity limit")
 	}
 	*budget--
 	children := func() bool {
 		for child := node.FirstChild(); child != nil; child = child.NextSibling() {
-			if !renderPiPromptNode(child, source, out, depth+1, budget) {
+			if !renderPiPromptNode(child, source, out, depth+1, budget, reason) {
 				return false
 			}
 		}
@@ -110,11 +141,11 @@ func renderPiPromptNode(node ast.Node, source []byte, out *strings.Builder, dept
 	case *ast.ListItem:
 		start := value.Pos()
 		if start < 0 || start >= len(source) {
-			return false
+			return refuse("list item")
 		}
 		marker := piListMarker.Find(source[start:])
 		if marker == nil {
-			return false
+			return refuse("list item")
 		}
 		out.Write(bytes.TrimSpace(marker))
 		out.WriteByte(' ')
@@ -132,7 +163,7 @@ func renderPiPromptNode(node ast.Node, source []byte, out *strings.Builder, dept
 		for child := value.FirstChild(); child != nil; child = child.NextSibling() {
 			literal, ok := child.(*ast.Text)
 			if !ok {
-				return false
+				return refuse("CodeSpan")
 			}
 			out.Write(bytes.ReplaceAll(literal.Value(source), []byte{'\n'}, []byte{' '}))
 		}
@@ -145,7 +176,7 @@ func renderPiPromptNode(node ast.Node, source []byte, out *strings.Builder, dept
 		// Goldmark can classify $x$@example.com as one email, while pi
 		// renders the leading math separately. Keep the literal guard here.
 		if piHasMathMarker(label) || !piLinkHasStableLabel(label, value.URL(source)) {
-			return false
+			return refuse("unstable link")
 		}
 		out.Write(label)
 		return true
@@ -157,15 +188,15 @@ func renderPiPromptNode(node ast.Node, source []byte, out *strings.Builder, dept
 		// URL whose fallback also prints the destination in parentheses.
 		literal, ok := value.FirstChild().(*ast.Text)
 		if !ok || literal.NextSibling() != nil || !piLinkHasStableLabel(literal.Value(source), value.Destination) {
-			return false
+			return refuse("unstable link")
 		}
-		return renderPiPromptNode(literal, source, out, depth+1, budget)
+		return renderPiPromptNode(literal, source, out, depth+1, budget, reason)
 	case *ast.Text:
 		literal := value.Value(source)
 		// Pi recognizes LaTeX separately from CommonMark. Refuse unknown
 		// transformations outside code rather than discard their meaning.
 		if piHasMathMarker(literal) {
-			return false
+			return refuse("Text (math marker)")
 		}
 		out.Write(literal)
 		if value.SoftLineBreak() || value.HardLineBreak() {
@@ -180,7 +211,10 @@ func renderPiPromptNode(node ast.Node, source []byte, out *strings.Builder, dept
 		}
 		return true
 	default:
-		return false
+		if name := node.Kind().String(); name != "" {
+			return refuse(name)
+		}
+		return refuse("unsupported Markdown")
 	}
 }
 

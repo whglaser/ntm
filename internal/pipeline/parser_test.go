@@ -1916,3 +1916,122 @@ func TestParseString_YAMLCommentOnly(t *testing.T) {
 		t.Fatalf("expected zero-value workflow, got %#v", w)
 	}
 }
+
+// TestLoadAndValidateRejectsPiPromptEchoHazards covers ntm-l6cuz.6's lint
+// surface: a pi-bound prompt or template whose rendered echo cannot be
+// attributed fails validation with the step and the construct named, before
+// any pane is touched.
+func TestLoadAndValidateRejectsPiPromptEchoHazards(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "lane.md"), []byte("Review ${vars.repo}.\n\n---\n\nReport.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "note.md"), []byte("| Name | Value |\n| --- | --- |\n| A | B |\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "workflow.yaml")
+	content := `
+schema_version: "2.0"
+name: pi-echo-hazards
+vars:
+  repo:
+    required: true
+    type: string
+steps:
+  - id: inline_hazard
+    agent: pi
+    prompt: |
+      Inspect the source.
+
+      <!-- operator note -->
+
+      Report.
+  - id: template_hazard
+    agent: pi
+    template: lane.md
+  - id: prompt_file_hazard
+    agent: pi
+    prompt_file: note.md
+  - id: parallel_guard
+    parallel:
+      - id: nested_hazard
+        agent: pi
+        prompt: |
+          > Quoted task
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, result, err := LoadAndValidate(path)
+	if err != nil {
+		t.Fatalf("LoadAndValidate: %v", err)
+	}
+	if result.Valid {
+		t.Fatalf("pi echo hazards validated clean: %+v", result)
+	}
+	want := map[string]string{
+		"inline_hazard":      "HTMLBlock",
+		"template_hazard":    "ThematicBreak",
+		"prompt_file_hazard": "Table",
+		"nested_hazard":      "Blockquote",
+	}
+	for _, e := range result.Errors {
+		for id, reason := range want {
+			if strings.Contains(e.Message, id) && strings.Contains(e.Message, reason) {
+				delete(want, id)
+			}
+		}
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing pi echo errors %v in %+v", want, result.Errors)
+	}
+}
+
+// TestLoadAndValidateAcceptsPiSafePrompts pins the other acceptance half:
+// the supported subset, fire-and-forget steps, and non-pi steps stay clean.
+func TestLoadAndValidateAcceptsPiSafePrompts(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "safe.md"), []byte("Review ${vars.repo} with `tests`.\n\n- item\n- item two\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "workflow.yaml")
+	content := `
+schema_version: "2.0"
+name: pi-safe-prompts
+vars:
+  repo:
+    required: true
+    type: string
+steps:
+  - id: safe_inline
+    agent: pi
+    prompt: |
+      Inspect **changes** and tests.
+
+      Report ${vars.repo} findings.
+  - id: safe_template
+    agent: pi
+    template: safe.md
+  - id: fire_and_forget
+    agent: pi
+    wait: none
+    prompt: |
+      <!-- never attributed because the step does not wait -->
+  - id: other_agent
+    agent: claude
+    prompt: |
+      | Name | Value |
+      | --- | --- |
+      | A | B |
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, result, err := LoadAndValidate(path)
+	if err != nil {
+		t.Fatalf("LoadAndValidate: %v", err)
+	}
+	if !result.Valid {
+		t.Fatalf("pi-safe workflow failed validation: %+v", result.Errors)
+	}
+}

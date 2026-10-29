@@ -67,6 +67,28 @@ func TestPiPromptEchoRefusesUnsupportedRendering(t *testing.T) {
 	}
 }
 
+func TestPiPromptEchoReasonNamesUnsupportedConstruct(t *testing.T) {
+	for _, tc := range []struct{ name, prompt, want string }{
+		{"html block", "Inspect source.\n\n<!-- operator note -->\n\nReport.", "HTMLBlock"},
+		{"thematic break", "Before.\n\n---\n\nAfter.", "ThematicBreak"},
+		{"blockquote", "> Quoted task", "Blockquote"},
+		{"table", "| Name | Value |\n| --- | --- |\n| A | B |", "Table"},
+		{"math marker", "Compute $x^2$.", "Text (math marker)"},
+		{"unstable link", "Review [the source](https://example.com).", "unstable link"},
+		{"image", "![diagram](diagram.png)", "Image"},
+		{"empty", "", "empty prompt"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := PiPromptEchoReason(tc.prompt); got != tc.want {
+				t.Fatalf("PiPromptEchoReason(%q) = %q, want %q", tc.prompt, got, tc.want)
+			}
+		})
+	}
+	if got := PiPromptEchoReason("# Review\n\nInspect **changes** and `tests`."); got != "" {
+		t.Fatalf("supported prompt reported refusal %q", got)
+	}
+}
+
 func TestPiRepaintRecognizesRenderedMarkdownCollectively(t *testing.T) {
 	const prompt = "# Review\n\nInspect **changes** and `tests`."
 	const visible = "Review\n\nInspect changes and tests."
