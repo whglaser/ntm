@@ -64,6 +64,14 @@ func orphanedTurnFixture(t *testing.T) (*Executor, *MockTmuxClient, string, stri
 		t.Fatal(err)
 	}
 
+	// The receipt records the composer-stripped transcript so output growth is
+	// measured against the same form capture returns.
+	initialFrame := piStagePane("Pi v1.3.0\n\nold frame\nlane started", "")
+	initialTranscript, complete := status.AgentResponseTranscript(initialFrame, "pi")
+	if !complete {
+		t.Fatalf("fixture frame is not a complete pi transcript: %q", initialFrame)
+	}
+
 	workflowPath := filepath.Join(projectDir, "workflow.yaml")
 	workflowYAML := `schema_version: "2.0"
 name: orphan-fixture
@@ -72,11 +80,13 @@ vars:
     required: true
     type: string
 steps:
-  - id: evidence_lanes_ox
-    outputs:
-      - name: lane_note
-        path: evidence/${vars.review_slug}/tool-ox.md
-    prompt: run the lane
+  - id: evidence_lanes
+    parallel:
+      - id: ox
+        outputs:
+          - name: lane_note
+            path: evidence/${vars.review_slug}/tool-ox.md
+        prompt: run the lane
 `
 	if err := os.WriteFile(workflowPath, []byte(workflowYAML), 0o644); err != nil {
 		t.Fatal(err)
@@ -87,7 +97,7 @@ steps:
 		Session: session, Endpoint: "local", PaneID: "%7", PanePID: 4242, AgentType: "pi",
 		StepHash: strings.Repeat("a", 64), PromptHash: strings.Repeat("b", 64),
 		PromptEchoHash: strings.Repeat("c", 64), PromptEchoLength: 42,
-		Status: agentDeliveryDelivered, BeforeOutput: "old frame", Output: "old frame\nlane started",
+		Status: agentDeliveryDelivered, BeforeOutput: initialFrame, Output: initialTranscript,
 		StartedAt: started, DeliveredAt: started.Add(time.Second),
 	}
 	state := &ExecutionState{
@@ -112,7 +122,7 @@ steps:
 	e := NewExecutor(cfg)
 	mock := NewMockTmuxClient()
 	mock.AddPane(session, tmux.Pane{ID: "%7", Index: 7, PID: 4242, Type: tmux.AgentType("pi"), Width: 120})
-	if err := mock.SetPaneOutput("%7", piStagePane("Pi v1.3.0\n\nold frame\nlane started", "")); err != nil {
+	if err := mock.SetPaneOutput("%7", initialFrame); err != nil {
 		t.Fatal(err)
 	}
 	e.SetTmuxClient(mock)
@@ -199,7 +209,7 @@ func TestStopOrphanedTurnInterruptsVerifiedPaneAndRecordsDecision(t *testing.T) 
 	e.SetDetector(orphanStateDetector{state: status.StateWorking, source: status.StateSourceOSC, lastSeen: time.Now().UTC()})
 	const reason = "Operator: ox lane kept generating after evidence_lanes failed"
 
-	result, err := e.decideOrphanedTurn(context.Background(), "evidence_lanes_ox", reason, OrphanedTurnActionStop)
+	result, err := e.decideOrphanedTurn(context.Background(), "evidence_lanes_ox", reason, OrphanedTurnActionStop, nil)
 	if err != nil {
 		t.Fatalf("stop orphaned turn: %v", err)
 	}
@@ -225,15 +235,23 @@ func TestStopOrphanedTurnInterruptsVerifiedPaneAndRecordsDecision(t *testing.T) 
 		t.Fatalf("persisted stop decision = %+v, want pane identity and artifact provenance", decision)
 	}
 
-	replay, err := e.decideOrphanedTurn(context.Background(), "evidence_lanes_ox", reason, OrphanedTurnActionStop)
+	replay, err := e.decideOrphanedTurn(context.Background(), "evidence_lanes_ox", reason, OrphanedTurnActionStop, nil)
 	if err != nil || !replay.Replayed {
 		t.Fatalf("repeated stop = %+v, %v; want an idempotent replay", replay, err)
 	}
-	if _, err := e.decideOrphanedTurn(context.Background(), "evidence_lanes_ox", "different reason", OrphanedTurnActionStop); err == nil {
+	if _, err := e.decideOrphanedTurn(context.Background(), "evidence_lanes_ox", "different reason", OrphanedTurnActionStop, nil); err == nil {
 		t.Fatal("conflicting stop decision was accepted")
 	}
-	if _, err := e.decideOrphanedTurn(context.Background(), "evidence_lanes_ox", reason, OrphanedTurnActionAdopt); err == nil {
+	if _, err := e.decideOrphanedTurn(context.Background(), "evidence_lanes_ox", reason, OrphanedTurnActionAdopt, nil); err == nil {
 		t.Fatal("adoption after a stop decision was accepted")
+	}
+	inspection, err := e.InspectOrphanedTurns(context.Background())
+	if err != nil {
+		t.Fatalf("InspectOrphanedTurns after stop: %v", err)
+	}
+	stopped, found := orphanTurnByStep(inspection, "evidence_lanes_ox")
+	if !found || stopped.Decision != OrphanedTurnActionStop {
+		t.Fatalf("stopped turn after reconciliation = %+v, want the stop decision surfaced", stopped)
 	}
 }
 
@@ -244,7 +262,7 @@ func TestAdoptOrphanedTurnRecordsArtifactsWithoutInterruptOrPaste(t *testing.T) 
 	e.SetDetector(orphanStateDetector{state: status.StateIdle, source: status.StateSourceScrape})
 	const reason = "Operator: adopting the lane note written after the step failed"
 
-	result, err := e.decideOrphanedTurn(context.Background(), "evidence_lanes_ox", reason, OrphanedTurnActionAdopt)
+	result, err := e.decideOrphanedTurn(context.Background(), "evidence_lanes_ox", reason, OrphanedTurnActionAdopt, nil)
 	if err != nil {
 		t.Fatalf("adopt orphaned turn: %v", err)
 	}
@@ -266,5 +284,58 @@ func TestAdoptOrphanedTurnRecordsArtifactsWithoutInterruptOrPaste(t *testing.T) 
 	}
 	if loaded.Steps["evidence_lanes_ox"].Status != StatusFailed {
 		t.Fatalf("adoption rewrote the step outcome: %+v", loaded.Steps["evidence_lanes_ox"])
+	}
+}
+
+// TestAdoptOrphanedTurnAcceptsExplicitArtifactWithoutAutomaticEvidence covers
+// the historical-run path: the frozen workflow declares no outputs and the
+// session is gone, so the operator names the file that landed after the stop.
+func TestAdoptOrphanedTurnAcceptsExplicitArtifactWithoutAutomaticEvidence(t *testing.T) {
+	e, _, projectDir, runID := orphanedTurnFixture(t)
+	e.SetDetector(orphanStateDetector{state: status.StateIdle, source: status.StateSourceScrape})
+	// Remove the declared-output evidence so only the explicit path remains.
+	if err := os.Remove(filepath.Join(projectDir, "evidence", "demo", "tool-ox.md")); err != nil {
+		t.Fatal(err)
+	}
+	explicitRel := filepath.Join("notes", "operator-note.md")
+	explicitAbs := filepath.Join(projectDir, explicitRel)
+	if err := os.MkdirAll(filepath.Dir(explicitAbs), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(explicitAbs, []byte("adopted finding\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := e.decideOrphanedTurn(context.Background(), "evidence_lanes_ox", "no evidence", OrphanedTurnActionAdopt, nil); err == nil {
+		t.Fatal("adoption without evidence or explicit artifacts was accepted")
+	}
+	const reason = "Operator: adopting the lane note the frozen workflow did not declare"
+	result, err := e.decideOrphanedTurn(context.Background(), "evidence_lanes_ox", reason, OrphanedTurnActionAdopt, []string{explicitRel})
+	if err != nil {
+		t.Fatalf("explicit adoption: %v", err)
+	}
+	if len(result.Decision.Artifacts) != 1 || result.Decision.Artifacts[0].Path != explicitAbs {
+		t.Fatalf("explicit adoption artifacts = %+v, want %s", result.Decision.Artifacts, explicitAbs)
+	}
+	if _, err := e.decideOrphanedTurn(context.Background(), "evidence_lanes_ox", reason, OrphanedTurnActionAdopt, []string{"notes/missing.md"}); err == nil {
+		t.Fatal("missing explicit artifact path was accepted")
+	}
+	loaded, err := LoadState(projectDir, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.OrphanedTurnDecisions) != 1 || len(loaded.OrphanedTurnDecisions[0].Artifacts) != 1 {
+		t.Fatalf("persisted explicit adoption = %+v, want one decision with provenance", loaded.OrphanedTurnDecisions)
+	}
+	inspection, err := e.InspectOrphanedTurns(context.Background())
+	if err != nil {
+		t.Fatalf("InspectOrphanedTurns after adoption: %v", err)
+	}
+	adopted, found := orphanTurnByStep(inspection, "evidence_lanes_ox")
+	if !found || adopted.Decision != OrphanedTurnActionAdopt || adopted.Class != OrphanedTurnArtifactLanded || len(adopted.Artifacts) != 1 {
+		t.Fatalf("adopted turn after reconciliation = %+v, want the decision surfaced with provenance", adopted)
+	}
+	if adopted.Artifacts[0].Path != explicitAbs {
+		t.Fatalf("adopted turn artifact = %q, want %q", adopted.Artifacts[0].Path, explicitAbs)
 	}
 }

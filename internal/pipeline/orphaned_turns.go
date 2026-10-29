@@ -58,6 +58,10 @@ type OrphanedTurn struct {
 	NewOutputBytes int                `json:"new_output_bytes,omitempty"`
 	Artifacts      []OrphanedArtifact `json:"artifacts,omitempty"`
 	PaneVerified   bool               `json:"pane_verified"`
+	// Decision and DecidedAt mark a turn already reconciled by an operator
+	// (adopted or stopped); the turn stays listed so the decision is visible.
+	Decision  string    `json:"decision,omitempty"`
+	DecidedAt time.Time `json:"decided_at,omitempty"`
 }
 
 // OrphanedTurnInspection is the read-only orphan report for one run.
@@ -73,6 +77,7 @@ type OrphanedTurnInspection struct {
 type OrphanedTurnDecision struct {
 	StepID    string             `json:"step_id"`
 	Action    string             `json:"action"`
+	Class     string             `json:"class,omitempty"`
 	Reason    string             `json:"reason"`
 	PaneID    string             `json:"pane_id,omitempty"`
 	PanePID   int                `json:"pane_pid,omitempty"`
@@ -175,6 +180,10 @@ func (e *Executor) inspectOrphanedTurnsFromState(ctx context.Context, state *Exe
 				}
 			}
 		}
+		if decision, ok := orphanDecisionForStep(state, stepID); ok {
+			turn.Decision, turn.DecidedAt = decision.Action, decision.DecidedAt
+			turn.Artifacts = mergeOrphanArtifacts(turn.Artifacts, decision.Artifacts)
+		}
 		if turn.Class == "" && len(turn.Artifacts) > 0 {
 			turn.Class = OrphanedTurnArtifactLanded
 		}
@@ -183,6 +192,34 @@ func (e *Executor) inspectOrphanedTurnsFromState(ctx context.Context, state *Exe
 		}
 		result.Turns = append(result.Turns, turn)
 	}
+	// Operators need to see reconciled turns too: a decision that was already
+	// recorded stays in the listing, marked with its action, so a later
+	// inspection does not look as if the orphan vanished silently.
+	emitted := make(map[string]struct{}, len(result.Turns))
+	for _, turn := range result.Turns {
+		emitted[turn.StepID] = struct{}{}
+	}
+	for _, decision := range state.OrphanedTurnDecisions {
+		if _, exists := emitted[decision.StepID]; exists {
+			continue
+		}
+		class := decision.Class
+		if class == "" {
+			class = OrphanedTurnArtifactLanded
+		}
+		step := state.Steps[decision.StepID]
+		turn := OrphanedTurn{
+			StepID: decision.StepID, StepStatus: string(step.Status),
+			PaneID: decision.PaneID, StartedAt: step.StartedAt, FinishedAt: step.FinishedAt,
+			Class: class, Artifacts: decision.Artifacts,
+			Decision: decision.Action, DecidedAt: decision.DecidedAt,
+		}
+		if record, ok := state.AgentDeliveries[decision.StepID]; ok {
+			turn.AgentType = record.AgentType
+		}
+		result.Turns = append(result.Turns, turn)
+	}
+	sort.Slice(result.Turns, func(i, j int) bool { return result.Turns[i].StepID < result.Turns[j].StepID })
 	return result, nil
 }
 
@@ -297,28 +334,78 @@ func (e *Executor) orphanArtifactPath(resolved string) (string, os.FileInfo, boo
 	return "", nil, false
 }
 
-// findWorkflowStepByID walks the same step positions the pi-prompt lint walks:
-// top-level steps plus nested parallel, foreach, loop and on_success bodies.
+// findWorkflowStepByID resolves a runtime step ID to its workflow declaration.
+// Foreach and parallel children execute under materialized IDs
+// ("parent_child"), so an exact match is tried first and then each parent's
+// nested body with the parent prefix stripped.
 func findWorkflowStepByID(workflow *Workflow, stepID string) *Step {
 	if workflow == nil || stepID == "" {
 		return nil
 	}
+	if step := findStepInList(workflow.Steps, stepID); step != nil {
+		return step
+	}
 	var found *Step
 	piPromptSteps(workflow.Steps, "steps", func(step *Step, _ string) {
-		if found == nil && step.ID == stepID {
-			found = step
+		if found != nil || step.ID == "" {
+			return
+		}
+		for _, sep := range []string{"_", "/", "#", ":", "."} {
+			prefix := step.ID + sep
+			if !strings.HasPrefix(stepID, prefix) {
+				continue
+			}
+			if child := findStepInList(nestedBodySteps(step), strings.TrimPrefix(stepID, prefix)); child != nil {
+				found = child
+				return
+			}
 		}
 	})
 	return found
 }
 
+func findStepInList(steps []Step, id string) *Step {
+	if id == "" {
+		return nil
+	}
+	for i := range steps {
+		if steps[i].ID == id {
+			return &steps[i]
+		}
+	}
+	return nil
+}
+
+// nestedBodySteps returns the steps a parent can materialize with a prefix.
+func nestedBodySteps(step *Step) []Step {
+	if step == nil {
+		return nil
+	}
+	body := append([]Step{}, step.Parallel.Steps...)
+	for _, fc := range []*ForeachConfig{step.Foreach, step.ForeachPane} {
+		if fc == nil {
+			continue
+		}
+		body = append(body, fc.Steps...)
+		body = append(body, fc.Body...)
+	}
+	if step.Loop != nil {
+		body = append(body, step.Loop.Steps...)
+		body = append(body, step.Loop.Body...)
+	}
+	body = append(body, step.OnSuccess...)
+	return body
+}
+
 // AdoptOrphanedTurnContext records post-failure artifact provenance for one
-// failed or cancelled step. It never sends a prompt, restarts the step, or
-// rewrites the step outcome.
-func AdoptOrphanedTurnContext(ctx context.Context, projectDir, runID, stepID, reason string) (*OrphanedTurnActionResult, error) {
+// failed or cancelled step. explicitArtifacts lets an operator attest to files
+// the automatic inspection cannot see (for example a run whose frozen workflow
+// predates output declarations). It never sends a prompt, restarts the step,
+// or rewrites the step outcome.
+func AdoptOrphanedTurnContext(ctx context.Context, projectDir, runID, stepID, reason string, explicitArtifacts []string) (*OrphanedTurnActionResult, error) {
 	cfg := DefaultExecutorConfig("")
 	cfg.ProjectDir, cfg.RunID = projectDir, runID
-	return NewExecutor(cfg).decideOrphanedTurn(ctx, stepID, reason, OrphanedTurnActionAdopt)
+	return NewExecutor(cfg).decideOrphanedTurn(ctx, stepID, reason, OrphanedTurnActionAdopt, explicitArtifacts)
 }
 
 // StopOrphanedTurnContext interrupts a pane whose verified turn is still
@@ -328,10 +415,10 @@ func AdoptOrphanedTurnContext(ctx context.Context, projectDir, runID, stepID, re
 func StopOrphanedTurnContext(ctx context.Context, projectDir, runID, stepID, reason string) (*OrphanedTurnActionResult, error) {
 	cfg := DefaultExecutorConfig("")
 	cfg.ProjectDir, cfg.RunID = projectDir, runID
-	return NewExecutor(cfg).decideOrphanedTurn(ctx, stepID, reason, OrphanedTurnActionStop)
+	return NewExecutor(cfg).decideOrphanedTurn(ctx, stepID, reason, OrphanedTurnActionStop, nil)
 }
 
-func (e *Executor) decideOrphanedTurn(ctx context.Context, stepID, reason, action string) (*OrphanedTurnActionResult, error) {
+func (e *Executor) decideOrphanedTurn(ctx context.Context, stepID, reason, action string, explicitArtifacts []string) (*OrphanedTurnActionResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -372,30 +459,42 @@ func (e *Executor) decideOrphanedTurn(ctx context.Context, stepID, reason, actio
 	if step, ok := state.Steps[stepID]; !ok || (step.Status != StatusFailed && step.Status != StatusCancelled) {
 		return nil, fmt.Errorf("step %q is not failed or cancelled; orphaned-turn reconciliation only applies to stopped steps", stepID)
 	}
+	// Resolve operator-named artifacts before replay so a retry with different
+	// provenance cannot silently replay the earlier decision.
+	explicit, err := e.explicitOrphanArtifacts(explicitArtifacts)
+	if err != nil {
+		return nil, err
+	}
 	for _, prior := range state.OrphanedTurnDecisions {
 		if prior.StepID != stepID {
 			continue
 		}
-		if prior.Action == action && prior.Reason == reason {
+		if prior.Action == action && prior.Reason == reason && orphanDecisionCovers(prior.Artifacts, explicit) {
 			return &OrphanedTurnActionResult{
 				RunID: state.RunID, WorkflowID: state.WorkflowID, Session: state.Session,
 				Decision: prior, Replayed: true,
 			}, nil
 		}
-		return nil, fmt.Errorf("step %q already has an immutable orphaned-turn decision (%s); a different action or reason is refused", stepID, prior.Action)
+		return nil, fmt.Errorf("step %q already has an immutable orphaned-turn decision (%s); a different action, reason, or artifact set is refused", stepID, prior.Action)
 	}
 	inspection, err := e.inspectOrphanedTurnsFromState(ctx, state)
 	if err != nil {
 		return nil, err
 	}
 	turn, found := orphanTurnByStep(inspection, stepID)
-	if !found {
-		return nil, fmt.Errorf("step %q has no live orphaned-turn evidence; inspect before deciding", stepID)
+	if !found && len(explicit) == 0 {
+		return nil, fmt.Errorf("step %q has no live orphaned-turn evidence; inspect before deciding, or adopt named files with --artifact", stepID)
 	}
 	decision := OrphanedTurnDecision{
 		StepID: stepID, Action: action, Reason: reason,
 		PaneID: record.PaneID, PanePID: record.PanePID,
-		DecidedAt: time.Now().UTC(), Artifacts: turn.Artifacts,
+		DecidedAt: time.Now().UTC(), Artifacts: mergeOrphanArtifacts(turn.Artifacts, explicit),
+	}
+	switch {
+	case found:
+		decision.Class = turn.Class
+	case len(decision.Artifacts) > 0:
+		decision.Class = OrphanedTurnArtifactLanded
 	}
 	if action == OrphanedTurnActionStop {
 		if !turn.PaneVerified {
@@ -426,6 +525,20 @@ func (e *Executor) decideOrphanedTurn(ctx context.Context, stepID, reason, actio
 	}, nil
 }
 
+// orphanDecisionForStep returns the operator decision already recorded for a
+// step, if any.
+func orphanDecisionForStep(state *ExecutionState, stepID string) (OrphanedTurnDecision, bool) {
+	if state == nil {
+		return OrphanedTurnDecision{}, false
+	}
+	for _, decision := range state.OrphanedTurnDecisions {
+		if decision.StepID == stepID {
+			return decision, true
+		}
+	}
+	return OrphanedTurnDecision{}, false
+}
+
 func orphanTurnByStep(inspection *OrphanedTurnInspection, stepID string) (OrphanedTurn, bool) {
 	if inspection == nil {
 		return OrphanedTurn{}, false
@@ -436,4 +549,72 @@ func orphanTurnByStep(inspection *OrphanedTurnInspection, stepID string) (Orphan
 		}
 	}
 	return OrphanedTurn{}, false
+}
+
+// explicitOrphanArtifacts validates operator-named adoption artifacts. Each
+// path must name an existing regular file; only path, size and mod time are
+// kept.
+func (e *Executor) explicitOrphanArtifacts(paths []string) ([]OrphanedArtifact, error) {
+	if len(paths) == 0 {
+		return nil, nil
+	}
+	artifacts := make([]OrphanedArtifact, 0, len(paths))
+	seen := make(map[string]struct{}, len(paths))
+	for _, ref := range paths {
+		ref = strings.TrimSpace(ref)
+		if ref == "" {
+			return nil, fmt.Errorf("--artifact requires a non-empty path")
+		}
+		path, info, ok := e.orphanArtifactPath(ref)
+		if !ok {
+			return nil, fmt.Errorf("--artifact %q is not an existing regular file", ref)
+		}
+		if _, dup := seen[path]; dup {
+			continue
+		}
+		seen[path] = struct{}{}
+		artifacts = append(artifacts, OrphanedArtifact{Path: path, ModTime: info.ModTime().UTC(), Size: info.Size()})
+	}
+	sort.Slice(artifacts, func(i, j int) bool { return artifacts[i].Path < artifacts[j].Path })
+	return artifacts, nil
+}
+
+// orphanDecisionCovers reports whether the recorded decision already contains
+// every artifact the retry names. An empty request replays on action+reason
+// alone, matching the accept paths' decision identity.
+func orphanDecisionCovers(recorded, requested []OrphanedArtifact) bool {
+	if len(requested) == 0 {
+		return true
+	}
+	present := make(map[string]struct{}, len(recorded))
+	for _, artifact := range recorded {
+		present[artifact.Path] = struct{}{}
+	}
+	for _, artifact := range requested {
+		if _, ok := present[artifact.Path]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// mergeOrphanArtifacts unions automatic and operator-named provenance by path.
+func mergeOrphanArtifacts(automatic, explicit []OrphanedArtifact) []OrphanedArtifact {
+	merged := append([]OrphanedArtifact{}, automatic...)
+	seen := make(map[string]struct{}, len(merged))
+	for _, artifact := range merged {
+		seen[artifact.Path] = struct{}{}
+	}
+	for _, artifact := range explicit {
+		if _, dup := seen[artifact.Path]; dup {
+			continue
+		}
+		seen[artifact.Path] = struct{}{}
+		merged = append(merged, artifact)
+	}
+	if len(merged) == 0 {
+		return nil
+	}
+	sort.Slice(merged, func(i, j int) bool { return merged[i].Path < merged[j].Path })
+	return merged
 }
