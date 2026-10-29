@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -312,19 +313,37 @@ type AdoptedAgentCounts struct {
 	Omp      int `json:"omp"`
 	Ollama   int `json:"ollama"`
 	User     int `json:"user"`
+
+	// Plugins holds counts for registered plugin agent types (e.g. pi), keyed
+	// by canonical plugin name, so adopt reports them like built-ins.
+	Plugins map[string]int `json:"plugins,omitempty"`
 }
 
 func (a AdoptedAgentCounts) Total() int {
-	return a.CC + a.Cod + a.Gmi + a.Agy + a.Grok + a.Cursor + a.Windsurf + a.Aider + a.Opencode + a.Omp + a.Ollama + a.User
+	total := a.CC + a.Cod + a.Gmi + a.Agy + a.Grok + a.Cursor + a.Windsurf + a.Aider + a.Opencode + a.Omp + a.Ollama + a.User
+	for _, count := range a.Plugins {
+		total += count
+	}
+	return total
 }
 
 func (a AdoptedAgentCounts) Summary() string {
-	parts := make([]string, 0, len(supportedAdoptTypes))
+	parts := make([]string, 0, len(supportedAdoptTypes)+len(a.Plugins))
 	for _, spec := range supportedAdoptTypes {
 		count := a.countFor(spec.AgentType)
 		if count > 0 {
 			parts = append(parts, fmt.Sprintf("%s:%d", spec.AgentType, count))
 		}
+	}
+	pluginNames := make([]string, 0, len(a.Plugins))
+	for name, count := range a.Plugins {
+		if count > 0 {
+			pluginNames = append(pluginNames, name)
+		}
+	}
+	sort.Strings(pluginNames)
+	for _, name := range pluginNames {
+		parts = append(parts, fmt.Sprintf("%s:%d", name, a.Plugins[name]))
 	}
 	if len(parts) == 0 {
 		return "none"
@@ -358,6 +377,11 @@ func (a *AdoptedAgentCounts) increment(agentType agentpkg.AgentType) {
 		a.Ollama++
 	case agentpkg.AgentTypeUser:
 		a.User++
+	default:
+		if a.Plugins == nil {
+			a.Plugins = make(map[string]int)
+		}
+		a.Plugins[string(agentType.Canonical())]++
 	}
 }
 
@@ -388,7 +412,7 @@ func (a AdoptedAgentCounts) countFor(agentType agentpkg.AgentType) int {
 	case agentpkg.AgentTypeUser:
 		return a.User
 	default:
-		return 0
+		return a.Plugins[string(agentType.Canonical())]
 	}
 }
 
@@ -502,16 +526,16 @@ func runAdopt(opts AdoptOptions) error {
 		panesByBareIndex[p.Index] = append(panesByBareIndex[p.Index], p)
 	}
 
-	if err := validateAdoptAssignments(opts.PaneAssignments); err != nil {
+	types := opts.Types
+	if len(types) == 0 {
+		types = supportedAdoptTypes
+	}
+	if err := validateAdoptAssignments(opts.PaneAssignments, types); err != nil {
 		return emitAdoptFailure(&AdoptResult{Success: false, Session: opts.Session, Error: err.Error()})
 	}
 
 	adoptedPanes := []AdoptedPaneInfo{}
 	counts := AdoptedAgentCounts{}
-	types := opts.Types
-	if len(types) == 0 {
-		types = supportedAdoptTypes
-	}
 	// Dedupe by agent type so a plugin alias sharing its name's pane list is
 	// adopted once, in the order the command registered the flags.
 	adoptOrder := make([]agentpkg.AgentType, 0, len(types))
@@ -678,16 +702,19 @@ func resolveAdoptPane(req paneSpec, byWinPane map[paneSpec]*tmux.Pane, byBareInd
 	}
 }
 
-func validateAdoptAssignments(assignments map[agentpkg.AgentType][]paneSpec) error {
+func validateAdoptAssignments(assignments map[agentpkg.AgentType][]paneSpec, types []adoptTypeSpec) error {
 	// Track by spec identity (window.pane string) so the same explicit address
 	// can't be claimed twice, and a bare index can't be reused. Bare-vs-window
 	// collisions referencing the same physical pane (e.g. `0` and `1.0`) can't
 	// be detected here because the session layout isn't known yet — those are
 	// caught at adoption time by the resolved-pane-ID dedup in runAdopt. Here we
 	// only reject obvious duplicate specs.
+	if len(types) == 0 {
+		types = supportedAdoptTypes
+	}
 	seen := make(map[string]agentpkg.AgentType)
 	total := 0
-	for _, spec := range supportedAdoptTypes {
+	for _, spec := range types {
 		for _, req := range assignments[spec.AgentType] {
 			total++
 			if req.Pane < 0 {
@@ -704,14 +731,17 @@ func validateAdoptAssignments(assignments map[agentpkg.AgentType][]paneSpec) err
 		}
 	}
 	if total == 0 {
-		return fmt.Errorf("no panes specified for adoption; use one or more of %s", adoptFlagList())
+		return fmt.Errorf("no panes specified for adoption; use one or more of %s", adoptFlagList(types))
 	}
 	return nil
 }
 
-func adoptFlagList() string {
-	parts := make([]string, 0, len(supportedAdoptTypes))
-	for _, spec := range supportedAdoptTypes {
+func adoptFlagList(types []adoptTypeSpec) string {
+	if len(types) == 0 {
+		types = supportedAdoptTypes
+	}
+	parts := make([]string, 0, len(types))
+	for _, spec := range types {
 		parts = append(parts, "--"+spec.Flag)
 	}
 	if len(parts) == 1 {
