@@ -1,8 +1,11 @@
 package robot
 
 import (
+	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestWaitPaneObservationsRetainUnreadableTargets(t *testing.T) {
@@ -131,5 +134,54 @@ func TestWaitTransitionsInitiallyBusyNeedsOnlyOneArrival(t *testing.T) {
 	met, _, pending := checkWaitPaneObservations(idle, nil, WaitOptions{RequireTransition: true}, conditions, initial, left)
 	if !met || len(pending) != 0 {
 		t.Fatalf("initially busy pane needs no extra cycle: met=%v pending=%v", met, pending)
+	}
+}
+
+// TestPendingWaitEvidenceNamesDecider covers ntm-l6cuz.7's pending-pane
+// evidence: the deciding patterns, state source and state age travel with the
+// pane, unobserved panes are marked unknown, and panes outside the target set
+// never appear.
+func TestPendingWaitEvidenceNamesDecider(t *testing.T) {
+	since := time.Now().Add(-90 * time.Second)
+	activities := []*AgentActivity{
+		{PaneID: "%7", State: StateThinking, StateSource: "scrape", StateSince: since, AgentType: "pi", DetectedPatterns: []string{"plugin_idle", "dots_spinner"}},
+		{PaneID: "%8", State: StateWaiting, StateSource: "scrape", AgentType: "pi"},
+	}
+	evidence := pendingWaitEvidence(activities, []string{"%9"}, []string{"%7", "%9"})
+	if len(evidence) != 2 {
+		t.Fatalf("pending evidence = %+v, want two entries", evidence)
+	}
+	decider := evidence[0]
+	if decider.Pane != "%7" || decider.State != string(StateThinking) || decider.StateSource != "scrape" || decider.StateSince == "" {
+		t.Fatalf("decider evidence = %+v", decider)
+	}
+	if len(decider.DetectedPatterns) != 2 || decider.DetectedPatterns[0] != "plugin_idle" {
+		t.Fatalf("deciding patterns = %v, want plugin_idle and dots_spinner", decider.DetectedPatterns)
+	}
+	if unobserved := evidence[1]; unobserved.Pane != "%9" || unobserved.State != "unknown" {
+		t.Fatalf("unobserved evidence = %+v, want unknown", unobserved)
+	}
+}
+
+// TestWaitResponsePendingEvidenceJSONShape pins the machine-readable surface
+// named in the acceptance: pending_evidence with deciding patterns/source.
+func TestWaitResponsePendingEvidenceJSONShape(t *testing.T) {
+	response := WaitResponse{
+		Agents:        []WaitAgentInfo{},
+		AgentsPending: []string{"%7"},
+		PendingEvidence: []WaitAgentInfo{{
+			Pane: "%7", State: "thinking", AgentType: "pi", StateSource: "scrape",
+			StateSince:       time.Now().UTC().Format(time.RFC3339),
+			DetectedPatterns: []string{"plugin_idle", "dots_spinner"},
+		}},
+	}
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("marshal wait response: %v", err)
+	}
+	for _, key := range []string{`"pending_evidence"`, `"detected_patterns"`, `"state_source"`, `"state_since"`} {
+		if !strings.Contains(string(encoded), key) {
+			t.Fatalf("wait JSON missing %s: %s", key, encoded)
+		}
 	}
 }

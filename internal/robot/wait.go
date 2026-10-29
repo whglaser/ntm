@@ -45,6 +45,10 @@ type WaitResponse struct {
 	// only AgentsPending used to be set.
 	Agents        []WaitAgentInfo `json:"agents"`
 	AgentsPending []string        `json:"agents_pending,omitempty"`
+	// PendingEvidence carries per-pane classification evidence for panes still
+	// pending when a wait times out, so an operator can see which pattern and
+	// state source kept the pane from matching (ntm-l6cuz.7).
+	PendingEvidence []WaitAgentInfo `json:"pending_evidence,omitempty"`
 
 	// WakePayload contains details about what triggered the wakeup (for attention conditions).
 	WakePayload *WaitWakePayload `json:"wake_payload,omitempty"`
@@ -93,10 +97,13 @@ type WaitCursorInfo struct {
 
 // WaitAgentInfo describes an agent's state when the wait completed or timed out.
 type WaitAgentInfo struct {
-	Pane      string `json:"pane"`
-	State     string `json:"state"`
-	MetAt     string `json:"met_at,omitempty"` // RFC3339 timestamp
-	AgentType string `json:"agent_type,omitempty"`
+	Pane             string   `json:"pane"`
+	State            string   `json:"state"`
+	MetAt            string   `json:"met_at,omitempty"` // RFC3339 timestamp
+	AgentType        string   `json:"agent_type,omitempty"`
+	StateSource      string   `json:"state_source,omitempty"`      // scrape|osc
+	StateSince       string   `json:"state_since,omitempty"`       // RFC3339 timestamp
+	DetectedPatterns []string `json:"detected_patterns,omitempty"` // deciding matches
 }
 
 // Wait condition constants - pane-based conditions
@@ -167,6 +174,7 @@ func GetWaitContext(ctx context.Context, opts WaitOptions) (*WaitResponse, int) 
 	var convergenceState ConvergenceState
 	var lastProductivity *ProductivityOutput
 	var lastPending []string
+	var lastPendingEvidence []WaitAgentInfo
 	var lastAttentionResult *AttentionConditionResult
 
 	// Every interrupted read and result publication uses the same response
@@ -189,6 +197,8 @@ func GetWaitContext(ctx context.Context, opts WaitOptions) (*WaitResponse, int) 
 			WaitedSeconds: time.Since(startTime).Seconds(),
 			Agents:        []WaitAgentInfo{},
 			AgentsPending: append([]string(nil), lastPending...),
+
+			PendingEvidence: append([]WaitAgentInfo(nil), lastPendingEvidence...),
 		}
 		if hasAttention {
 			if lastAttentionResult == nil {
@@ -423,11 +433,7 @@ func GetWaitContext(ctx context.Context, opts WaitOptions) (*WaitResponse, int) 
 							Session:       opts.Session,
 							Condition:     opts.Condition,
 							WaitedSeconds: elapsed.Seconds(),
-							Agents: []WaitAgentInfo{{
-								Pane:      a.PaneID,
-								State:     string(a.State),
-								AgentType: a.AgentType,
-							}},
+							Agents:        []WaitAgentInfo{waitAgentEvidence(a)},
 						}, 1
 					}
 				}
@@ -438,6 +444,7 @@ func GetWaitContext(ctx context.Context, opts WaitOptions) (*WaitResponse, int) 
 			activities, unobservedPanes, opts, paneConditions, initiallyInTarget, sawTransition,
 		)
 		lastPending = pending
+		lastPendingEvidence = pendingWaitEvidence(activities, unobservedPanes, pending)
 
 		attentionMet := !hasAttention
 		if hasAttention {
@@ -785,12 +792,9 @@ func checkWaitConditionMetWithTransition(
 		}
 
 		// Agent meets condition (and transition requirement if applicable)
-		matchingAgents = append(matchingAgents, WaitAgentInfo{
-			Pane:      activity.PaneID,
-			State:     string(activity.State),
-			MetAt:     FormatTimestamp(now),
-			AgentType: activity.AgentType,
-		})
+		evidence := waitAgentEvidence(activity)
+		evidence.MetAt = FormatTimestamp(now)
+		matchingAgents = append(matchingAgents, evidence)
 	}
 
 	// Determine if condition is met based on --any vs ALL

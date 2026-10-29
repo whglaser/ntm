@@ -739,8 +739,9 @@ type AgentActivity struct {
 	PaneID           string            `json:"pane_id"`
 	AgentType        string            `json:"agent_type"` // "claude", "codex", "gemini", "*"
 	State            AgentState        `json:"state"`
-	Confidence       float64           `json:"confidence"` // 0.0-1.0
-	Velocity         float64           `json:"velocity"`   // current chars/sec
+	StateSource      string            `json:"state_source,omitempty"` // scrape|osc
+	Confidence       float64           `json:"confidence"`             // 0.0-1.0
+	Velocity         float64           `json:"velocity"`               // current chars/sec
 	StateSince       time.Time         `json:"state_since"`
 	DetectedPatterns []string          `json:"detected_patterns,omitempty"`
 	LastOutput       time.Time         `json:"last_output,omitempty"`
@@ -753,6 +754,11 @@ type AgentActivity struct {
 	// RateLimited indicates the agent has hit provider rate limits.
 	RateLimited bool `json:"rate_limited,omitempty"`
 }
+
+// activityStateSourceScrape marks classifier-derived activity. OSC 7501
+// program status (ntm-l6cuz.2) overrides this with "osc" when an
+// authoritative report decides the state.
+const activityStateSourceScrape = "scrape"
 
 // StateClassifier combines velocity and pattern signals to classify agent state.
 type StateClassifier struct {
@@ -936,6 +942,7 @@ func (sc *StateClassifier) classifyInternal(sample *VelocitySample) (*AgentActiv
 		PaneID:           sc.velocityTracker.PaneID,
 		AgentType:        sc.agentType,
 		State:            finalState,
+		StateSource:      activityStateSourceScrape,
 		Confidence:       confidence,
 		Velocity:         velocity,
 		StateSince:       sc.stateSince,
@@ -1290,6 +1297,34 @@ func (sc *StateClassifier) classifyState(velocity float64, matches []PatternMatc
 		if m.Category == CategoryError {
 			return StateError, 0.95, "error_pattern:" + m.Pattern
 		}
+	}
+
+	// A registered plugin's declared readiness outranks generic cosmetic
+	// matches: plugin_working (115) is authoritative live work and
+	// plugin_idle (92) is authoritative readiness. The idle signal only
+	// loses to a thinking pattern at least as specific (higher priority), so
+	// a truncated stats footer matching dots_spinner (70) can no longer pin
+	// a finished plugin pane THINKING while plugin_idle is visible
+	// (ntm-l6cuz.7).
+	bestPluginIdle, bestThinking := 0, 0
+	for _, m := range matches {
+		switch {
+		case m.Pattern == pluginIdlePattern:
+			if m.Priority > bestPluginIdle {
+				bestPluginIdle = m.Priority
+			}
+		case m.Pattern == pluginWorkingPattern:
+			if m.Priority > bestThinking {
+				bestThinking = m.Priority
+			}
+		case m.Category == CategoryThinking:
+			if m.Priority > bestThinking {
+				bestThinking = m.Priority
+			}
+		}
+	}
+	if bestPluginIdle > 0 && bestPluginIdle > bestThinking {
+		return StateWaiting, 0.90, "plugin_idle"
 	}
 
 	// Thinking indicators are positive evidence of active work and must
