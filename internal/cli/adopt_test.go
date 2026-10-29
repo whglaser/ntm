@@ -92,6 +92,7 @@ func bare(indices ...int) []paneSpec {
 func TestValidateAdoptAssignments(t *testing.T) {
 	tests := []struct {
 		name        string
+		types       []adoptTypeSpec
 		assignments map[agentpkg.AgentType][]paneSpec
 		wantErr     string
 	}{
@@ -144,11 +145,43 @@ func TestValidateAdoptAssignments(t *testing.T) {
 			assignments: map[agentpkg.AgentType][]paneSpec{},
 			wantErr:     "use one or more of --cc, --cod, --gmi, --agy, --grok, --cursor, --windsurf, --aider, --oc, --omp, --ollama, or --user",
 		},
+		{
+			name: "plugin agent type",
+			types: []adoptTypeSpec{
+				{Flag: "cc", AgentType: agentpkg.AgentTypeClaudeCode},
+				{Flag: "pi", AgentType: agentpkg.AgentType("pi")},
+			},
+			assignments: map[agentpkg.AgentType][]paneSpec{
+				agentpkg.AgentType("pi"): bare(0, 1),
+			},
+		},
+		{
+			name: "plugin type absent from the dynamic table is ignored like before",
+			types: []adoptTypeSpec{
+				{Flag: "cc", AgentType: agentpkg.AgentTypeClaudeCode},
+			},
+			assignments: map[agentpkg.AgentType][]paneSpec{
+				agentpkg.AgentType("pi"): bare(0),
+			},
+			wantErr: "no panes specified",
+		},
+		{
+			name: "plugin alias duplicate still detected across types",
+			types: []adoptTypeSpec{
+				{Flag: "pi", AgentType: agentpkg.AgentType("pi")},
+				{Flag: "rb", AgentType: agentpkg.AgentType("reviewbot")},
+			},
+			assignments: map[agentpkg.AgentType][]paneSpec{
+				agentpkg.AgentType("pi"):        bare(2),
+				agentpkg.AgentType("reviewbot"): bare(2),
+			},
+			wantErr: "assigned multiple times",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validateAdoptAssignments(tt.assignments)
+			err := validateAdoptAssignments(tt.assignments, tt.types)
 			if tt.wantErr == "" {
 				if err != nil {
 					t.Fatalf("validateAdoptAssignments() unexpected error: %v", err)
