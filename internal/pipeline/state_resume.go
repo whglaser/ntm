@@ -619,6 +619,13 @@ type AgentDeliveryState struct {
 	StartedAt          time.Time `json:"started_at"`
 	DeliveredAt        time.Time `json:"delivered_at,omitempty"`
 	CompletedAt        time.Time `json:"completed_at,omitempty"`
+	// recoveredTurn is process-local (never persisted): it marks a turn whose
+	// completion was attributed by the OSC recovery path when the pre-send
+	// boundary and prompt echo had both scrolled away (ntm-l6cuz.5). It keeps
+	// the echo-less recovered frame attributed on later polls without
+	// weakening the normal prompt-echo checks; a reloaded receipt falls back
+	// to the strict path and fails closed.
+	recoveredTurn bool
 	// Resolution fields remain values so snapshots cannot share mutable audit
 	// data. The boundary hash keeps the accepted receipt identity stable after
 	// ordinary resume advances or clears BeforeOutput.

@@ -2170,7 +2170,7 @@ func (e *Executor) executeAgentDelivery(ctx context.Context, step *Step, workflo
 		if err != nil {
 			return false, err
 		}
-		next, ready, err := observeAgentDelivery(record, current)
+		next, ready, err := e.observeAgentDeliveryTurn(record.PaneID, record, current)
 		if err != nil {
 			return false, err
 		}
@@ -2407,8 +2407,89 @@ func observeAgentDelivery(record AgentDeliveryState, current string) (AgentDeliv
 	return record, response != "" && !echoOnly, nil
 }
 
-// A retained complete-line overlap supports normal scrollback rollover.
-// A replacement screen is not evidence that the original request completed.
+// observeAgentDeliveryTurn is the executor's authoritative-recovery wrapper
+// around observeAgentDelivery. A long prompt plus a multi-minute turn can
+// scroll both the pre-send boundary and the prompt echo out of the capture
+// window; when the pane's own OSC 7501 report says the turn settled
+// (done/idle), that report still proves completion, so the turn is marked
+// complete instead of failing closed. Recovery never re-sends: it only
+// observes, attributes the current frame, and records the decision. Without a
+// fresh authoritative report the boundary error is preserved exactly as
+// before (ntm-l6cuz.5).
+func (e *Executor) observeAgentDeliveryTurn(paneID string, record AgentDeliveryState, current string) (AgentDeliveryState, bool, error) {
+	next, ready, err := observeAgentDelivery(record, current)
+	if err == nil {
+		if !ready && next.recoveredTurn && current == next.BeforeOutput {
+			// A turn already attributed to this exact frame stays complete:
+			// the frame has not changed since the attribution, so there is no
+			// new evidence to re-anchor. This is the steady state after an
+			// OSC recovery, whose saved output no longer contains pi's prompt
+			// echo, so the echo-anchored check would otherwise never pass
+			// again. Genuine new output changes the frame and falls through to
+			// the normal attribution rules.
+			return next, true, nil
+		}
+		return next, ready, nil
+	}
+	if e == nil || !errors.Is(err, errAgentDeliveryBoundaryLost) {
+		return next, ready, err
+	}
+	settled, ok := e.authoritativeTurnSettled(paneID)
+	if !ok {
+		return next, false, err
+	}
+	output := next.Output
+	if output == "" {
+		// Nothing was attributed before the boundary scrolled away. Use the
+		// pane's own current transcript, dropping one complete prompt echo
+		// when present. The authoritative report proves the turn settled, so
+		// this observes the frame rather than inferring a response.
+		output = current
+		piEcho := status.PromptEchoFingerprint{Hash: record.PiPromptEchoHash, Length: record.PiPromptEchoLength}
+		if _, end, anchored := status.UniqueAgentEchoSpan(current, record.PromptEchoHash, record.PromptEchoLength, piEcho); anchored && strings.TrimSpace(current[end:]) != "" {
+			output = strings.TrimRight(current[end:], "\n")
+		}
+	}
+	next.BeforeOutput, next.Output = current, output
+	next.recoveredTurn = true
+	slog.Warn("pipeline.agent_delivery.boundary_recovered",
+		"pane_id", paneID,
+		"agent_type", record.AgentType,
+		"state_source", string(settled.StateSource),
+		"reason", "authoritative program status settled the turn after the pre-send boundary scrolled away",
+	)
+	return next, true, nil
+}
+
+// authoritativeTurnSettled reports whether the pane's own OSC 7501 report
+// currently says the turn completed. Only the OSC source counts: an idle
+// scrape reading is exactly what the boundary check protects against, and a
+// stale or working report must keep the receipt fail-closed.
+func (e *Executor) authoritativeTurnSettled(paneID string) (status.AgentStatus, bool) {
+	if e == nil || e.detector == nil || paneID == "" {
+		return status.AgentStatus{}, false
+	}
+	st, err := e.detector.Detect(paneID)
+	if err != nil {
+		return status.AgentStatus{}, false
+	}
+	if st.StateSource != status.StateSourceOSC || st.State != status.StateIdle {
+		return status.AgentStatus{}, false
+	}
+	return st, true
+}
+
+// errAgentDeliveryBoundaryLost means the capture no longer contains the
+// pre-send output boundary, so the response delta cannot be attributed from
+// the capture alone. The executor may still recover the dispatched turn from
+// an authoritative program-status report (ntm-l6cuz.5); every other caller
+// keeps the fail-closed receipt semantics.
+var errAgentDeliveryBoundaryLost = errors.New("saved agent output boundary is no longer visible; inspect the original pane before an intentional restart")
+
+// agentDeliveryNewOutput returns the response text after the pre-send
+// boundary. A retained complete-line overlap supports normal scrollback
+// rollover; a replacement screen is not evidence that the original request
+// completed.
 func agentDeliveryNewOutput(before, after string) (string, error) {
 	if strings.HasPrefix(after, before) {
 		return after[len(before):], nil
@@ -2421,7 +2502,7 @@ func agentDeliveryNewOutput(before, after string) (string, error) {
 			}
 		}
 	}
-	return "", errors.New("saved agent output boundary is no longer visible; inspect the original pane before an intentional restart")
+	return "", errAgentDeliveryBoundaryLost
 }
 
 // resolveTemplatePath resolves a template reference to an absolute file path.

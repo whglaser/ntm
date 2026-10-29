@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/programstatus"
 	"github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
@@ -471,5 +472,96 @@ func TestExecuteRejectsCancellationBeforeTMUX(t *testing.T) {
 	}
 	if err := Execute(nil, Pipeline{}); err == nil {
 		t.Fatal("nil context must not reach transport")
+	}
+}
+
+// TestPiAdHocStageRecoversScrolledBoundaryFromOSC is the ntm-l6cuz.5
+// acceptance: a long turn scrolls both the pre-send boundary and the prompt
+// echo out of the capture window, and pi's own OSC "done" report still
+// completes the step without a re-send.
+func TestPiAdHocStageRecoversScrolledBoundaryFromOSC(t *testing.T) {
+	executor, client, _ := newStageDeliveryFixture(t)
+	client.pane.Type, client.pane.Command = tmux.AgentType("pi"), "pi"
+	client.before = piStagePane("Pi v1.3.0\nPrevious turn context that will scroll away.", "")
+	source := newFakeOSCSource()
+	executor.SetProgramStatusSource(source)
+	client.prepare = func(_ context.Context, call int) error {
+		if call == 2 {
+			// The agent settles only after its lane output has scrolled the
+			// pre-send boundary and the prompt echo out of the window.
+			source.emit(client.pane.ID, programstatus.StateDone)
+		}
+		return nil
+	}
+	// The acceptance case is a ~3 KB prompt and a multi-minute lane; the
+	// frame below is correspondingly large, and the prompt echo is gone.
+	prompt := strings.Repeat("Run the lane and report every artifact. ", 90)
+	client.onPaste = func(_ int, _ string) {
+		client.after = piStagePane("Pi v1.3.0\n\n"+strings.Repeat("lane output line\n", 400)+"Lane note complete.", "")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	result, err := executor.executeAdHocStage(ctx, Stage{AgentType: "pi", Prompt: prompt}, client.pane.ID, "", AgentDeliveryState{})
+	if err != nil {
+		t.Fatalf("scrolled-boundary turn was not recovered from the OSC report: %v", err)
+	}
+	if client.pastes != 1 || client.legacyPaste != 0 {
+		t.Fatalf("recovery changed the delivery: pastes=%d legacy=%d", client.pastes, client.legacyPaste)
+	}
+	if !strings.Contains(result.Output, "Lane note complete.") {
+		t.Fatalf("recovered turn lost the current frame's output: %q", result.Output)
+	}
+}
+
+// TestPiAdHocStageKeepsBoundaryFailureWithoutAuthoritativeReport pins the
+// fail-closed half of ntm-l6cuz.5: without a fresh OSC report the scrolled
+// boundary is still an error, and the prompt is never re-sent.
+func TestPiAdHocStageKeepsBoundaryFailureWithoutAuthoritativeReport(t *testing.T) {
+	executor, client, _ := newStageDeliveryFixture(t)
+	client.pane.Type, client.pane.Command = tmux.AgentType("pi"), "pi"
+	client.before = piStagePane("Pi v1.3.0\nPrevious turn context that will scroll away.", "")
+	client.onPaste = func(_ int, _ string) {
+		client.after = piStagePane("Pi v1.3.0\n\n"+strings.Repeat("lane output line\n", 40), "")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	_, err := executor.executeAdHocStage(ctx, Stage{AgentType: "pi", Prompt: "Run the lane."}, client.pane.ID, "", AgentDeliveryState{})
+	if err == nil || !strings.Contains(err.Error(), "saved agent output boundary is no longer visible") {
+		t.Fatalf("unattributed scrolled boundary did not fail closed: %v", err)
+	}
+	if client.pastes != 1 {
+		t.Fatalf("fail-closed path re-sent the prompt: pastes=%d", client.pastes)
+	}
+}
+
+// TestPiAdHocStageDoesNotRecoverOnWorkingReport pins the state condition: a
+// fresh OSC "working" report is not completion evidence, so the lost boundary
+// still fails closed.
+func TestPiAdHocStageDoesNotRecoverOnWorkingReport(t *testing.T) {
+	executor, client, _ := newStageDeliveryFixture(t)
+	client.pane.Type, client.pane.Command = tmux.AgentType("pi"), "pi"
+	client.before = piStagePane("Pi v1.3.0\nPrevious turn context that will scroll away.", "")
+	source := newFakeOSCSource()
+	executor.SetProgramStatusSource(source)
+	client.prepare = func(_ context.Context, call int) error {
+		if call == 2 {
+			source.emit(client.pane.ID, programstatus.StateWorking)
+		}
+		return nil
+	}
+	client.onPaste = func(_ int, _ string) {
+		client.after = piStagePane("Pi v1.3.0\n\n"+strings.Repeat("lane output line\n", 40), "")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	_, err := executor.executeAdHocStage(ctx, Stage{AgentType: "pi", Prompt: "Run the lane."}, client.pane.ID, "", AgentDeliveryState{})
+	if err == nil || !strings.Contains(err.Error(), "saved agent output boundary is no longer visible") {
+		t.Fatalf("working report wrongly attributed a scrolled boundary: %v", err)
+	}
+	if client.pastes != 1 {
+		t.Fatalf("working-report path re-sent the prompt: pastes=%d", client.pastes)
 	}
 }
