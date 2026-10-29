@@ -169,7 +169,7 @@ func (e *Executor) executeAdHocStage(ctx context.Context, stage Stage, paneID, p
 		if err != nil {
 			return false, err
 		}
-		next, ready, err := observeAgentDelivery(record, current)
+		next, ready, err := e.observeAgentDeliveryTurn(record.PaneID, record, current)
 		if err != nil {
 			return false, err
 		}
