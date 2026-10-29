@@ -2271,3 +2271,222 @@ func TestWaitForRestartPromptDeliveryReadyGatesOnShellAndComposer(t *testing.T) 
 		}
 	})
 }
+
+func TestReapRestartPaneLateReadyAgentsPromotesLateReadyPane(t *testing.T) {
+	output := &RestartPaneOutput{
+		AgentRelaunched:     map[string]bool{"1": false},
+		AgentRelaunchStatus: map[string]RestartAgentRelaunchStatus{"1": RestartAgentRelaunchNotReady},
+		ProcessAlive:        map[string]bool{"1": true},
+	}
+	ready := map[string]bool{"1": false}
+	calls := 0
+	canceled := reapRestartPaneLateReadyAgents(
+		t.Context(),
+		output,
+		ready,
+		[]restartLateReadyCandidate{{
+			PaneKey:  "1",
+			Info:     restartPromptTarget{Target: "%1", ResolvedType: "pi"},
+			ShellPID: 42,
+		}},
+		500*time.Millisecond,
+		5*time.Millisecond,
+		func(context.Context, string, int, string, time.Duration) (bool, error) {
+			calls++
+			return calls >= 2, nil
+		},
+		nil,
+		func(int) bool { return true },
+	)
+	if canceled {
+		t.Fatal("late-ready pass reported cancellation")
+	}
+	if calls < 2 {
+		t.Fatalf("late-ready pane was probed %d time(s), want at least 2", calls)
+	}
+	if !ready["1"] || !output.AgentRelaunched["1"] || output.AgentRelaunchStatus["1"] != RestartAgentRelaunchReady {
+		t.Fatalf("late-ready pane not promoted: ready=%v output=%+v", ready, output)
+	}
+	if len(output.Failed) != 0 {
+		t.Fatalf("late-ready pane must not be reported failed: %+v", output.Failed)
+	}
+	if !output.ProcessAlive["1"] {
+		t.Fatal("process liveness must be refreshed for a promoted pane")
+	}
+}
+
+func TestReapRestartPaneLateReadyAgentsRecordsBoundedFailure(t *testing.T) {
+	output := &RestartPaneOutput{
+		AgentRelaunched:     map[string]bool{"1": false},
+		AgentRelaunchStatus: map[string]RestartAgentRelaunchStatus{"1": RestartAgentRelaunchNotReady},
+		ProcessAlive:        map[string]bool{"1": false},
+	}
+	started := time.Now()
+	calls := 0
+	canceled := reapRestartPaneLateReadyAgents(
+		t.Context(),
+		output,
+		map[string]bool{"1": false},
+		[]restartLateReadyCandidate{{
+			PaneKey:  "1",
+			Info:     restartPromptTarget{Target: "%1", ResolvedType: "pi"},
+			ShellPID: 42,
+		}},
+		60*time.Millisecond,
+		5*time.Millisecond,
+		func(context.Context, string, int, string, time.Duration) (bool, error) {
+			calls++
+			return false, nil
+		},
+		nil,
+		func(int) bool { return true },
+	)
+	if canceled {
+		t.Fatal("late-ready pass reported cancellation")
+	}
+	if calls == 0 {
+		t.Fatal("pane was never probed")
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("late-ready window was not bounded: %s", elapsed)
+	}
+	if len(output.Failed) != 1 || !strings.Contains(output.Failed[0].Reason, "not ready within") {
+		t.Fatalf("failure not recorded after the late window: %+v", output.Failed)
+	}
+	if output.AgentRelaunchStatus["1"] != RestartAgentRelaunchNotReady {
+		t.Fatalf("status=%q, want not_ready", output.AgentRelaunchStatus["1"])
+	}
+	if !output.ProcessAlive["1"] {
+		t.Fatal("process liveness must be refreshed after a failed late window")
+	}
+}
+
+// TestReapRestartPaneLateReadyAgentsRotatesAcrossStragglers proves one dead
+// pane cannot consume the whole late window while a slow-but-alive sibling is
+// still booting: checks rotate per poll so the healthy pane is promoted.
+func TestReapRestartPaneLateReadyAgentsRotatesAcrossStragglers(t *testing.T) {
+	output := &RestartPaneOutput{
+		AgentRelaunched: map[string]bool{"1": false, "2": false},
+		AgentRelaunchStatus: map[string]RestartAgentRelaunchStatus{
+			"1": RestartAgentRelaunchNotReady,
+			"2": RestartAgentRelaunchNotReady,
+		},
+		ProcessAlive: map[string]bool{"1": true, "2": true},
+	}
+	ready := map[string]bool{"1": false, "2": false}
+	slowCalls := 0
+	canceled := reapRestartPaneLateReadyAgents(
+		t.Context(),
+		output,
+		ready,
+		[]restartLateReadyCandidate{
+			{PaneKey: "1", Info: restartPromptTarget{Target: "%1", ResolvedType: "pi"}, ShellPID: 1},
+			{PaneKey: "2", Info: restartPromptTarget{Target: "%2", ResolvedType: "pi"}, ShellPID: 2},
+		},
+		200*time.Millisecond,
+		5*time.Millisecond,
+		func(_ context.Context, target string, _ int, _ string, _ time.Duration) (bool, error) {
+			if target == "%2" {
+				slowCalls++
+				return slowCalls >= 3, nil
+			}
+			return false, nil
+		},
+		nil,
+		func(int) bool { return true },
+	)
+	if canceled {
+		t.Fatal("late-ready pass reported cancellation")
+	}
+	if !ready["2"] || output.AgentRelaunchStatus["2"] != RestartAgentRelaunchReady {
+		t.Fatalf("slow-but-alive pane was starved: ready=%v status=%+v", ready, output)
+	}
+	if ready["1"] || output.AgentRelaunchStatus["1"] != RestartAgentRelaunchNotReady {
+		t.Fatalf("dead pane must stay not_ready: ready=%v status=%+v", ready, output)
+	}
+	if len(output.Failed) != 1 || output.Failed[0].Pane != "1" {
+		t.Fatalf("only the dead pane may fail: %+v", output.Failed)
+	}
+}
+
+func TestReapRestartPaneLateReadyAgentsHonorsCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	output := &RestartPaneOutput{
+		AgentRelaunched:     map[string]bool{"1": false, "2": false},
+		AgentRelaunchStatus: map[string]RestartAgentRelaunchStatus{"1": RestartAgentRelaunchNotReady, "2": RestartAgentRelaunchNotReady},
+		ProcessAlive:        map[string]bool{"1": true, "2": true},
+	}
+	canceled := reapRestartPaneLateReadyAgents(
+		ctx,
+		output,
+		map[string]bool{"1": false, "2": false},
+		[]restartLateReadyCandidate{
+			{PaneKey: "1", Info: restartPromptTarget{Target: "%1", ResolvedType: "pi"}, ShellPID: 1},
+			{PaneKey: "2", Info: restartPromptTarget{Target: "%2", ResolvedType: "pi"}, ShellPID: 2},
+		},
+		time.Minute,
+		5*time.Millisecond,
+		func(context.Context, string, int, string, time.Duration) (bool, error) {
+			cancel()
+			return false, context.Canceled
+		},
+		nil,
+		func(int) bool { return true },
+	)
+	if !canceled {
+		t.Fatal("cancellation during the late window was not reported")
+	}
+	if output.ErrorCode != ErrCodeTimeout {
+		t.Fatalf("error_code=%q, want %q", output.ErrorCode, ErrCodeTimeout)
+	}
+	for _, pane := range []string{"1", "2"} {
+		if output.AgentRelaunchStatus[pane] != RestartAgentRelaunchUnknown {
+			t.Fatalf("pane %s status=%q, want unknown after cancellation", pane, output.AgentRelaunchStatus[pane])
+		}
+	}
+	if len(output.Failed) != 2 {
+		t.Fatalf("canceled late window must name both unresolved panes: %+v", output.Failed)
+	}
+	for _, failure := range output.Failed {
+		if !strings.Contains(failure.Reason, "late readiness check skipped") {
+			t.Fatalf("unexpected cancellation reason: %+v", failure)
+		}
+	}
+}
+
+// TestReapRestartPaneLateReadyAgentsRefusesChangedIdentity proves a late
+// arrival is not promoted when the replacement contract no longer holds.
+func TestReapRestartPaneLateReadyAgentsRefusesChangedIdentity(t *testing.T) {
+	output := &RestartPaneOutput{
+		AgentRelaunched:     map[string]bool{"1": false},
+		AgentRelaunchStatus: map[string]RestartAgentRelaunchStatus{"1": RestartAgentRelaunchNotReady},
+		ProcessAlive:        map[string]bool{"1": true},
+	}
+	ready := map[string]bool{"1": false}
+	canceled := reapRestartPaneLateReadyAgents(
+		t.Context(),
+		output,
+		ready,
+		[]restartLateReadyCandidate{{
+			PaneKey:  "1",
+			Info:     restartPromptTarget{Target: "%1", ResolvedType: "pi"},
+			ShellPID: 42,
+		}},
+		200*time.Millisecond,
+		5*time.Millisecond,
+		func(context.Context, string, int, string, time.Duration) (bool, error) { return true, nil },
+		func(context.Context, restartLateReadyCandidate) error {
+			return errors.New("pane %1 changed ownership after relaunch")
+		},
+		func(int) bool { return true },
+	)
+	if canceled {
+		t.Fatal("late-ready pass reported cancellation")
+	}
+	if ready["1"] || output.AgentRelaunched["1"] || output.AgentRelaunchStatus["1"] != RestartAgentRelaunchUnknown {
+		t.Fatalf("changed identity must not be promoted: ready=%v output=%+v", ready, output)
+	}
+	if len(output.Failed) != 1 || !strings.Contains(output.Failed[0].Reason, "agent relaunch withheld") {
+		t.Fatalf("identity failure not recorded: %+v", output.Failed)
+	}
+}

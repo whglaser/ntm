@@ -33,6 +33,12 @@ const (
 	restartPaneReadyTimeout = 15 * time.Second
 	// restartPaneReadyPollInterval is the ready-gate poll cadence.
 	restartPaneReadyPollInterval = 400 * time.Millisecond
+	// restartPaneLateReadyTimeout is the extra bounded window for agent panes
+	// that miss the initial ready-gate. A loaded host can push a genuine CLI
+	// cold start past the gate while its pane is healthy (ntm-pnc64.2);
+	// re-checking the stragglers here turns those late-ready panes into
+	// successes instead of false negatives. Fast panes never enter the pass.
+	restartPaneLateReadyTimeout = 45 * time.Second
 	// restartPaneDispatchReadyTimeout bounds the canonical idle observation gate
 	// that runs after relaunch readiness but before an atomic bead claim.
 	restartPaneDispatchReadyTimeout = 15 * time.Second
@@ -120,6 +126,14 @@ type restartAgentRelaunchOutcome struct {
 	ProcessAlive     bool
 	ShellPID         int
 	ObservationError error
+}
+
+// restartLateReadyCandidate is an agent pane whose relaunch was delivered but
+// whose TUI was not observed before the initial ready-gate expired.
+type restartLateReadyCandidate struct {
+	PaneKey  string
+	Info     restartPromptTarget
+	ShellPID int
 }
 
 // RestartError represents a failed restart attempt
@@ -773,6 +787,10 @@ func GetRestartPaneContext(ctx context.Context, opts RestartPaneOptions) (*Resta
 	// an explicit relaunch the pane is left at a bare shell and any restart
 	// prompt would be typed into zsh instead of an agent.
 	agentPaneReady := make(map[string]bool, len(output.Restarted))
+	// lateReadyCandidates collects agent panes whose initial ready-gate expired
+	// without observing the TUI; they get one more bounded window after the
+	// relaunch loop before a failure is recorded.
+	var lateReadyCandidates []restartLateReadyCandidate
 	if len(output.Restarted) > 0 {
 		// Let fresh shells initialize before typing into them.
 		if err := waitForRestartPaneDelay(ctx, restartPaneSettleDelay); err != nil {
@@ -933,11 +951,31 @@ func GetRestartPaneContext(ctx context.Context, opts RestartPaneOptions) (*Resta
 				continue
 			}
 			if !outcome.Ready {
-				output.Failed = append(output.Failed, RestartError{
-					Pane:   paneKey,
-					Reason: fmt.Sprintf("agent not ready within %s after relaunch", restartPaneReadyTimeout),
+				lateReadyCandidates = append(lateReadyCandidates, restartLateReadyCandidate{
+					PaneKey:  paneKey,
+					Info:     info,
+					ShellPID: outcome.ShellPID,
 				})
 			}
+		}
+		if reapRestartPaneLateReadyAgents(
+			ctx,
+			output,
+			agentPaneReady,
+			lateReadyCandidates,
+			restartPaneLateReadyTimeout,
+			restartPaneReadyPollInterval,
+			func(readyCtx context.Context, target string, rootPID int, kind string, timeout time.Duration) (bool, error) {
+				return waitForPaneAgentReadyWithContext(readyCtx, target, rootPID, kind, timeout,
+					restartPaneReadyPollInterval, tmux.CapturePaneVisibleContext, deps.ObserveAgentProcess)
+			},
+			func(identityCtx context.Context, candidate restartLateReadyCandidate) error {
+				spec := launchPlan.Specs[candidate.PaneKey]
+				return launchPlan.Preflight.observeReplacement(identityCtx, deps, candidate.Info.Target, output.PaneShellPIDs[candidate.PaneKey].After, false, &spec)
+			},
+			process.HasChildAlive,
+		) {
+			return output, nil
 		}
 	}
 
@@ -2586,6 +2624,103 @@ func waitForPaneAgentReadyWithContext(
 			return false, err
 		}
 	}
+}
+
+// reapRestartPaneLateReadyAgents gives every agent pane that missed the
+// initial ready-gate one more bounded observation window before its restart is
+// recorded as a failure. A loaded host can push a real CLI cold start past the
+// gate (ntm-pnc64.2); a pane that comes up inside the window is a success, not
+// something an operator has to verify by hand. Checks rotate across the
+// pending panes so one dead pane cannot consume the window a slow-but-alive
+// sibling needs. verifyIdentity re-checks the replacement contract before a
+// late arrival is promoted; nil skips that check for unit tests. Returns true
+// when the caller's context was canceled and output already carries the
+// cancellation state.
+func reapRestartPaneLateReadyAgents(
+	ctx context.Context,
+	output *RestartPaneOutput,
+	agentPaneReady map[string]bool,
+	candidates []restartLateReadyCandidate,
+	timeout time.Duration,
+	pollInterval time.Duration,
+	waitReady func(context.Context, string, int, string, time.Duration) (bool, error),
+	verifyIdentity func(context.Context, restartLateReadyCandidate) error,
+	hasChildAlive func(int) bool,
+) bool {
+	if len(candidates) == 0 || output == nil || agentPaneReady == nil {
+		return false
+	}
+	if waitReady == nil || hasChildAlive == nil {
+		return false
+	}
+	if timeout <= 0 {
+		timeout = restartPaneLateReadyTimeout
+	}
+	if pollInterval <= 0 {
+		pollInterval = restartPaneReadyPollInterval
+	}
+	deadline := time.Now().Add(timeout)
+	pending := append([]restartLateReadyCandidate(nil), candidates...)
+
+	failPending := func(reason string) {
+		for _, candidate := range pending {
+			output.ProcessAlive[candidate.PaneKey] = hasChildAlive(candidate.ShellPID)
+			output.AgentRelaunched[candidate.PaneKey] = false
+			output.AgentRelaunchStatus[candidate.PaneKey] = RestartAgentRelaunchUnknown
+			appendRestartFailureOnce(output, candidate.PaneKey, reason)
+		}
+	}
+
+	for len(pending) > 0 {
+		rotationStart := time.Now()
+		for i := 0; i < len(pending); {
+			candidate := pending[i]
+			// One cheap probe per rotation: passing the poll interval as the
+			// deadline makes the readiness wait do a single capture and then
+			// sleep out the remainder of the interval.
+			ready, err := waitReady(ctx, candidate.Info.Target, candidate.ShellPID, candidate.Info.ResolvedType, pollInterval)
+			if cancelErr := restartPaneCancellationError(ctx, err); cancelErr != nil {
+				failPending(fmt.Sprintf("late readiness check skipped: %v", cancelErr))
+				setRestartPaneCancellation(output, cancelErr, "restart canceled while late-ready panes settled")
+				return true
+			}
+			if !ready {
+				i++
+				continue
+			}
+			if verifyIdentity != nil {
+				if identityErr := verifyIdentity(ctx, candidate); identityErr != nil {
+					output.ProcessAlive[candidate.PaneKey] = hasChildAlive(candidate.ShellPID)
+					output.AgentRelaunched[candidate.PaneKey] = false
+					output.AgentRelaunchStatus[candidate.PaneKey] = RestartAgentRelaunchUnknown
+					appendRestartFailureOnce(output, candidate.PaneKey, fmt.Sprintf("agent relaunch withheld: %v", identityErr))
+					pending = append(pending[:i], pending[i+1:]...)
+					continue
+				}
+			}
+			agentPaneReady[candidate.PaneKey] = true
+			output.AgentRelaunched[candidate.PaneKey] = true
+			output.AgentRelaunchStatus[candidate.PaneKey] = RestartAgentRelaunchReady
+			output.ProcessAlive[candidate.PaneKey] = hasChildAlive(candidate.ShellPID)
+			pending = append(pending[:i], pending[i+1:]...)
+		}
+		if len(pending) == 0 || !time.Now().Before(deadline) {
+			break
+		}
+		if elapsed := time.Since(rotationStart); elapsed < pollInterval {
+			if err := waitForRestartPaneDelay(ctx, pollInterval-elapsed); err != nil {
+				failPending(fmt.Sprintf("late readiness check skipped: %v", err))
+				setRestartPaneCancellation(output, err, "restart canceled while late-ready panes settled")
+				return true
+			}
+		}
+	}
+	for _, candidate := range pending {
+		output.ProcessAlive[candidate.PaneKey] = hasChildAlive(candidate.ShellPID)
+		appendRestartFailureOnce(output, candidate.PaneKey,
+			fmt.Sprintf("agent not ready within %s after relaunch", restartPaneReadyTimeout+timeout))
+	}
+	return false
 }
 
 func waitForRestartPaneDelay(ctx context.Context, delay time.Duration) error {
