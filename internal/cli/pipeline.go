@@ -943,6 +943,7 @@ Examples:
 // workflow. Ordinary resume interprets the original outcome and runs dependents.
 func newPipelineRecoverCmd() *cobra.Command {
 	var stepID, receipt, reason, outputFile string
+	var artifacts []string
 	var acceptDelivery, acceptCommand, adoptOrphan, stopOrphan bool
 	var exitCode int
 	cmd := &cobra.Command{
@@ -990,8 +991,10 @@ observing rather than killing the process. Inspection reports those turns as
 orphaned with a class: "generating" for a pane still producing, or
 "artifact_after_failure" for declared outputs written after the step stopped.
 --adopt-orphan records artifact provenance in the run state; --stop-orphan
-interrupts a verified generating pane. Neither action resends the prompt or
-restarts the step.
+interrupts a verified generating pane. Adoption can name files the automatic
+inspection cannot see with one or more --artifact paths (for example a run
+whose frozen workflow predates output declarations). Neither action resends
+the prompt or restarts the step.
 
 Run from the project containing the saved pipeline state.
 
@@ -1044,6 +1047,9 @@ Examples:
 			}
 			if (adoptOrphan || stopOrphan) && (strings.TrimSpace(stepID) == "" || strings.TrimSpace(reason) == "") {
 				return fail(errors.New("--adopt-orphan and --stop-orphan require --step-id and a non-empty --reason"))
+			}
+			if len(artifacts) > 0 && !adoptOrphan {
+				return fail(errors.New("--artifact requires --adopt-orphan"))
 			}
 			if acceptCommand && (!cmd.Flags().Changed("exit-code") || !cmd.Flags().Changed("output-file") || strings.TrimSpace(outputFile) == "" || exitCode < 0 || exitCode > 255) {
 				return fail(errors.New("--accept-command requires an explicit --exit-code from 0 to 255 and --output-file"))
@@ -1136,7 +1142,7 @@ Examples:
 				}
 				var result *pipeline.OrphanedTurnActionResult
 				if action == pipeline.OrphanedTurnActionAdopt {
-					result, err = pipeline.AdoptOrphanedTurnContext(cmd.Context(), projectDir, runID, stepID, reason)
+					result, err = pipeline.AdoptOrphanedTurnContext(cmd.Context(), projectDir, runID, stepID, reason, artifacts)
 				} else {
 					result, err = pipeline.StopOrphanedTurnContext(cmd.Context(), projectDir, runID, stepID, reason)
 				}
@@ -1220,6 +1226,10 @@ Examples:
 						pipeline.SanitizeDescriptionForTerminal(turn.StepID), pipeline.SanitizeDescriptionForTerminal(turn.Class), turn.PaneVerified,
 						pipeline.SanitizeDescriptionForTerminal(turn.PaneID), pipeline.SanitizeDescriptionForTerminal(turn.AgentType),
 						pipeline.SanitizeDescriptionForTerminal(turn.StepStatus), turn.FinishedAt.Format(time.RFC3339))
+					if turn.Decision != "" {
+						fmt.Fprintf(cmd.OutOrStdout(), "    Decision: %s at %s\n",
+							pipeline.SanitizeDescriptionForTerminal(turn.Decision), turn.DecidedAt.Format(time.RFC3339))
+					}
 					if turn.AgentState != "" {
 						fmt.Fprintf(cmd.OutOrStdout(), "    Agent state: %s (%s)  Last active: %s\n",
 							pipeline.SanitizeDescriptionForTerminal(turn.AgentState), pipeline.SanitizeDescriptionForTerminal(turn.StateSource), turn.LastActive.Format(time.RFC3339))
@@ -1244,6 +1254,7 @@ Examples:
 	cmd.Flags().IntVar(&exitCode, "exit-code", 0, "Observed command exit code (0 to 255); explicitly required with --accept-command")
 	cmd.Flags().StringVar(&outputFile, "output-file", "", "Regular file containing complete captured command output; explicitly required with --accept-command")
 	cmd.Flags().BoolVar(&adoptOrphan, "adopt-orphan", false, "Record post-failure artifact provenance for a failed or cancelled step's orphaned turn")
+	cmd.Flags().StringArrayVar(&artifacts, "artifact", nil, "Existing regular file to record as adopted post-failure provenance (repeatable; requires --adopt-orphan)")
 	cmd.Flags().BoolVar(&stopOrphan, "stop-orphan", false, "Interrupt a verified pane whose turn is still generating after its step failed or was cancelled")
 	cmd.Flags().StringVar(&reason, "reason", "", "Observation confirming the original delivery, completed command outcome, or orphaned-turn decision")
 	return cmd
