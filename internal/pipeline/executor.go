@@ -2053,7 +2053,10 @@ func (e *Executor) executeAgentDelivery(ctx context.Context, step *Step, workflo
 	// after the pane lock is held: a queued step targeting the same pane must
 	// not clear the state an in-flight step is waiting on. pi reports a state
 	// change, so the tap must be attached before the turn's prompt is pasted.
-	e.ensureProgramStatusCapture(paneID)
+	// A fresh dispatch also drops reports from the pane's previous turn; a
+	// recorded retry/resume keeps them because it observes the same turn
+	// (ntm-l6cuz.9).
+	e.ensureProgramStatusCapture(paneID, !recorded)
 	e.resetDetectorPaneState(paneID)
 	if !recorded {
 		endpoint := e.agentDeliveryEndpoint()
@@ -2424,12 +2427,18 @@ func observeAgentDelivery(record AgentDeliveryState, current string) (AgentDeliv
 // observeAgentDeliveryTurn is the executor's authoritative-recovery wrapper
 // around observeAgentDelivery. A long prompt plus a multi-minute turn can
 // scroll both the pre-send boundary and the prompt echo out of the capture
-// window; when the pane's own OSC 7501 report says the turn settled
-// (done/idle), that report still proves completion, so the turn is marked
-// complete instead of failing closed. Recovery never re-sends: it only
-// observes, attributes the current frame, and records the decision. Without a
-// fresh authoritative report the boundary error is preserved exactly as
-// before (ntm-l6cuz.5).
+// window. Two readings still decide the turn without a re-send:
+//
+//   - a fresh OSC 7501 report says the turn settled (done/idle): the turn is
+//     complete and the current frame's transcript is attributed (ntm-l6cuz.5);
+//   - the pane is demonstrably still working: the lost boundary is a
+//     transient observation, not a verdict, so the wait parks without
+//     attributing anything and without failing the step. A later settle
+//     report completes it, and the step timeout stays the bounded backstop
+//     (ntm-l6cuz.9).
+//
+// Idle/unknown/error readings without an authoritative settle, and detector
+// failures, keep the fail-closed boundary error exactly as before.
 func (e *Executor) observeAgentDeliveryTurn(paneID string, record AgentDeliveryState, current string) (AgentDeliveryState, bool, error) {
 	next, ready, err := observeAgentDelivery(record, current)
 	if err == nil {
@@ -2448,8 +2457,25 @@ func (e *Executor) observeAgentDeliveryTurn(paneID string, record AgentDeliveryS
 	if e == nil || !errors.Is(err, errAgentDeliveryBoundaryLost) {
 		return next, ready, err
 	}
-	settled, ok := e.authoritativeTurnSettled(paneID)
+	st, ok := e.agentDeliveryPaneStatus(paneID)
 	if !ok {
+		return next, false, err
+	}
+	settled := st.StateSource == status.StateSourceOSC && st.State == status.StateIdle
+	if !settled {
+		if st.State == status.StateWorking {
+			// The boundary is gone but the pane is demonstrably mid-turn.
+			// Parking keeps the recorded delivery, attributes nothing, and
+			// re-sends nothing; only a later authoritative settle (or the
+			// step timeout) can end this wait.
+			slog.Debug("pipeline.agent_delivery.boundary_parked",
+				"pane_id", paneID,
+				"agent_type", record.AgentType,
+				"state_source", string(st.StateSource),
+				"reason", "pre-send output boundary is not visible while the pane reports working; keeping the recorded delivery for a later settle",
+			)
+			return next, false, nil
+		}
 		return next, false, err
 	}
 	output := next.Output
@@ -2469,17 +2495,17 @@ func (e *Executor) observeAgentDeliveryTurn(paneID string, record AgentDeliveryS
 	slog.Warn("pipeline.agent_delivery.boundary_recovered",
 		"pane_id", paneID,
 		"agent_type", record.AgentType,
-		"state_source", string(settled.StateSource),
+		"state_source", string(st.StateSource),
 		"reason", "authoritative program status settled the turn after the pre-send boundary scrolled away",
 	)
 	return next, true, nil
 }
 
-// authoritativeTurnSettled reports whether the pane's own OSC 7501 report
-// currently says the turn completed. Only the OSC source counts: an idle
-// scrape reading is exactly what the boundary check protects against, and a
-// stale or working report must keep the receipt fail-closed.
-func (e *Executor) authoritativeTurnSettled(paneID string) (status.AgentStatus, bool) {
+// agentDeliveryPaneStatus returns the detector's current reading for a pane
+// observed through a delivery receipt. ok is false when there is no pane, no
+// detector, or the detector itself failed; every such case keeps the
+// fail-closed boundary error because nothing can be attributed safely.
+func (e *Executor) agentDeliveryPaneStatus(paneID string) (status.AgentStatus, bool) {
 	if e == nil || e.detector == nil || paneID == "" {
 		return status.AgentStatus{}, false
 	}
@@ -2487,17 +2513,15 @@ func (e *Executor) authoritativeTurnSettled(paneID string) (status.AgentStatus, 
 	if err != nil {
 		return status.AgentStatus{}, false
 	}
-	if st.StateSource != status.StateSourceOSC || st.State != status.StateIdle {
-		return status.AgentStatus{}, false
-	}
 	return st, true
 }
 
 // errAgentDeliveryBoundaryLost means the capture no longer contains the
 // pre-send output boundary, so the response delta cannot be attributed from
-// the capture alone. The executor may still recover the dispatched turn from
-// an authoritative program-status report (ntm-l6cuz.5); every other caller
-// keeps the fail-closed receipt semantics.
+// the capture alone. The executor's delivery wait may still recover the
+// dispatched turn from an authoritative program-status report (ntm-l6cuz.5)
+// or park it while the pane is demonstrably working (ntm-l6cuz.9); every
+// other caller keeps the fail-closed receipt semantics.
 var errAgentDeliveryBoundaryLost = errors.New("saved agent output boundary is no longer visible; inspect the original pane before an intentional restart")
 
 // agentDeliveryNewOutput returns the response text after the pre-send

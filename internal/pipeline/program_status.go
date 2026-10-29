@@ -46,10 +46,27 @@ func (e *Executor) SetProgramStatusSource(source status.ProgramStatusSource) {
 // paneID so reports emitted during the coming turn are recorded before
 // waitForIdle polls. It is a no-op for dry runs and injected (non-tmux)
 // clients, so unit tests never touch the host tmux server.
-func (e *Executor) ensureProgramStatusCapture(paneID string) {
+//
+// beginTurn distinguishes a fresh dispatch from resuming a recorded delivery.
+// A new dispatch drops any report left from the pane's previous lifetime or
+// earlier step so a stale "done" cannot complete this step before its agent
+// starts. A recorded retry/resume keeps the report: it observes the same
+// turn, pi emits reports only on state changes, and a "done" that landed
+// during the retry gap is the authoritative settle evidence a second Forget
+// would destroy (ntm-l6cuz.9).
+func (e *Executor) ensureProgramStatusCapture(paneID string, beginTurn bool) {
 	if e == nil || e.config.DryRun || paneID == "" {
 		return
 	}
+
+	if beginTurn {
+		e.programStatusMu.Lock()
+		if e.programStatusObserver != nil {
+			e.programStatusObserver.Forget(paneID)
+		}
+		e.programStatusMu.Unlock()
+	}
+
 	if _, live := e.tmuxClient().(realTmuxClient); !live {
 		return
 	}
@@ -77,14 +94,10 @@ func (e *Executor) ensureProgramStatusCapture(paneID string) {
 		e.SetProgramStatusSource(observer)
 	}
 
-	// A new dispatch begins a new turn. Drop any report left from the pane's
-	// previous lifetime or earlier step so a stale "done" cannot complete
-	// this step before its agent starts.
-	e.programStatusMu.Lock()
-	observer.Forget(paneID)
 	// A failed start (for example, another process owns the pane's pipe)
 	// leaves scraping as the source; the wait must not fail because its
 	// optional authority is unavailable.
+	e.programStatusMu.Lock()
 	_ = e.programStatusStreams.StartStream(paneID)
 	e.programStatusMu.Unlock()
 }

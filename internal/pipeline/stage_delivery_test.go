@@ -536,10 +536,11 @@ func TestPiAdHocStageKeepsBoundaryFailureWithoutAuthoritativeReport(t *testing.T
 	}
 }
 
-// TestPiAdHocStageDoesNotRecoverOnWorkingReport pins the state condition: a
-// fresh OSC "working" report is not completion evidence, so the lost boundary
-// still fails closed.
-func TestPiAdHocStageDoesNotRecoverOnWorkingReport(t *testing.T) {
+// TestPiAdHocStageParksScrolledBoundaryWhileWorking pins the ntm-l6cuz.9
+// stage contract: a fresh OSC "working" report is not completion evidence,
+// but it is also not a fatal receipt error. The wait parks until its deadline
+// without attributing anything and without re-sending the prompt.
+func TestPiAdHocStageParksScrolledBoundaryWhileWorking(t *testing.T) {
 	executor, client, _ := newStageDeliveryFixture(t)
 	client.pane.Type, client.pane.Command = tmux.AgentType("pi"), "pi"
 	client.before = piStagePane("Pi v1.3.0\nPrevious turn context that will scroll away.", "")
@@ -554,14 +555,17 @@ func TestPiAdHocStageDoesNotRecoverOnWorkingReport(t *testing.T) {
 	client.onPaste = func(_ int, _ string) {
 		client.after = piStagePane("Pi v1.3.0\n\n"+strings.Repeat("lane output line\n", 40), "")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer cancel()
 
 	_, err := executor.executeAdHocStage(ctx, Stage{AgentType: "pi", Prompt: "Run the lane."}, client.pane.ID, "", AgentDeliveryState{})
-	if err == nil || !strings.Contains(err.Error(), "saved agent output boundary is no longer visible") {
-		t.Fatalf("working report wrongly attributed a scrolled boundary: %v", err)
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("working boundary loss did not park until the deadline: %v", err)
+	}
+	if strings.Contains(err.Error(), "saved agent output boundary is no longer visible") {
+		t.Fatalf("working boundary loss still failed the stage: %v", err)
 	}
 	if client.pastes != 1 {
-		t.Fatalf("working-report path re-sent the prompt: pastes=%d", client.pastes)
+		t.Fatalf("parked stage re-sent the prompt: pastes=%d", client.pastes)
 	}
 }

@@ -103,7 +103,7 @@ func (e *Executor) executeAdHocStage(ctx context.Context, stage Stage, paneID, p
 	// queued stage for the same pane must not clear the state this one waits
 	// on, and pi reports are change-driven, so the tap must exist before the
 	// prompt is pasted.
-	e.ensureProgramStatusCapture(paneID)
+	e.ensureProgramStatusCapture(paneID, true)
 	e.resetDetectorPaneState(paneID)
 	if err := e.tmuxClient().PrepareDelivery(ctx, pane, agentType); err != nil {
 		return record, fmt.Errorf("stage not dispatched: %w", err)
