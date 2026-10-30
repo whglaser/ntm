@@ -337,23 +337,13 @@ internal/tmux/backpressure.go:Client.CaptureBackpressureInputs	bd-ld4j2	reachabl
 internal/tmux/backpressure.go:captureBackpressureTracker.inputs	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tmux/backpressure.go:firstNonEmpty	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tmux/backpressure.go:isCaptureTimeout	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tmux/capture_helpers.go:Client.CaptureForCheckpoint	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tmux/capture_helpers.go:Client.CaptureForCheckpointContext	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tmux/capture_helpers.go:Client.CaptureForFullContext	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tmux/capture_helpers.go:Client.CaptureForHealthCheck	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tmux/client.go:Client.RespawnPane	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tmux/client.go:Client.RespawnPaneContext	ntm-9n7x8	upstream f477c62c debt (upstream G1 gate red): kept only by RTA's reflection rule, no call path from cmd/ntm; wire or delete upstream
 internal/tmux/client.go:RespawnPaneContext	ntm-9n7x8	upstream f477c62c debt (upstream G1 gate red): unreachable from cmd/ntm; package-level respawn wrapper left uncalled; wire or delete upstream
 internal/tmux/launch_environment.go:LaunchEnvironment.GoString	ntm-9n7x8	upstream f477c62c debt (upstream G1 gate red): unreachable from cmd/ntm; redaction GoString stringer left uncalled; wire or delete upstream
 internal/tmux/launch_environment.go:LaunchEnvironment.Send	ntm-9n7x8	upstream f477c62c debt (upstream G1 gate red): unreachable from cmd/ntm; the live handoff path uses SendIfCurrent and Send is an uncalled twin; wire or delete upstream
 internal/tmux/launch_environment.go:LaunchEnvironment.String	ntm-9n7x8	upstream f477c62c debt (upstream G1 gate red): unreachable from cmd/ntm; redaction String stringer left uncalled; wire or delete upstream
 internal/tmux/pane_badge.go:Client.ReadPaneBadgeContext	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tmux/pane_border.go:Client.ResetPaneBorderStyle	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tmux/pane_border.go:Client.ResetPaneBorderStyleContext	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tmux/pane_border.go:Client.SetPaneBorderStyle	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tmux/pane_border.go:Client.SetPaneBorderStyleContext	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tmux/session.go:Client.PasteKeysWithDelay	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tmux/session.go:Client.SendEOF	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tmux/session.go:SetPaneAgentTypeContext	ntm-9n7x8	upstream f477c62c debt (upstream G1 gate red): unreachable from cmd/ntm; package-level wrapper left uncalled (the guarded form is live); wire or delete upstream
 internal/tools/am.go:AMAdapter.ServerURL	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tools/am.go:AMAdapter.SetServerURL	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it

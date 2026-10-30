@@ -3720,11 +3720,6 @@ func SendOmpExitContext(ctx context.Context, target string) error {
 	return DefaultClient.SendOmpExitContext(ctx, target)
 }
 
-// SendEOF sends Ctrl+D (EOF) to a pane
-func (c *Client) SendEOF(target string) error {
-	return c.RunSilent("send-keys", "-t", ExactTarget(target), "C-d")
-}
-
 // DisplayMessage shows a message in the tmux status line.
 // The "--" prevents msg from being interpreted as a tmux flag.
 func (c *Client) DisplayMessage(session, msg string, durationMs int) error {

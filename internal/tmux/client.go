@@ -708,11 +708,6 @@ func (c *Client) IsInstalled() bool {
 	return err == nil
 }
 
-// RespawnPane respawns a pane, optionally killing the current process (-k)
-func (c *Client) RespawnPane(target string, kill bool) error {
-	return c.RespawnPaneContext(context.Background(), target, kill)
-}
-
 // RespawnPaneContext respawns a pane with cancellation support
 func (c *Client) RespawnPaneContext(ctx context.Context, target string, kill bool) error {
 	args := []string{"respawn-pane", "-t", ExactTarget(target)}
