@@ -193,12 +193,7 @@ internal/state/store.go:Store.UpdateReservation	bd-ld4j2	reachable only through 
 internal/state/store.go:Store.UpdateTask	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/state/store.go:Store.UpsertToolHealth	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/state/timeline.go:TimelineState.IsTerminal	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/status/compaction.go:CompactionDetector.Events	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/status/compaction.go:CompactionDetector.EventsForPane	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/status/compaction.go:CompactionDetector.HasRecentCompaction	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/status/osc.go:OSCDetector.DetectAll	ntm-l6cuz.2	interface-completing method added by the OSC 7501 capture; production waits call Detect per pane, and the session-wide form lands with the ntm wait/activity wiring
-internal/status/recovery.go:CompactionRecoveryIntegration.Detector	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/status/recovery.go:CompactionRecoveryIntegration.Recovery	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/status/recovery.go:RecoveryManager.CanSendRecovery	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/status/recovery.go:RecoveryManager.GetLastRecoveryTime	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/status/recovery.go:RecoveryManager.GetRecoveryCount	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
@@ -211,8 +206,6 @@ internal/status/recovery.go:RecoveryManager.SetCooldown	bd-ld4j2	reachable only 
 internal/status/recovery.go:RecoveryManager.SetPrompt	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/status/recovery.go:RecoveryManager.recoveryPaneType	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/status/recovery.go:RecoveryManager.sendRecoveryPromptByIDForAgent	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/status/types.go:AgentStatus.IdleDuration	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/status/types.go:ErrorType.Message	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/status/unified.go:UnifiedDetector.DetectAll	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/status/unified.go:UnifiedDetector.DetectAllContext	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/swarm/claude_config_home.go:ClaudeConfigProvisioner.CredentialIsolated	ntm-9n7x8	upstream f477c62c debt (upstream G1 gate red): unreachable from cmd/ntm; its credentialState helper chain is dead; wire or delete upstream
@@ -515,3 +508,9 @@ internal/ensemble/types.go:ModeCatalog.ListByTier	permanent	test-inspection acce
 internal/ensemble/types.go:ModeCatalog.ListDefault	permanent	test-inspection accessor for the live mode catalog: reached by internal/ensemble/types_test.go (TestModeCatalog_ListDefault); delegates to ListByTier
 internal/ensemble/types.go:ModeCatalog.SearchModes	permanent	test-inspection accessor for the live mode catalog: reached by internal/ensemble/types_test.go (TestModeCatalog_Basic search assertions)
 internal/ensemble/types.go:ModeCatalog.Version	permanent	test-inspection accessor for the live mode catalog: reached by internal/ensemble/types_test.go (TestModeCatalog_Basic)
+# permanent: test-inspection accessors (bd-ld4j2 batch 14)
+internal/status/compaction.go:CompactionDetector.Events	permanent	test-inspection accessor for live compaction detection: reached by internal/status/compaction_test.go and recovery tests, which assert the live Check() event history
+internal/status/compaction.go:CompactionDetector.EventsForPane	permanent	test-inspection accessor for live compaction detection: reached by internal/status/compaction_test.go / recovery_test.go per-pane assertions
+internal/status/compaction.go:CompactionDetector.HasRecentCompaction	permanent	test-inspection accessor for live compaction detection: reached by internal/status/compaction_test.go (TestCompactionDetector_HasRecentCompaction)
+internal/status/recovery.go:CompactionRecoveryIntegration.Detector	permanent	test-inspection accessor for the live integration wiring: reached cross-package by internal/cli/monitor_compaction_test.go and internal/status/recovery_test.go
+internal/status/recovery.go:CompactionRecoveryIntegration.Recovery	permanent	test-inspection accessor for the live integration wiring: reached cross-package by internal/cli/monitor_compaction_test.go and internal/status/recovery_test.go

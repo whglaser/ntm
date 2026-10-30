@@ -164,20 +164,6 @@ func TestAgentStatusIsHealthy(t *testing.T) {
 	}
 }
 
-func TestAgentStatusIdleDuration(t *testing.T) {
-	// Set LastActive to 5 minutes ago
-	status := AgentStatus{
-		LastActive: time.Now().Add(-5 * time.Minute),
-	}
-
-	duration := status.IdleDuration()
-
-	// Should be approximately 5 minutes
-	if duration < 4*time.Minute || duration > 6*time.Minute {
-		t.Errorf("IdleDuration = %v, expected around 5 minutes", duration)
-	}
-}
-
 func TestAgentStateIcon(t *testing.T) {
 	tests := []struct {
 		state    AgentState
@@ -194,29 +180,6 @@ func TestAgentStateIcon(t *testing.T) {
 			if tt.state.Icon() != tt.expected {
 				t.Errorf("Icon() for %s = %q, want %q",
 					tt.state, tt.state.Icon(), tt.expected)
-			}
-		})
-	}
-}
-
-func TestErrorTypeMessage(t *testing.T) {
-	tests := []struct {
-		errType  ErrorType
-		expected string
-	}{
-		{ErrorRateLimit, "Rate limited - too many requests"},
-		{ErrorCrash, "Agent crashed"},
-		{ErrorAuth, "Authentication error"},
-		{ErrorConnection, "Connection error"},
-		{ErrorGeneric, "Error detected"},
-		{ErrorNone, ""},
-	}
-
-	for _, tt := range tests {
-		t.Run(string(tt.errType), func(t *testing.T) {
-			if tt.errType.Message() != tt.expected {
-				t.Errorf("Message() for %s = %q, want %q",
-					tt.errType, tt.errType.Message(), tt.expected)
 			}
 		})
 	}
