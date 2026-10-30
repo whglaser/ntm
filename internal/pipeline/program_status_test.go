@@ -2,6 +2,8 @@ package pipeline
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -302,4 +304,129 @@ func TestNewTurnForgetsProgramStatusButResumeKeepsIt(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestAgentDeliveryCompletesOnStableArtifactsWithoutPiFrame is the
+// ntm-l6cuz.11 acceptance for the live failure: the declared deliverable is
+// written and byte-stable while the pane frame is unattributable (idle, the
+// pre-send boundary scrolled away). The wait must park on the lost boundary,
+// complete on the artifact set instead of demanding another attributed pi
+// frame, and never re-send the prompt.
+func TestAgentDeliveryCompletesOnStableArtifactsWithoutPiFrame(t *testing.T) {
+	executor, mock := submittingExecutor(t, "pi-stable-artifacts")
+	executor.config.ProjectDir = t.TempDir()
+	executor.config.OutputStabilityWindow = 100 * time.Millisecond
+	mock.AddPane("", tmux.Pane{ID: "%1", Index: 1, PID: 4141, Type: tmux.AgentType("pi"), Width: 100})
+	if err := mock.SetPaneOutput("%1", piStagePane("Pi v1.3.0\nPrevious turn context that will scroll away.", "")); err != nil {
+		t.Fatal(err)
+	}
+	artifact := filepath.Join(executor.config.ProjectDir, "lane-note.md")
+	mock.SetSubmissionVerifier(func(target, _, _ string) error {
+		if err := os.WriteFile(artifact, []byte("lane note complete\n"), 0o600); err != nil {
+			return err
+		}
+		// The turn repaints away the pre-send boundary; the frame is never
+		// attributable from here on.
+		return mock.SetPaneOutput(target, piStagePane("Pi v1.3.0\n\n"+strings.Repeat("lane output line\n", 400)+"unattributed", ""))
+	})
+
+	workflow := singleStepWorkflow("pi-stable-artifacts", Step{
+		ID:      "work",
+		Pane:    PaneSpec{Index: 1},
+		Prompt:  "Run the lane.",
+		Wait:    WaitCompletion,
+		Timeout: Duration{Duration: 10 * time.Second},
+		Outputs: []OutputDecl{{Name: "lane-note", Path: artifact}},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	state, err := executor.Run(ctx, workflow, nil, nil)
+	if err != nil || state.Status != StatusCompleted {
+		t.Fatalf("stable declared artifacts did not complete the step: state=%+v err=%v", state.Status, err)
+	}
+	if got := state.Steps["work"]; got.Status != StatusCompleted {
+		t.Fatalf("step status = %q, want completed", got.Status)
+	}
+	if _, err := os.Stat(artifact); err != nil {
+		t.Fatalf("artifact disappeared: %v", err)
+	}
+	assertNotResent(t, mock)
+}
+
+// TestAgentDeliveryMissingArtifactsStillFailClosedOnBoundaryLoss pins that the
+// parking rule did not weaken the receipt: a lost boundary while idle with no
+// declared deliverable on disk still fails closed and never re-sends.
+func TestAgentDeliveryMissingArtifactsStillFailClosedOnBoundaryLoss(t *testing.T) {
+	executor, mock := submittingExecutor(t, "pi-missing-artifacts")
+	executor.config.ProjectDir = t.TempDir()
+	executor.config.OutputStabilityWindow = 100 * time.Millisecond
+	mock.AddPane("", tmux.Pane{ID: "%1", Index: 1, PID: 4141, Type: tmux.AgentType("pi"), Width: 100})
+	if err := mock.SetPaneOutput("%1", piStagePane("Pi v1.3.0\nPrevious turn context that will scroll away.", "")); err != nil {
+		t.Fatal(err)
+	}
+	artifact := filepath.Join(executor.config.ProjectDir, "never-written.md")
+	mock.SetSubmissionVerifier(func(target, _, _ string) error {
+		return mock.SetPaneOutput(target, piStagePane("Pi v1.3.0\n\n"+strings.Repeat("lane output line\n", 400)+"unattributed", ""))
+	})
+
+	workflow := singleStepWorkflow("pi-missing-artifacts", Step{
+		ID:      "work",
+		Pane:    PaneSpec{Index: 1},
+		Prompt:  "Run the lane.",
+		Wait:    WaitCompletion,
+		Timeout: Duration{Duration: 5 * time.Second},
+		Outputs: []OutputDecl{{Name: "lane-note", Path: artifact}},
+	})
+	state, err := executor.Run(context.Background(), workflow, nil, nil)
+	if err == nil || state.Status == StatusCompleted {
+		t.Fatalf("missing deliverable completed on an unattributable frame: state=%+v err=%v", state.Status, err)
+	}
+	got := state.Steps["work"]
+	if got.Error == nil || !strings.Contains(got.Error.Message, "boundary is no longer visible") {
+		t.Fatalf("missing deliverable did not fail closed on the boundary error: %+v", got.Error)
+	}
+	assertNotResent(t, mock)
+}
+
+// TestAgentDeliveryStableArtifactsOutrankIncompletePostWaitFrame pins the
+// second discard path from the live run: waitForIdle can return on the
+// artifact window while the required post-wait pi frame is an incomplete
+// capture. The stable deliverable is terminal; the step must complete without
+// re-entering the wait (whose debounce plus re-baselined watcher used to
+// consume the rest of the deadline).
+func TestAgentDeliveryStableArtifactsOutrankIncompletePostWaitFrame(t *testing.T) {
+	executor, mock := submittingExecutor(t, "pi-artifacts-over-frame")
+	executor.config.ProjectDir = t.TempDir()
+	executor.config.OutputStabilityWindow = 100 * time.Millisecond
+	mock.AddPane("", tmux.Pane{ID: "%1", Index: 1, PID: 4141, Type: tmux.AgentType("pi"), Width: 100})
+	if err := mock.SetPaneOutput("%1", piStagePane("Pi v1.3.0\nPrevious turn context that will scroll away.", "")); err != nil {
+		t.Fatal(err)
+	}
+	artifact := filepath.Join(executor.config.ProjectDir, "lane-note.md")
+	mock.SetSubmissionVerifier(func(target, _, _ string) error {
+		if err := os.WriteFile(artifact, []byte("lane note complete\n"), 0o600); err != nil {
+			return err
+		}
+		// A bare transcript with no pi chrome: AgentResponseTranscript reports
+		// the capture incomplete, so collect() is (false, nil) every poll.
+		return mock.SetPaneOutput(target, "lane output line\n")
+	})
+
+	workflow := singleStepWorkflow("pi-artifacts-over-frame", Step{
+		ID:      "work",
+		Pane:    PaneSpec{Index: 1},
+		Prompt:  "Run the lane.",
+		Wait:    WaitCompletion,
+		Timeout: Duration{Duration: 4 * time.Second},
+		Outputs: []OutputDecl{{Name: "lane-note", Path: artifact}},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	state, err := executor.Run(ctx, workflow, nil, nil)
+	if err != nil || state.Status != StatusCompleted {
+		t.Fatalf("stable artifacts did not outrank the incomplete post-wait frame: state=%+v err=%v", state.Status, err)
+	}
+	assertNotResent(t, mock)
 }

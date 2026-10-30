@@ -2179,6 +2179,11 @@ func (e *Executor) executeAgentDelivery(ctx context.Context, step *Step, workflo
 		}
 	}
 	result.PaneUsed, result.AgentType, result.StartedAt = record.PaneID, record.AgentType, record.StartedAt
+	// Build the completion policy once per attempt. waitIdleOptionsForStep
+	// creates a fresh artifact watcher, so rebuilding it for every wait
+	// re-baselined the stability window and let a boundary-lost frame fail a
+	// deliverable that was already byte-stable (ntm-l6cuz.11).
+	opts := e.waitIdleOptionsForStep(step)
 	collect := func() (bool, error) {
 		current, err := e.captureAgentDelivery(ctx, record)
 		if errors.Is(err, errIncompleteAgentCapture) {
@@ -2189,6 +2194,13 @@ func (e *Executor) executeAgentDelivery(ctx context.Context, step *Step, workflo
 		}
 		next, ready, err := e.observeAgentDeliveryTurn(record.PaneID, record, current)
 		if err != nil {
+			if errors.Is(err, errAgentDeliveryBoundaryLost) && opts.Artifacts != nil && opts.Artifacts.allPresent() {
+				// The pane frame is no longer attributable, but every declared
+				// deliverable exists on disk: park instead of failing, and let
+				// the stability window (or the step deadline) decide. A missing
+				// output still fails closed exactly as before.
+				return false, nil
+			}
 			return false, err
 		}
 		if next.BeforeOutput != record.BeforeOutput || next.Output != record.Output {
@@ -2230,7 +2242,7 @@ func (e *Executor) executeAgentDelivery(ctx context.Context, step *Step, workflo
 		deadline := time.Now().Add(timeout)
 		remaining := timeout
 		for {
-			if err := e.waitForIdle(ctx, paneID, remaining, e.waitIdleOptionsForStep(step), collect); err != nil {
+			if err := e.waitForIdle(ctx, paneID, remaining, opts, collect); err != nil {
 				// Preserve partial output even when the deadline precedes the first
 				// idle poll. Cancellation never starts a new uncancelled capture.
 				if ctx.Err() == nil && e.checkpointFailure() == nil {
@@ -2241,6 +2253,13 @@ func (e *Executor) executeAgentDelivery(ctx context.Context, step *Step, workflo
 				return fail("timeout", fmt.Errorf("waiting for the original agent delivery: %w", err))
 			}
 			if !strings.EqualFold(strings.TrimSpace(record.AgentType), "pi") {
+				break
+			}
+			// Artifact stability is terminal completion. When waitForIdle
+			// returned because the declared outputs matured, the redraw that
+			// hid the pane frame is exactly the case the fallback exists for,
+			// so another attributed frame is not required (ntm-l6cuz.11).
+			if opts.Artifacts != nil && opts.Artifacts.satisfiedAt(time.Now()) {
 				break
 			}
 			// The last idle observation can itself race a pi redraw. Require

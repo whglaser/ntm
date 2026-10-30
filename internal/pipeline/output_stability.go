@@ -92,6 +92,18 @@ func (a *artifactStability) satisfiedAt(now time.Time) bool {
 	return !a.since.IsZero() && now.Sub(a.since) >= a.window
 }
 
+// allPresent reports whether every watched path currently exists and is
+// readable. It is the park condition for an unattributable pane frame: a
+// missing deliverable must still fail closed, but an existing one can wait
+// for the stability window to mature instead of killing the step.
+func (a *artifactStability) allPresent() bool {
+	if a == nil || len(a.paths) == 0 {
+		return false
+	}
+	_, ok := digestArtifacts(a.paths)
+	return ok
+}
+
 // watchedPaths returns the resolved paths for logging. The slice is a copy;
 // callers cannot mutate the watcher's state.
 func (a *artifactStability) watchedPaths() []string {
