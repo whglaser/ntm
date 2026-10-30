@@ -22,9 +22,6 @@ func TestOmpAgentType(t *testing.T) {
 	if !AgentTypeOmp.IsValid() {
 		t.Error("omp must be a valid built-in agent type")
 	}
-	if got := AgentTypeOmp.DisplayName(); got != "Oh My Pi" {
-		t.Errorf("DisplayName = %q, want \"Oh My Pi\"", got)
-	}
 	if got := AgentTypeOmp.ProfileName(); got != "OMP" {
 		t.Errorf("ProfileName = %q, want \"OMP\"", got)
 	}

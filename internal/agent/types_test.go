@@ -32,35 +32,6 @@ func TestAgentType_String(t *testing.T) {
 	}
 }
 
-func TestAgentType_DisplayName(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		at   AgentType
-		want string
-	}{
-		{AgentTypeClaudeCode, "Claude Code"},
-		{AgentTypeCodex, "Codex CLI"},
-		{AgentTypeGemini, "Gemini CLI"},
-		{AgentTypeGrok, "Grok Build"},
-		{AgentTypeOllama, "Ollama"},
-		{AgentTypeCursor, "Cursor"},
-		{AgentTypeWindsurf, "Windsurf"},
-		{AgentTypeAider, "Aider"},
-		{AgentTypeUser, "User"},
-		{AgentType("codex"), "Codex CLI"},
-		{AgentType(" gemini "), "Gemini CLI"},
-		{AgentTypeUnknown, "Unknown"},
-		{AgentType("anything-else"), "Unknown"},
-	}
-
-	for _, tt := range tests {
-		if got := tt.at.DisplayName(); got != tt.want {
-			t.Errorf("AgentType(%q).DisplayName() = %q, want %q", tt.at, got, tt.want)
-		}
-	}
-}
-
 func TestAgentType_Canonical(t *testing.T) {
 	t.Parallel()
 
@@ -247,46 +218,6 @@ func TestAgentState_GetRecommendation(t *testing.T) {
 				t.Errorf("AgentState.GetRecommendation() = %q, want %q", got, tt.want)
 			}
 		})
-	}
-}
-
-func TestRecommendation_IsActionable(t *testing.T) {
-	tests := []struct {
-		r    Recommendation
-		want bool
-	}{
-		{RecommendSafeToRestart, true},
-		{RecommendErrorState, true},
-		{RecommendDoNotInterrupt, false},
-		{RecommendRateLimitedWait, false},
-		{RecommendContextLowContinue, false},
-		{RecommendUnknown, false},
-	}
-
-	for _, tt := range tests {
-		if got := tt.r.IsActionable(); got != tt.want {
-			t.Errorf("Recommendation(%q).IsActionable() = %v, want %v", tt.r, got, tt.want)
-		}
-	}
-}
-
-func TestRecommendation_RequiresWaiting(t *testing.T) {
-	tests := []struct {
-		r    Recommendation
-		want bool
-	}{
-		{RecommendRateLimitedWait, true},
-		{RecommendContextLowContinue, true},
-		{RecommendDoNotInterrupt, true},
-		{RecommendSafeToRestart, false},
-		{RecommendErrorState, false},
-		{RecommendUnknown, false},
-	}
-
-	for _, tt := range tests {
-		if got := tt.r.RequiresWaiting(); got != tt.want {
-			t.Errorf("Recommendation(%q).RequiresWaiting() = %v, want %v", tt.r, got, tt.want)
-		}
 	}
 }
 

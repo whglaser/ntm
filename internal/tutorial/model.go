@@ -434,13 +434,3 @@ func (m Model) View() string {
 
 	return m.renderSlide()
 }
-
-// GetCurrentSlide returns the current slide ID
-func (m Model) GetCurrentSlide() SlideID {
-	return m.currentSlide
-}
-
-// IsTransitioning returns whether a transition is in progress
-func (m Model) IsTransitioning() bool {
-	return m.transitioning
-}

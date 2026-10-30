@@ -89,23 +89,3 @@ func (c *Client) search(ctx context.Context, opts SearchOptions, agents []string
 
 	return &response, nil
 }
-
-// SearchQuick performs a simple search with defaults
-func (c *Client) SearchQuick(ctx context.Context, query string) (*SearchResponse, error) {
-	return c.Search(ctx, SearchOptions{
-		Query:  query,
-		Limit:  10,
-		Fields: "summary",
-	})
-}
-
-// SearchForContext searches for relevant past context
-func (c *Client) SearchForContext(ctx context.Context, query, workspace string) (*SearchResponse, error) {
-	return c.Search(ctx, SearchOptions{
-		Query:     query,
-		Workspace: workspace,
-		Since:     "30d",
-		Limit:     5,
-		Fields:    "summary",
-	})
-}

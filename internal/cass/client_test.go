@@ -155,21 +155,6 @@ func TestClient_Status(t *testing.T) {
 	}
 }
 
-func TestClient_HealthUsesHealthCommand(t *testing.T) {
-	executor := &mockExecutor{output: []byte(`{"healthy": true}`)}
-	client := NewClient(WithExecutor(executor))
-
-	if _, err := client.Health(context.Background()); err != nil {
-		t.Fatalf("Health() error: %v", err)
-	}
-	if len(executor.args) != 1 {
-		t.Fatalf("executor calls = %d, want 1", len(executor.args))
-	}
-	if got, want := executor.args[0], []string{"health", "--json"}; !slices.Equal(got, want) {
-		t.Errorf("Health() command = %v, want %v", got, want)
-	}
-}
-
 // Regression test for acfs#266: when the cass binary is installed but
 // no index has been built, cass exits with code 3. The DefaultExecutor
 // must surface this as ErrNotInitialized so downstream callers (ntm

@@ -558,49 +558,6 @@ func TestProgressDots_EdgeCases(t *testing.T) {
 // animations.go: Particle
 // =============================================================================
 
-func TestParticleRender(t *testing.T) {
-	t.Parallel()
-
-	// Particle with full life should render
-	p := Particle{
-		Life:    30,
-		MaxLife: 30,
-		Char:    "★",
-		Color:   "#ff0000",
-	}
-	got := p.Render()
-	if got == "" {
-		t.Error("Particle with full life should render non-empty")
-	}
-	if !strings.Contains(got, "★") {
-		t.Errorf("Particle.Render should contain char '★', got %q", got)
-	}
-
-	// Particle with low life (< 30% alpha) should render empty
-	pLow := Particle{
-		Life:    2,
-		MaxLife: 30,
-		Char:    "★",
-		Color:   "#ff0000",
-	}
-	gotLow := pLow.Render()
-	if gotLow != "" {
-		t.Errorf("Particle with life/max < 0.3 should render empty, got %q", gotLow)
-	}
-
-	// Particle with exactly 30% life should render
-	pBorder := Particle{
-		Life:    9,
-		MaxLife: 30,
-		Char:    "★",
-		Color:   "#ff0000",
-	}
-	gotBorder := pBorder.Render()
-	if gotBorder == "" {
-		t.Error("Particle at exactly 30% life should still render")
-	}
-}
-
 func TestParticleUpdate(t *testing.T) {
 	t.Parallel()
 
@@ -849,29 +806,6 @@ func TestRenderCommandCode_SyntaxHighlighting(t *testing.T) {
 // =============================================================================
 // model.go: Model accessors and helpers
 // =============================================================================
-
-func TestGetCurrentSlide(t *testing.T) {
-	t.Parallel()
-
-	m := New()
-	if m.GetCurrentSlide() != SlideWelcome {
-		t.Errorf("initial slide should be Welcome, got %v", m.GetCurrentSlide())
-	}
-
-	m2 := New(WithStartSlide(SlideComplete))
-	if m2.GetCurrentSlide() != SlideComplete {
-		t.Errorf("should be Complete, got %v", m2.GetCurrentSlide())
-	}
-}
-
-func TestIsTransitioning(t *testing.T) {
-	t.Parallel()
-
-	m := New()
-	if m.IsTransitioning() {
-		t.Error("should not be transitioning initially")
-	}
-}
 
 func TestEffectiveWidth(t *testing.T) {
 	t.Parallel()

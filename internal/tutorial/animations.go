@@ -60,23 +60,6 @@ func (p *Particle) Update() {
 	p.Life--
 }
 
-// Render returns the styled particle character
-func (p Particle) Render() string {
-	// Fade based on life
-	alpha := float64(p.Life) / float64(p.MaxLife)
-	if alpha < 0.3 {
-		return ""
-	}
-
-	color := styles.ParseHex(p.Color)
-	// Apply alpha to brightness
-	color.R = int(float64(color.R) * alpha)
-	color.G = int(float64(color.G) * alpha)
-	color.B = int(float64(color.B) * alpha)
-
-	return fmt.Sprintf("\x1b[38;2;%d;%d;%dm%s\x1b[0m", color.R, color.G, color.B, p.Char)
-}
-
 // TypingAnimation creates a typing effect for text
 type TypingAnimation struct {
 	Lines       []string

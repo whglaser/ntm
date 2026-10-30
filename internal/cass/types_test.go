@@ -42,18 +42,6 @@ func TestMetaHasMore(t *testing.T) {
 	}
 }
 
-func TestSearchResponseHasResults(t *testing.T) {
-	empty := SearchResponse{Hits: []SearchHit{}}
-	if empty.HasResults() {
-		t.Error("HasResults() should return false for empty hits")
-	}
-
-	withHits := SearchResponse{Hits: []SearchHit{{Title: "test"}}}
-	if !withHits.HasResults() {
-		t.Error("HasResults() should return true with hits")
-	}
-}
-
 func TestSearchResponseHasMore(t *testing.T) {
 	tests := []struct {
 		name string
@@ -172,28 +160,6 @@ func TestDBInfoIsUsable(t *testing.T) {
 				t.Errorf("IsUsable() = %v, want %v", got, tt.want)
 			}
 		})
-	}
-}
-
-func TestCapabilitiesHasFeature(t *testing.T) {
-	caps := Capabilities{Features: []string{"search", "timeline", "expand"}}
-
-	if !caps.HasFeature("search") {
-		t.Error("HasFeature() should return true for existing feature")
-	}
-	if caps.HasFeature("nonexistent") {
-		t.Error("HasFeature() should return false for nonexistent feature")
-	}
-}
-
-func TestCapabilitiesHasConnector(t *testing.T) {
-	caps := Capabilities{Connectors: []string{"claude-code", "codex", "cursor"}}
-
-	if !caps.HasConnector("claude-code") {
-		t.Error("HasConnector() should return true for existing connector")
-	}
-	if caps.HasConnector("nonexistent") {
-		t.Error("HasConnector() should return false for nonexistent connector")
 	}
 }
 
@@ -395,11 +361,11 @@ func TestCapabilitiesUnmarshal(t *testing.T) {
 	if caps.CrateVersion != "0.5.0" {
 		t.Errorf("CrateVersion = %q, want %q", caps.CrateVersion, "0.5.0")
 	}
-	if !caps.HasFeature("timeline") {
-		t.Error("HasFeature(timeline) should return true")
+	if len(caps.Features) != 4 || caps.Features[1] != "timeline" {
+		t.Errorf("Features = %v, want search/timeline/expand/aggregations", caps.Features)
 	}
-	if !caps.HasConnector("claude-code") {
-		t.Error("HasConnector(claude-code) should return true")
+	if len(caps.Connectors) != 4 || caps.Connectors[0] != "claude-code" {
+		t.Errorf("Connectors = %v, want claude-code first", caps.Connectors)
 	}
 	if caps.Limits.MaxResults != 100 {
 		t.Errorf("Limits.MaxResults = %d, want 100", caps.Limits.MaxResults)
