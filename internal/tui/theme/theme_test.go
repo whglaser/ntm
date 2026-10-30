@@ -217,40 +217,6 @@ func TestNewStyles(t *testing.T) {
 	}
 }
 
-func TestGradient(t *testing.T) {
-	theme := CatppuccinMocha
-
-	t.Run("fewer steps than colors", func(t *testing.T) {
-		grad := theme.Gradient(3)
-		if len(grad) != 3 {
-			t.Errorf("expected 3 colors, got %d", len(grad))
-		}
-	})
-
-	t.Run("exact steps as colors", func(t *testing.T) {
-		grad := theme.Gradient(5)
-		if len(grad) != 5 {
-			t.Errorf("expected 5 colors, got %d", len(grad))
-		}
-	})
-
-	t.Run("more steps than colors", func(t *testing.T) {
-		grad := theme.Gradient(10)
-		if len(grad) != 10 {
-			t.Errorf("expected 10 colors, got %d", len(grad))
-		}
-	})
-
-	t.Run("colors are not empty", func(t *testing.T) {
-		grad := theme.Gradient(3)
-		for i, c := range grad {
-			if c == "" {
-				t.Errorf("gradient color %d should not be empty", i)
-			}
-		}
-	})
-}
-
 func TestNoColorEnabled(t *testing.T) {
 	t.Run("returns false when NO_COLOR not set", func(t *testing.T) {
 		// Ensure NO_COLOR and NTM_NO_COLOR are not set

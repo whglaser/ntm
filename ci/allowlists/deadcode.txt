@@ -241,12 +241,6 @@ internal/tui/dashboard/panels/ticker.go:TickerPanel.Blur	bd-ld4j2	reachable only
 internal/tui/dashboard/panels/ticker.go:TickerPanel.Focus	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tui/dashboard/panels/ticker.go:TickerPanel.GetHeight	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tui/dashboard/panels/timeline.go:TimelinePanel.HasError	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tui/icons/icons.go:IconSet.StatusIcon	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tui/synthesizer/modes_view.go:ModeVisualization.Init	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tui/theme/semantic.go:SemanticPalette.AgentColor	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tui/theme/semantic.go:SemanticPalette.StatusColor	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tui/theme/semantic.go:Theme.Semantic	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tui/theme/theme.go:Theme.Gradient	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 
 # permanent: test-helper
 internal/config/liveness.go:RegisterReader	permanent	liveness_audit exclusion: called only from liveness_claims*.go, which the gate's -tags liveness_audit build drops by design (bd-ir0li)

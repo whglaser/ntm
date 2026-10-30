@@ -125,16 +125,6 @@ func TestModeVisualization_SetData_CursorClamp(t *testing.T) {
 	}
 }
 
-func TestModeVisualization_Init(t *testing.T) {
-	t.Parallel()
-
-	mv := NewModeVisualization()
-	cmd := mv.Init()
-	if cmd != nil {
-		t.Error("Init should return nil cmd")
-	}
-}
-
 func TestModeVisualization_Update_Close(t *testing.T) {
 	t.Parallel()
 

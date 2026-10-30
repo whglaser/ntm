@@ -94,9 +94,6 @@ func (m *ModeVisualization) SetData(sessionName string, sess *ensemble.EnsembleS
 	m.cursor = clampInt(m.cursor, 0, maxInt(0, assignmentCount(sess)-1))
 }
 
-// Init implements tea.Model.
-func (m ModeVisualization) Init() tea.Cmd { return nil }
-
 // Update implements tea.Model.
 func (m ModeVisualization) Update(msg tea.Msg) (ModeVisualization, tea.Cmd) {
 	switch msg := msg.(type) {

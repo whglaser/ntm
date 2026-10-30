@@ -467,11 +467,3 @@ func (i IconSet) CategoryIcon(category string) string {
 		return i.General
 	}
 }
-
-// StatusIcon returns a colored status icon string
-func (i IconSet) StatusIcon(success bool) string {
-	if success {
-		return i.Check
-	}
-	return i.Cross
-}

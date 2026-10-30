@@ -679,26 +679,3 @@ func NewStyles(t Theme) Styles {
 
 	return styles
 }
-
-// Gradient returns a slice of colors for gradient effects
-func (t Theme) Gradient(steps int) []lipgloss.Color {
-	// Simple gradient from Blue to Pink
-	colors := []lipgloss.Color{
-		t.Blue,
-		t.Sapphire,
-		t.Lavender,
-		t.Mauve,
-		t.Pink,
-	}
-
-	if steps <= len(colors) {
-		return colors[:steps]
-	}
-
-	// Repeat colors if more steps needed
-	result := make([]lipgloss.Color, steps)
-	for i := 0; i < steps; i++ {
-		result[i] = colors[i%len(colors)]
-	}
-	return result
-}

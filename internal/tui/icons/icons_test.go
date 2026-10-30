@@ -217,18 +217,6 @@ func TestCategoryIcon(t *testing.T) {
 	}
 }
 
-func TestStatusIcon(t *testing.T) {
-	t.Parallel()
-
-	icons := ASCII
-	if got := icons.StatusIcon(true); got != icons.Check {
-		t.Errorf("StatusIcon(true) = %q, want %q", got, icons.Check)
-	}
-	if got := icons.StatusIcon(false); got != icons.Cross {
-		t.Errorf("StatusIcon(false) = %q, want %q", got, icons.Cross)
-	}
-}
-
 func TestSetDefaultAndCurrent(t *testing.T) {
 	saved := Default
 	defer func() { Default = saved }()
