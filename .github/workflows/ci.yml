@@ -74,6 +74,40 @@ jobs:
         run: bash scripts/guards/tagged_vet.sh
 
   # ============================================================================
+  # TMUX ISOLATION CANARY - ntm-6c7of. The host's whole tmux server died
+  # repeatedly while tests ran; the guard in internal/tmux plus per-package
+  # TestMain isolation prevent it, and this job keeps them honest. The
+  # self-test kills a sentinel server and requires the detector to notice
+  # (a detector that cannot fire is a placebo); the focused run then requires
+  # the sentinel to survive the tmux-touching suites. Test failures are
+  # reported but do not mask the canary property (add --strict to require
+  # green tests as well once the tree is green).
+  # ============================================================================
+  tmux-isolation-canary:
+    name: Tmux Isolation Canary
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
+      - name: Canary detector self-test (must fire)
+        run: bash scripts/tmux_isolation_canary.sh --self-test
+
+      - name: Tmux isolation canary (sentinel must survive the focused set)
+        run: bash scripts/tmux_isolation_canary.sh
+
+  # ============================================================================
   # RELEASE PREFLIGHT (dry-run) - WS0-G4 release-artifact lockstep
   # (bd-ws0-guards-klz98.5). Releases are DSR-only (AGENTS.md), so this job is
   # a DRY-RUN of scripts/release_preflight.sh against the VERSION file: every
@@ -615,13 +649,14 @@ jobs:
     name: CI Success
     runs-on: ubuntu-24.04
     timeout-minutes: 5
-    needs: [reality-guards, reality-guards-go, lint, openapi-drift, test, coverage, build, security, goreleaser-check, integration, upgrade-check, vscode-extension]
+    needs: [reality-guards, reality-guards-go, tmux-isolation-canary, lint, openapi-drift, test, coverage, build, security, goreleaser-check, integration, upgrade-check, vscode-extension]
     if: always()
     steps:
       - name: Check all jobs passed
         run: |
           if [ "${{ needs.reality-guards.result }}" != "success" ] || \
              [ "${{ needs.reality-guards-go.result }}" != "success" ] || \
+             [ "${{ needs.tmux-isolation-canary.result }}" != "success" ] || \
              [ "${{ needs.lint.result }}" != "success" ] || \
              [ "${{ needs.openapi-drift.result }}" != "success" ] || \
              [ "${{ needs.test.result }}" != "success" ] || \

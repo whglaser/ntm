@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -172,5 +173,68 @@ func TestClassifyKillServerRefusalIsNotInfrastructure(t *testing.T) {
 	}
 	if class.Kind != CommandErrorCommandFailed {
 		t.Fatalf("kill-server refusal kind = %q, want %q", class.Kind, CommandErrorCommandFailed)
+	}
+}
+
+// TestClientKillsOnlyThePrivateSocketItResolves proves NewClient/DefaultClient
+// capture no socket: the server target is resolved from TMUX_TMPDIR when the
+// command runs, not when the client is built. A kill-server aimed at a fresh
+// private root must kill exactly that server (and the guard must allow it as
+// private), while the package's own TestMain server on a different root stays
+// alive (ntm-6c7of direction 4 — resolution tested, not inferred).
+func TestClientKillsOnlyThePrivateSocketItResolves(t *testing.T) {
+	bin := findInstalledTmuxBinaryPath()
+	if bin == "" {
+		t.Skip("tmux binary not installed")
+	}
+	packageRoot := strings.TrimSpace(os.Getenv("TMUX_TMPDIR"))
+	if packageRoot == "" {
+		t.Skip("package-wide tmux isolation is not active")
+	}
+
+	// The package TestMain server is reachable before the test.
+	if _, err := DefaultClient.Run("list-sessions"); err != nil {
+		t.Fatalf("package server not reachable before test: %v", err)
+	}
+
+	freshRoot, err := os.MkdirTemp(tmuxTestTempBase(), "ntm-tmux-test-*")
+	if err != nil {
+		t.Fatalf("create fresh private socket root: %v", err)
+	}
+	t.Cleanup(func() {
+		// Best-effort: if the test failed before the client's kill, do not leave
+		// a detached server on the fresh root behind.
+		kill := exec.Command(bin, "kill-server")
+		kill.Env = isolatedTmuxTestEnvironment(freshRoot)
+		_ = kill.Run()
+		_ = os.RemoveAll(freshRoot)
+	})
+
+	start := exec.Command(bin, "new-session", "-d", "-s", "resolve", "-x", "80", "-y", "24")
+	start.Env = isolatedTmuxTestEnvironment(freshRoot)
+	if out, err := start.CombinedOutput(); err != nil {
+		t.Fatalf("start fresh private server: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+
+	// Redirect the shared client at the fresh root at call time.
+	t.Setenv("TMUX", "")
+	t.Setenv("TMUX_PANE", "")
+	t.Setenv("TMUX_TMPDIR", freshRoot)
+
+	if _, err := DefaultClient.Run("kill-server"); err != nil {
+		t.Fatalf("kill-server against the private root must be allowed: %v", err)
+	}
+
+	has := exec.Command(bin, "has-session", "-t", "resolve")
+	has.Env = isolatedTmuxTestEnvironment(freshRoot)
+	if err := has.Run(); err == nil {
+		t.Fatal("the private server survived kill-server")
+	}
+
+	// Back on the package root, the package server must still be alive: the
+	// kill resolved the fresh root, it did not capture it at NewClient time.
+	t.Setenv("TMUX_TMPDIR", packageRoot)
+	if _, err := DefaultClient.Run("list-sessions"); err != nil {
+		t.Fatalf("the package server did not survive a kill aimed at a different root: %v", err)
 	}
 }

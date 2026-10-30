@@ -231,6 +231,23 @@ go test -v ./internal/tmux/...
 go test -v -run TestUpgradeAsset ./internal/cli/
 ```
 
+### Tmux Test Isolation (never kill the operator's server)
+
+A real-tmux test that acts on the ambient server can end every live session at once
+(ntm-6c7of: the host's tmux server died repeatedly while tests ran). Two invariants
+keep that impossible: package `TestMain`s call `testutil.IsolateTmuxTestProcess()`
+to run behind a private `TMUX_TMPDIR`, and `internal/tmux` refuses `kill-server`
+against the ambient/default socket unless `NTM_ALLOW_KILL_SERVER=1` is explicitly set
+(do not set it to make a test pass — isolate instead). New real-tmux packages must
+isolate the same way.
+
+Before running tmux-touching suites locally, prove the walls hold:
+
+```bash
+make tmux-canary         # sentinel survives; loud warning on test failures, fails only on ambient kills
+make tmux-canary-strict  # also requires the focused suite to pass
+```
+
 ---
 
 ## Third-Party Library Usage

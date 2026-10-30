@@ -22,7 +22,7 @@ GOFLAGS := -trimpath -tags=$(BUILD_TAGS)
 # Output directory
 DIST := dist
 
-.PHONY: all build clean install test test-short test-all test-e2e lint fmt help pre-commit upgrade-contract
+.PHONY: all build clean install test test-short test-all test-e2e tmux-canary lint fmt help pre-commit upgrade-contract
 
 all: build
 
@@ -72,6 +72,15 @@ test-all:
 ## Run E2E tests only (requires agents)
 test-e2e:
 	$(GO) test -v -count=1 -tags=e2e ./e2e/... -timeout 10m
+
+## Prove no tmux-touching test can kill the ambient/default tmux server (ntm-6c7of)
+# Runs the tmux-touching packages under -short with an ambient-shaped environment
+# pointed at a private sentinel server and fails if the sentinel does not survive.
+tmux-canary:
+	bash scripts/tmux_isolation_canary.sh
+
+tmux-canary-strict:
+	bash scripts/tmux_isolation_canary.sh --strict
 
 ## Validate upgrade asset naming contract
 upgrade-contract:
@@ -151,6 +160,7 @@ help:
 	@echo "  test        Run tests (fast, skips E2E)"
 	@echo "  test-all    Run all tests including E2E"
 	@echo "  test-e2e    Run E2E tests only (requires agents)"
+	@echo "  tmux-canary Prove tmux tests cannot kill the ambient server (ntm-6c7of)"
 	@echo "  lint        Run linter"
 	@echo "  fmt         Format code"
 	@echo "  clean       Remove build artifacts"
