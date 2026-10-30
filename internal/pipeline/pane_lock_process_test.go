@@ -3,10 +3,13 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"testing"
 	"time"
+
+	"github.com/Dicklesworthstone/ntm/tests/testutil"
 )
 
 // Environment contract for the subprocess half of the two-process test.
@@ -27,7 +30,11 @@ const (
 	paneLockHelperReadyFile = "helper-holds-lock"
 )
 
-// TestMain lets this test binary re-exec itself as the lock-holding child.
+// TestMain lets this test binary re-exec itself as the lock-holding child,
+// then isolates the package's real-tmux tests behind a private server so they
+// can never create, enumerate, or kill sessions on the developer's default
+// tmux server (ntm-6c7of).
+//
 // The unit tests model two processes with two Executors, which is faithful
 // (flock belongs to the open file description, so two descriptions contend
 // even in one process) — but ntm#324 is a two-PROCESS bug, so it is worth one
@@ -36,7 +43,17 @@ func TestMain(m *testing.M) {
 	if dir := os.Getenv(paneLockHelperEnv); dir != "" {
 		os.Exit(runPaneLockHelper(dir))
 	}
-	os.Exit(m.Run())
+	cleanupTmux, err := testutil.IsolateTmuxTestProcess()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "isolate pipeline tmux tests: %v\n", err)
+		os.Exit(1)
+	}
+	code := m.Run()
+	if err := cleanupTmux(); err != nil {
+		fmt.Fprintf(os.Stderr, "clean up isolated pipeline tmux: %v\n", err)
+		code = 1
+	}
+	os.Exit(code)
 }
 
 // runPaneLockHelper takes the pane lock, signals readiness, holds, releases.
