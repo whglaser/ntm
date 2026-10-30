@@ -197,11 +197,6 @@ func NewHistoryPanel() *HistoryPanel {
 	}
 }
 
-// HasError returns true if there's an active error
-func (m *HistoryPanel) HasError() bool {
-	return m.err != nil
-}
-
 // SetPanes provides pane metadata used for agent-type filtering and rendering targets.
 func (m *HistoryPanel) SetPanes(panes []tmux.Pane) {
 	if len(panes) == 0 {

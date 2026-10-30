@@ -333,10 +333,7 @@ internal/tools/rch.go:RCHAdapter.IsAvailable	bd-ld4j2	reachable only through RTA
 internal/tools/rch.go:RCHAdapter.SelectWorker	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tui/components/scrollable_panel.go:ScrollablePanel.AtBottom	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tui/components/scrollable_panel.go:ScrollablePanel.AtTop	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tui/components/scrollable_panel.go:ScrollablePanel.HalfPageDown	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tui/components/scrollable_panel.go:ScrollablePanel.HalfPageUp	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tui/components/scrollable_panel.go:ScrollablePanel.LineDown	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tui/components/scrollable_panel.go:ScrollablePanel.LineUp	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tui/components/spring_manager.go:SpringManager.GetDimension	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tui/components/spring_manager.go:SpringManager.GetScrollOffset	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tui/components/spring_manager.go:SpringManager.GetSmoothed	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
@@ -349,35 +346,26 @@ internal/tui/components/toast.go:ToastManager.ClearHistory	bd-ld4j2	reachable on
 internal/tui/components/toast.go:ToastManager.History	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tui/components/toast.go:ToastManager.PushProgress	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tui/components/toast.go:ToastManager.UpdateProgress	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tui/dashboard/panels/accounts.go:AccountsPanel.Refresh	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tui/dashboard/panels/attention.go:AttentionPanel.IsFeedAvailable	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tui/dashboard/panels/cass.go:CASSPanel.HandlesOwnHeight	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tui/dashboard/panels/cass.go:CASSPanel.HasError	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tui/dashboard/panels/conflicts.go:ConflictsPanel.GetConflicts	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tui/dashboard/panels/conflicts.go:ConflictsPanel.SetConflicts	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tui/dashboard/panels/cost.go:CostPanel.HandlesOwnHeight	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tui/dashboard/panels/cost.go:CostPanel.HasError	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tui/dashboard/panels/files.go:FilesPanel.HandlesOwnHeight	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tui/dashboard/panels/files.go:FilesPanel.HasError	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tui/dashboard/panels/history.go:HistoryPanel.HasError	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tui/dashboard/panels/metrics.go:MetricsPanel.HasError	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tui/dashboard/panels/panel.go:PanelBase.EndRetry	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tui/dashboard/panels/panel.go:PanelBase.HandlesOwnHeight	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tui/dashboard/panels/panel.go:PanelBase.IsRetrying	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tui/dashboard/panels/panel.go:PanelBase.MaxRetries	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tui/dashboard/panels/panel.go:PanelBase.ResetRetry	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tui/dashboard/panels/panel.go:PanelBase.RetryCount	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tui/dashboard/panels/panel.go:PanelBase.SetMaxRetries	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tui/dashboard/panels/panel.go:PanelBase.StartRetry	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tui/dashboard/panels/quota.go:QuotaPanel.Refresh	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tui/dashboard/panels/spawn.go:SpawnData.PendingCount	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tui/dashboard/panels/spawn_wizard.go:SpawnWizard.Keybindings	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tui/dashboard/panels/spawn_wizard.go:SpawnWizard.Size	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tui/dashboard/panels/ticker.go:TickerPanel.Blur	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tui/dashboard/panels/ticker.go:TickerPanel.Focus	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tui/dashboard/panels/ticker.go:TickerPanel.GetHeight	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tui/dashboard/panels/timeline.go:TimelinePanel.HasError	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tui/dashboard/panels/workflow.go:WorkflowPanel.HasData	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tui/icons/icons.go:IconSet.StatusIcon	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tui/synthesizer/modes_view.go:ModeVisualization.Init	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tui/theme/semantic.go:SemanticPalette.AgentColor	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
@@ -590,3 +578,5 @@ internal/context/pending.go:NewPendingRotationStoreWithPath	permanent	path-injec
 internal/context/predictor.go:NewContextPredictor	permanent	constructor reached by tests/e2e/context_management_test.go (live context-management e2e coverage)
 internal/context/predictor.go:DefaultPredictorConfig	permanent	config constructor reached by tests/e2e/context_management_test.go (live context-management e2e coverage)
 internal/pipeline/mock.go:MockTmuxClient.InterruptPane	ntm-l6cuz.8	test-only tmux mock; implements TmuxClient.InterruptPane used by the orphaned-turn stop path; same class as the other MockTmuxClient entries
+# permanent: compile-required interface default (bd-ld4j2 batch 6)
+internal/tui/dashboard/panels/panel.go:PanelBase.HandlesOwnHeight	permanent	default implementation required for the Panel interface: RotationConfirmPanel, QuotaPanel, RateLimitPanel, AccountsPanel, and TimelinePanel embed PanelBase and do not override it; deleting the method needs the interface method and every override removed together (bd-ld4j2)

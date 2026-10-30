@@ -66,8 +66,6 @@ func (p *WorkflowPanel) SetData(data WorkflowPanelData, err error) {
 	}
 }
 
-func (p *WorkflowPanel) HasData() bool { return p.data.State != nil || p.err != nil }
-
 func (p *WorkflowPanel) View() string {
 	if p.Width() <= 0 {
 		return ""

@@ -65,29 +65,6 @@ func (q *QuotaPanel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return q, nil
 }
 
-// Refresh fetches the latest data from the cache
-func (q *QuotaPanel) Refresh() {
-	if q.cache == nil {
-		q.data = QuotaData{Available: false}
-		return
-	}
-
-	status := q.cache.GetStatus()
-	usages := q.cache.GetAllUsage()
-	_, err := q.cache.GetLastError()
-
-	q.data = QuotaData{
-		Status:    status,
-		Usages:    usages,
-		Available: status != nil || len(usages) > 0,
-		Error:     err,
-	}
-
-	if err == nil {
-		q.SetLastUpdate(time.Now())
-	}
-}
-
 // SetData updates the panel data directly
 func (q *QuotaPanel) SetData(data QuotaData) {
 	q.data = data

@@ -120,11 +120,6 @@ func (m *MetricsPanel) SetData(data MetricsData, err error) {
 	}
 }
 
-// HasError returns true if there's an active error.
-func (m *MetricsPanel) HasError() bool {
-	return m.err != nil
-}
-
 // Keybindings returns metrics panel specific shortcuts.
 func (m *MetricsPanel) Keybindings() []Keybinding {
 	return []Keybinding{

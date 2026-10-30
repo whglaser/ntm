@@ -169,21 +169,6 @@ func (sp *ScrollablePanel) LineDown(n int) {
 	sp.vp.ScrollDown(n)
 }
 
-// LineUp scrolls up by n lines.
-func (sp *ScrollablePanel) LineUp(n int) {
-	sp.vp.ScrollUp(n)
-}
-
-// HalfPageDown scrolls down by half a viewport.
-func (sp *ScrollablePanel) HalfPageDown() {
-	sp.vp.HalfPageDown()
-}
-
-// HalfPageUp scrolls up by half a viewport.
-func (sp *ScrollablePanel) HalfPageUp() {
-	sp.vp.HalfPageUp()
-}
-
 // ScrollState returns the current scroll state for use with ScrollFooter.
 func (sp *ScrollablePanel) ScrollState() ScrollState {
 	totalLines := sp.TotalLines()

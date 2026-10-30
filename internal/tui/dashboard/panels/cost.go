@@ -121,8 +121,6 @@ func (c *CostPanel) SetData(data CostPanelData, err error) {
 	}
 }
 
-func (c *CostPanel) HasError() bool { return c.err != nil }
-
 func (c *CostPanel) HasData() bool {
 	if len(c.data.Agents) > 0 {
 		return true

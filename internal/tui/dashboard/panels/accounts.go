@@ -1,7 +1,6 @@
 package panels
 
 import (
-	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -61,34 +60,6 @@ func (a *AccountsPanel) Init() tea.Cmd {
 // Update implements tea.Model
 func (a *AccountsPanel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return a, nil
-}
-
-// Refresh fetches the latest data from CAAM
-func (a *AccountsPanel) Refresh() {
-	if a.adapter == nil {
-		a.data = AccountsData{Available: false}
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	status, err := a.adapter.GetStatus(ctx)
-	if err != nil {
-		a.data = AccountsData{
-			Available: false,
-			Error:     err,
-		}
-		return
-	}
-
-	a.data = AccountsData{
-		Status:    status,
-		Available: status != nil && status.Available,
-		Error:     nil,
-	}
-
-	a.SetLastUpdate(time.Now())
 }
 
 // SetData updates the panel data directly
