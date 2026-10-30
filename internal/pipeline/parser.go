@@ -337,6 +337,11 @@ func Validate(w *Workflow) ValidationResult {
 
 	validateSettings(w.Settings, &result)
 
+	// Optional provisioning block (ntm-pnc64.1): validate the exact pane
+	// layout here so lint and --dry-run reject a plan the runner could not
+	// provision before any tmux mutation.
+	validateProvision(w.Provision, &result)
+
 	// Validate steps
 	stepIDs := make(map[string]bool)
 	for i, step := range w.Steps {
