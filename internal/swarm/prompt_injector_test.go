@@ -162,39 +162,13 @@ func TestNewPromptInjector(t *testing.T) {
 	}
 }
 
-func TestGetTemplate(t *testing.T) {
-	injector := NewPromptInjector()
-
-	tests := []struct {
-		name        string
-		expectEmpty bool
-	}{
-		{"default", false},
-		{"review", false},
-		{"test", false},
-		{"nonexistent", false}, // Falls back to default
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			tmpl := injector.GetTemplate(tt.name)
-			if tt.expectEmpty && tmpl != "" {
-				t.Errorf("expected empty template for %q, got %q", tt.name, tmpl)
-			}
-			if !tt.expectEmpty && tmpl == "" {
-				t.Errorf("expected non-empty template for %q", tt.name)
-			}
-		})
-	}
-}
-
-func TestSetTemplate(t *testing.T) {
+func TestTemplateMapCustomization(t *testing.T) {
 	injector := NewPromptInjector()
 
 	customTemplate := "This is a custom template"
-	injector.SetTemplate("custom", customTemplate)
+	injector.Templates["custom"] = customTemplate
 
-	result := injector.GetTemplate("custom")
+	result := injector.Templates["custom"]
 	if result != customTemplate {
 		t.Errorf("expected template %q, got %q", customTemplate, result)
 	}
@@ -224,15 +198,11 @@ func TestNeedsDoubleEnter(t *testing.T) {
 	}
 }
 
-func TestWithStaggerDelay(t *testing.T) {
+func TestStaggerDelayField(t *testing.T) {
 	injector := NewPromptInjector()
 	customDelay := 500 * time.Millisecond
 
-	result := injector.WithStaggerDelay(customDelay)
-
-	if result != injector {
-		t.Error("WithStaggerDelay should return the same injector for chaining")
-	}
+	injector.StaggerDelay = customDelay
 
 	if injector.StaggerDelay != customDelay {
 		t.Errorf("expected StaggerDelay of %v, got %v", customDelay, injector.StaggerDelay)
@@ -306,21 +276,9 @@ func TestBatchInjectionResult(t *testing.T) {
 	}
 }
 
-func TestInjectSwarmNilPlan(t *testing.T) {
-	injector := NewPromptInjector()
-	result, err := injector.InjectSwarm(nil, "test prompt")
-
-	if err == nil {
-		t.Error("expected error for nil plan")
-	}
-	if result != nil {
-		t.Error("expected nil result for nil plan")
-	}
-}
-
 func TestInjectBatchEmpty(t *testing.T) {
 	injector := NewPromptInjector()
-	result, err := injector.InjectBatch([]InjectionTarget{}, "test prompt")
+	result, err := injector.InjectBatchWithContext(context.Background(), []InjectionTarget{}, "test prompt")
 
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
@@ -384,7 +342,8 @@ func TestPromptInjector_GrokDirectPathsDeliverViaTmux(t *testing.T) {
 // pane — grok included — is delivered to, exactly like claude/codex.
 func TestPromptInjector_MixedBatchDeliversToGrok(t *testing.T) {
 	client := &countingPromptInjectionTmuxClient{captureOutput: "ready>\n"}
-	injector := NewPromptInjector().WithStaggerDelay(0)
+	injector := NewPromptInjector()
+	injector.StaggerDelay = 0
 	injector.tmuxClientOverride = client
 	injector.EnterDelay = 0
 	injector.DoubleEnterDelay = 0
@@ -447,42 +406,34 @@ func TestPromptTemplateConstants(t *testing.T) {
 	}
 }
 
-func TestWithRateLimitTracker(t *testing.T) {
+func TestRateLimitTrackerField(t *testing.T) {
 	injector := NewPromptInjector()
 	tracker := ratelimit.NewRateLimitTracker("")
 
-	result := injector.WithRateLimitTracker(tracker)
-
-	if result != injector {
-		t.Error("WithRateLimitTracker should return the same injector for chaining")
-	}
+	injector.RateLimitTracker = tracker
 
 	if injector.RateLimitTracker != tracker {
 		t.Error("expected RateLimitTracker to be set")
 	}
 }
 
-func TestWithAdaptiveDelay(t *testing.T) {
+func TestAdaptiveDelayField(t *testing.T) {
 	injector := NewPromptInjector()
 
-	result := injector.WithAdaptiveDelay(true)
-
-	if result != injector {
-		t.Error("WithAdaptiveDelay should return the same injector for chaining")
-	}
-
+	injector.UseAdaptiveDelay = true
 	if !injector.UseAdaptiveDelay {
 		t.Error("expected UseAdaptiveDelay to be true")
 	}
 
-	injector.WithAdaptiveDelay(false)
+	injector.UseAdaptiveDelay = false
 	if injector.UseAdaptiveDelay {
 		t.Error("expected UseAdaptiveDelay to be false")
 	}
 }
 
 func TestGetDelayForAgentFixed(t *testing.T) {
-	injector := NewPromptInjector().WithStaggerDelay(500 * time.Millisecond)
+	injector := NewPromptInjector()
+	injector.StaggerDelay = 500 * time.Millisecond
 
 	delay := injector.GetDelayForAgent("cc")
 
@@ -493,9 +444,9 @@ func TestGetDelayForAgentFixed(t *testing.T) {
 
 func TestGetDelayForAgentAdaptive(t *testing.T) {
 	tracker := ratelimit.NewRateLimitTracker("")
-	injector := NewPromptInjector().
-		WithRateLimitTracker(tracker).
-		WithAdaptiveDelay(true)
+	injector := NewPromptInjector()
+	injector.RateLimitTracker = tracker
+	injector.UseAdaptiveDelay = true
 
 	// Default anthropic delay is 15s
 	delay := injector.GetDelayForAgent("cc")
@@ -514,9 +465,9 @@ func TestGetDelayForAgentAdaptive(t *testing.T) {
 
 func TestRecordSuccess(t *testing.T) {
 	tracker := ratelimit.NewRateLimitTracker("")
-	injector := NewPromptInjector().
-		WithRateLimitTracker(tracker).
-		WithAdaptiveDelay(true)
+	injector := NewPromptInjector()
+	injector.RateLimitTracker = tracker
+	injector.UseAdaptiveDelay = true
 
 	// Record multiple successes
 	for i := 0; i < 10; i++ {
@@ -535,7 +486,8 @@ func TestRecordSuccess(t *testing.T) {
 }
 
 func TestRecordSuccessNoOpWithoutTracker(t *testing.T) {
-	injector := NewPromptInjector().WithAdaptiveDelay(true)
+	injector := NewPromptInjector()
+	injector.UseAdaptiveDelay = true
 
 	// Should not panic when tracker is nil
 	injector.recordSuccess("cc")
@@ -543,9 +495,9 @@ func TestRecordSuccessNoOpWithoutTracker(t *testing.T) {
 
 func TestRecordSuccessNoOpWithoutAdaptiveDelay(t *testing.T) {
 	tracker := ratelimit.NewRateLimitTracker("")
-	injector := NewPromptInjector().
-		WithRateLimitTracker(tracker).
-		WithAdaptiveDelay(false)
+	injector := NewPromptInjector()
+	injector.RateLimitTracker = tracker
+	injector.UseAdaptiveDelay = false
 
 	injector.recordSuccess("cc")
 
@@ -579,44 +531,13 @@ func TestInjectBatchWithContextCancellation(t *testing.T) {
 	}
 }
 
-func TestInjectSwarmWithContext(t *testing.T) {
-	injector := NewPromptInjector()
-
-	// Create a cancelled context
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	plan := &SwarmPlan{
-		Sessions: []SessionSpec{
-			{
-				Name:      "test",
-				AgentType: "cc",
-				PaneCount: 2,
-				Panes: []PaneSpec{
-					{Index: 1, AgentType: "cc"},
-					{Index: 2, AgentType: "cc"},
-				},
-			},
-		},
-	}
-
-	result, err := injector.InjectSwarmWithContext(ctx, plan, "test prompt")
-
-	if err == nil {
-		t.Error("expected error for cancelled context")
-	}
-
-	if result == nil {
-		t.Fatal("expected non-nil result")
-	}
-}
-
 // TestPromptInjector_StaggeredDeliveryTiming tests the timing of staggered delivery.
 // It verifies that the stagger delay is actually applied between sends.
 func TestPromptInjector_StaggeredDeliveryTiming(t *testing.T) {
 	t.Log("[TEST] Starting staggered delivery timing test")
 
-	injector := NewPromptInjector().WithStaggerDelay(50 * time.Millisecond)
+	injector := NewPromptInjector()
+	injector.StaggerDelay = 50 * time.Millisecond
 
 	t.Logf("[TEST] Configured stagger delay: %v", injector.StaggerDelay)
 	t.Logf("[TEST] Expected minimum total time for 3 panes with 2 gaps: %v", 2*50*time.Millisecond)
@@ -718,7 +639,7 @@ func TestPromptInjector_ReviewModePrompts(t *testing.T) {
 	injector := NewPromptInjector()
 
 	// Get the review template
-	reviewPrompt := injector.GetTemplate("review")
+	reviewPrompt := injector.Templates["review"]
 	t.Logf("[TEST] Review template length: %d chars", len(reviewPrompt))
 	t.Logf("[TEST] Review template first 50 chars: %q", reviewPrompt[:min(50, len(reviewPrompt))])
 
@@ -748,7 +669,7 @@ func TestPromptInjector_TestModePrompts(t *testing.T) {
 	injector := NewPromptInjector()
 
 	// Get the test template
-	testPrompt := injector.GetTemplate("test")
+	testPrompt := injector.Templates["test"]
 	t.Logf("[TEST] Test template length: %d chars", len(testPrompt))
 
 	// Verify test template contains expected content
@@ -770,7 +691,7 @@ func TestPromptInjector_DefaultMarchingOrdersContent(t *testing.T) {
 
 	injector := NewPromptInjector()
 
-	defaultPrompt := injector.GetTemplate("default")
+	defaultPrompt := injector.Templates["default"]
 	t.Logf("[TEST] Default template length: %d chars", len(defaultPrompt))
 
 	// Verify default template contains expected content
@@ -798,9 +719,9 @@ func TestPromptInjector_AdaptiveDelayWithDifferentProviders(t *testing.T) {
 	t.Log("[TEST] Testing adaptive delay with different providers")
 
 	tracker := ratelimit.NewRateLimitTracker("")
-	injector := NewPromptInjector().
-		WithRateLimitTracker(tracker).
-		WithAdaptiveDelay(true)
+	injector := NewPromptInjector()
+	injector.RateLimitTracker = tracker
+	injector.UseAdaptiveDelay = true
 
 	t.Log("[TEST] Adaptive delay enabled with rate limit tracker")
 
@@ -874,43 +795,6 @@ func TestPromptInjector_EnterDelayConfiguration(t *testing.T) {
 }
 
 // TestPromptInjector_InjectSwarmWithTemplate tests injection with named templates.
-func TestPromptInjector_InjectSwarmWithTemplate(t *testing.T) {
-	t.Log("[TEST] Testing InjectSwarmWithTemplate")
-
-	injector := NewPromptInjector()
-
-	// Create a cancelled context to avoid actual tmux calls
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	plan := &SwarmPlan{
-		Sessions: []SessionSpec{
-			{
-				Name:      "test",
-				AgentType: "cc",
-				PaneCount: 1,
-				Panes: []PaneSpec{
-					{Index: 1, AgentType: "cc"},
-				},
-			},
-		},
-	}
-
-	// Test with "review" template
-	t.Log("[TEST] Testing with 'review' template")
-	_, err := injector.InjectSwarmWithContext(ctx, plan, injector.GetTemplate("review"))
-	if err == nil {
-		t.Log("[TEST] Note: no error expected here would mean actual tmux calls succeeded")
-	}
-
-	// Test with "test" template
-	t.Log("[TEST] Testing with 'test' template")
-	_, err = injector.InjectSwarmWithContext(ctx, plan, injector.GetTemplate("test"))
-	if err == nil {
-		t.Log("[TEST] Note: no error expected here would mean actual tmux calls succeeded")
-	}
-}
-
 // TestPromptInjector_BatchResultTracking tests batch injection result tracking.
 func TestPromptInjector_BatchResultTracking(t *testing.T) {
 	t.Log("[TEST] Testing batch injection result tracking")
@@ -1012,11 +896,10 @@ func TestPromptInjector_ChainedConfiguration(t *testing.T) {
 
 	tracker := ratelimit.NewRateLimitTracker("")
 
-	injector := NewPromptInjector().
-		WithStaggerDelay(250 * time.Millisecond).
-		WithRateLimitTracker(tracker).
-		WithAdaptiveDelay(true).
-		WithLogger(nil)
+	injector := NewPromptInjector().WithLogger(nil)
+	injector.StaggerDelay = 250 * time.Millisecond
+	injector.RateLimitTracker = tracker
+	injector.UseAdaptiveDelay = true
 
 	t.Log("[TEST] Created injector with chained configuration")
 	t.Logf("[TEST] StaggerDelay: %v", injector.StaggerDelay)

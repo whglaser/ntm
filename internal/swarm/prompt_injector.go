@@ -141,25 +141,6 @@ func (p *PromptInjector) WithLogger(logger *slog.Logger) *PromptInjector {
 	return p
 }
 
-// WithStaggerDelay sets a custom stagger delay and returns the PromptInjector for chaining.
-func (p *PromptInjector) WithStaggerDelay(delay time.Duration) *PromptInjector {
-	p.StaggerDelay = delay
-	return p
-}
-
-// WithRateLimitTracker sets a rate limit tracker for adaptive delays.
-func (p *PromptInjector) WithRateLimitTracker(tracker *ratelimit.RateLimitTracker) *PromptInjector {
-	p.RateLimitTracker = tracker
-	return p
-}
-
-// WithAdaptiveDelay enables or disables adaptive delay learning.
-// When enabled, the RateLimitTracker must be set.
-func (p *PromptInjector) WithAdaptiveDelay(enabled bool) *PromptInjector {
-	p.UseAdaptiveDelay = enabled
-	return p
-}
-
 // tmuxClient returns the configured tmux client or the default client.
 func (p *PromptInjector) tmuxClient() promptInjectionTmuxClient {
 	if p.tmuxClientOverride != nil {
@@ -197,20 +178,6 @@ func (p *PromptInjector) recordSuccess(agentType string) {
 	}
 }
 
-// GetTemplate returns the prompt template by name.
-// Returns the default template if the name is not found.
-func (p *PromptInjector) GetTemplate(name string) string {
-	if tmpl, ok := p.Templates[name]; ok {
-		return tmpl
-	}
-	return p.Templates["default"]
-}
-
-// SetTemplate sets a named template.
-func (p *PromptInjector) SetTemplate(name, template string) {
-	p.Templates[name] = template
-}
-
 // InjectPrompt sends a prompt to a single pane.
 // agentType is used to handle agent-specific quirks (e.g., Codex needs double-Enter).
 // This method satisfies the ensemble.BasicInjector interface.
@@ -246,12 +213,6 @@ func (p *PromptInjector) InjectPromptContext(ctx context.Context, sessionPane, a
 		"success", true)
 
 	return nil
-}
-
-// InjectPromptWithResult sends a prompt to a single pane and returns detailed result.
-// agentType is used to handle agent-specific quirks (e.g., Codex needs double-Enter).
-func (p *PromptInjector) InjectPromptWithResult(sessionPane, agentType, prompt string) (*InjectionResult, error) {
-	return p.InjectPromptWithResultContext(context.Background(), sessionPane, agentType, prompt)
 }
 
 // InjectPromptWithResultContext retains a failed receipt when interrupted.
@@ -408,12 +369,6 @@ func (p *PromptInjector) WaitForReady(ctx context.Context, target, agentType str
 
 // needsDoubleEnter is removed, now uses tmux.AgentType.NeedsDoubleEnter()
 
-// InjectBatch sends prompts to multiple panes with staggering.
-// All targets receive the same prompt.
-func (p *PromptInjector) InjectBatch(targets []InjectionTarget, prompt string) (*BatchInjectionResult, error) {
-	return p.InjectBatchWithContext(context.Background(), targets, prompt)
-}
-
 // InjectBatchWithContext sends prompts to multiple panes with staggering and context support.
 // All targets receive the same prompt. The operation can be cancelled via context.
 // When UseAdaptiveDelay is true, delays are obtained from the RateLimitTracker.
@@ -516,116 +471,4 @@ func validatePromptInjectionTarget(target InjectionTarget) error {
 		return fmt.Errorf("pane %s (%s) does not support automated prompt delivery: %w", target.SessionPane, agentType.Canonical(), err)
 	}
 	return nil
-}
-
-// InjectSwarm sends marching orders to all panes in a SwarmPlan.
-// Each pane receives the same prompt.
-func (p *PromptInjector) InjectSwarm(plan *SwarmPlan, prompt string) (*BatchInjectionResult, error) {
-	return p.InjectSwarmWithContext(context.Background(), plan, prompt)
-}
-
-func (p *PromptInjector) sessionOrchestrator() *SessionOrchestrator {
-	if p.SessionOrchestrator != nil {
-		return p.SessionOrchestrator
-	}
-	return NewSessionOrchestrator()
-}
-
-// InjectSwarmWithContext sends marching orders to all panes in a SwarmPlan with context support.
-// Each pane receives the same prompt. The operation can be cancelled via context.
-func (p *PromptInjector) InjectSwarmWithContext(ctx context.Context, plan *SwarmPlan, prompt string) (*BatchInjectionResult, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if plan == nil {
-		return nil, fmt.Errorf("plan cannot be nil")
-	}
-
-	// Build targets from plan
-	orch := p.sessionOrchestrator()
-	var targets []InjectionTarget
-	for _, sessionSpec := range plan.Sessions {
-		targeting, err := orch.resolveTargeting(ctx, sessionSpec.Name)
-		targetingOK := err == nil
-		if err != nil {
-			p.logger().Warn("[PromptInjector] session_targeting_resolve_failed",
-				"session", sessionSpec.Name,
-				"error", err)
-		}
-
-		for _, paneSpec := range sessionSpec.Panes {
-			sessionPane := formatPaneTarget(sessionSpec.Name, paneSpec.Index)
-			if targetingOK {
-				if resolved, err := swarmPaneTargetFromPlanIndex(sessionSpec.Name, targeting, paneSpec.Index); err == nil {
-					sessionPane = resolved
-				} else {
-					p.logger().Warn("[PromptInjector] pane_target_resolve_failed",
-						"session", sessionSpec.Name,
-						"pane_index", paneSpec.Index,
-						"error", err)
-				}
-			}
-
-			target := InjectionTarget{
-				SessionPane: sessionPane,
-				AgentType:   paneSpec.AgentType,
-			}
-			targets = append(targets, target)
-		}
-	}
-
-	p.logger().Info("[PromptInjector] swarm_inject_start",
-		"total_sessions", len(plan.Sessions),
-		"total_panes", len(targets))
-
-	result, err := p.InjectBatchWithContext(ctx, targets, prompt)
-
-	p.logger().Info("[PromptInjector] swarm_inject_complete",
-		"successful", result.Successful,
-		"failed", result.Failed,
-		"duration", result.Duration)
-
-	return result, err
-}
-
-// InjectSwarmWithTemplate sends marching orders using a named template.
-func (p *PromptInjector) InjectSwarmWithTemplate(plan *SwarmPlan, templateName string) (*BatchInjectionResult, error) {
-	prompt := p.GetTemplate(templateName)
-	return p.InjectSwarm(plan, prompt)
-}
-
-// InjectToSession sends a prompt to all agent panes in a session.
-// It fetches pane information from tmux and sends to all non-user panes.
-func (p *PromptInjector) InjectToSession(session, prompt string) (*BatchInjectionResult, error) {
-	return p.InjectToSessionWithContext(context.Background(), session, prompt)
-}
-
-// InjectToSessionWithContext sends a prompt to all agent panes in a session with context support.
-// It fetches pane information from tmux and sends to all non-user panes.
-func (p *PromptInjector) InjectToSessionWithContext(ctx context.Context, session, prompt string) (*BatchInjectionResult, error) {
-	client := p.tmuxClient()
-
-	panes, err := client.GetPanesContext(ctx, session)
-	if err != nil {
-		return nil, fmt.Errorf("get panes for session %q: %w", session, err)
-	}
-
-	var targets []InjectionTarget
-	for _, pane := range panes {
-		// Skip user panes
-		if pane.Type == tmux.AgentUser {
-			continue
-		}
-
-		targets = append(targets, InjectionTarget{
-			SessionPane: pane.ID,
-			AgentType:   string(pane.Type),
-		})
-	}
-
-	p.logger().Info("[PromptInjector] session_inject_start",
-		"session", session,
-		"agent_panes", len(targets))
-
-	return p.InjectBatchWithContext(ctx, targets, prompt)
 }
