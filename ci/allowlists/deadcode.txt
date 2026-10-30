@@ -17,12 +17,6 @@
 # interface value) with no call path from ./cmd/ntm, found by
 # scripts/guards/reflectdead at the 2026-10-05 first run, linux/darwin/windows
 # intersected. New ones fail the gate; fixing one means deleting its line.
-internal/agentmail/client.go:Client.InvalidateCache	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/agentmail/client.go:Client.ProjectKey	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/agentmail/client.go:Client.SetProjectKey	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/agentmail/tools.go:Client.ContactHandshake	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/agentmail/tools.go:Client.PrepareThread	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/agentmail/tools.go:Client.StartSession	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/agentsession/discover.go:Discoverer.Discover	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/alerts/types.go:Alert.IsResolved	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/assignment/store.go:AssignmentStore.Assign	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
@@ -507,3 +501,7 @@ internal/ratelimit/tracker.go:RateLimitTracker.GetAllProviders	permanent	test-in
 internal/ratelimit/tracker.go:RateLimitTracker.GetRecentEvents	permanent	test-inspection accessor for recorded events: reached by internal/ratelimit/tracker_test.go (TestGetRecentEvents, TestGetRecentEvents_Empty)
 internal/ratelimit/tracker.go:RateLimitTracker.Reset	permanent	tracker test reset helper: reached by internal/ratelimit/tracker_test.go (TestReset)
 internal/ratelimit/tracker.go:RateLimitTracker.ResetAll	permanent	tracker test reset helper: reached by internal/ratelimit/tracker_test.go (TestResetAll)
+# permanent: test-helper (bd-ld4j2 batch 17)
+internal/agentmail/client.go:Client.InvalidateCache	permanent	test reset hook for the availability cache: reached by internal/agentmail/client_test.go (TestInvalidateCache)
+internal/agentmail/client.go:Client.ProjectKey	permanent	test-inspection accessor for live client configuration: reached by internal/serve/server_test.go (mail-client project-key assertions) and internal/agentmail/client_test.go
+internal/agentmail/client.go:Client.SetProjectKey	permanent	test fixture for live client reconfiguration: reached by internal/serve/mail_test.go and internal/agentmail/client_test.go

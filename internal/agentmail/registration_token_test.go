@@ -220,47 +220,6 @@ func TestContactToolsAttachCorrectRegistrationToken(t *testing.T) {
 	}
 }
 
-func TestContactHandshakeAttachesRequesterAndTargetTokens(t *testing.T) {
-	t.Parallel()
-
-	var requesterToken atomic.Value // string
-	var targetToken atomic.Value    // string
-	server := httptest.NewServer(mockMCPHandler(t, map[string]func(args map[string]interface{}) (interface{}, *JSONRPCError){
-		"macro_contact_handshake": func(args map[string]interface{}) (interface{}, *JSONRPCError) {
-			req, _ := args["requester_registration_token"].(string)
-			tgt, _ := args["target_registration_token"].(string)
-			requesterToken.Store(req)
-			targetToken.Store(tgt)
-			return ContactHandshakeResult{ContactStatus: "approved"}, nil
-		},
-	}))
-	defer server.Close()
-
-	c := NewClient(WithBaseURL(server.URL + "/"))
-	c.SetRegistrationToken("/abs/project", "GreenCastle", "TOK-REQUESTER")
-	c.SetRegistrationToken("/abs/project", "BlueLake", "TOK-TARGET")
-
-	if _, err := c.ContactHandshake(context.Background(), ContactHandshakeOptions{
-		ProjectKey: "/abs/project",
-		AgentName:  "GreenCastle",
-		ToAgent:    "BlueLake",
-		AutoAccept: true,
-		TTLSeconds: 3600,
-		Reason:     "test",
-		Program:    "codex",
-		Model:      "gpt-5",
-	}); err != nil {
-		t.Fatalf("macro_contact_handshake failed: %v", err)
-	}
-
-	if got, _ := requesterToken.Load().(string); got != "TOK-REQUESTER" {
-		t.Errorf("requester_registration_token = %q, want TOK-REQUESTER", got)
-	}
-	if got, _ := targetToken.Load().(string); got != "TOK-TARGET" {
-		t.Errorf("target_registration_token = %q, want TOK-TARGET", got)
-	}
-}
-
 // TestAttachRegistrationToken_OmittedForUnknownAgent verifies that we
 // don't invent or leak a token onto calls for agents we don't have one
 // for — that would make the server's auth check meaningless.
