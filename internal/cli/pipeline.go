@@ -243,6 +243,7 @@ func newPipelineRunCmd() *cobra.Command {
 		background    bool
 		startFromStep string
 		fromState     string
+		provision     bool
 	)
 
 	cmd := &cobra.Command{
@@ -269,7 +270,10 @@ Examples:
   ntm pipeline run workflow.yaml --session proj --dry-run
 
   # Run in background
-  ntm pipeline run workflow.yaml --session proj --background`,
+  ntm pipeline run workflow.yaml --session proj --background
+
+  # Provision the workflow's declared session/agent layout, then run
+  ntm pipeline run workflow.yaml --session proj --provision`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			workflowFile := args[0]
@@ -287,13 +291,27 @@ Examples:
 				return err
 			}
 
-			res, err := resolvePipelineSession(session, cmd.OutOrStdout())
+			// --provision may create the session, so a missing name is a valid
+			// target instead of the usual hard error; prefix ambiguity still
+			// fails. The project dir falls back to the workspace because a
+			// not-yet-created session has no live panes to inspect.
+			var res SessionResolution
+			var err error
+			if provision {
+				res, err = resolvePipelineProvisionSession(cmd.Context(), session, cmd.OutOrStdout())
+			} else {
+				res, err = resolvePipelineSession(session, cmd.OutOrStdout())
+			}
 			if err != nil {
 				return err
 			}
 			session = res.Session
 
-			projectDir, err := resolvePipelineProjectDirForSession(cmd.Context(), session)
+			projectDirFn := resolvePipelineProjectDirForSession
+			if provision {
+				projectDirFn = resolveWorkspaceProjectDirForExplicitSession
+			}
+			projectDir, err := projectDirFn(cmd.Context(), session)
 			if err != nil {
 				return err
 			}
@@ -301,6 +319,30 @@ Examples:
 			vars, err := parsePipelineRunVariables(varsFile, varsFlag)
 			if err != nil {
 				return err
+			}
+
+			// Provisioning (ntm-pnc64.1) runs in this process before any
+			// execution path, so foreground, background, and JSON runs all
+			// start from a satisfied layout. With --dry-run it only prints the
+			// plan and never touches tmux. JSON mode keeps stdout machine-only.
+			if provision {
+				provisionOut := cmd.OutOrStdout()
+				if jsonOutput {
+					provisionOut = io.Discard
+				}
+				wf, validation, loadErr := pipeline.LoadAndValidate(workflowPath)
+				if loadErr != nil {
+					return fmt.Errorf("failed to load workflow: %w", loadErr)
+				}
+				if !validation.Valid {
+					for _, e := range validation.Errors {
+						fmt.Fprintf(os.Stderr, "  ❌ %s\n", e.Message)
+					}
+					return fmt.Errorf("workflow validation failed")
+				}
+				if err := runPipelineProvision(cmd.Context(), wf, session, projectDir, dryRun, provisionOut); err != nil {
+					return err
+				}
 			}
 
 			// JSON mode
@@ -481,6 +523,7 @@ Examples:
 	cmd.Flags().BoolVarP(&background, "background", "b", false, "Run in background")
 	cmd.Flags().StringVar(&startFromStep, "start-from", "", "Begin execution at the given step ID; transitive dependencies are marked Skipped")
 	cmd.Flags().StringVar(&fromState, "from-state", "", "Run ID whose persisted outputs should be reused for steps skipped by --start-from")
+	cmd.Flags().BoolVar(&provision, "provision", false, "Create/verify the session and agent panes declared by the workflow's provision block before running")
 
 	return cmd
 }

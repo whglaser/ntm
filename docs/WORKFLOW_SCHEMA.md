@@ -7,6 +7,7 @@ NTM workflows define multi-step automation pipelines for orchestrating AI agents
 - [Quick Start](#quick-start)
 - [Custom Orchestration Templates](#custom-orchestration-templates)
 - [Root Structure](#root-structure)
+- [Session Provisioning](#session-provisioning)
 - [Variables](#variables)
 - [Settings](#settings)
 - [Steps](#steps)
@@ -311,10 +312,61 @@ settings:                      # Optional: Global settings
   on_error: fail
   notify_on_complete: true
 
+provision:                     # Optional: session/agent layout for --provision
+  user_pane: true
+  agents:
+    - pane: 2
+      agent: pi
+
 steps:                         # Required: Step definitions
   - id: step_id
     # ... step configuration
 ```
+
+## Session Provisioning
+
+`ntm pipeline run` normally requires the session to exist. An optional
+`provision:` block declares the session and agent-pane layout the workflow
+needs, and `--provision` satisfies it before the run starts:
+
+```yaml
+provision:
+  user_pane: true            # reserve pane 1 for the operator shell
+  agents:
+    - pane: 2                # explicit pane index; entries must be ascending
+      agent: pi
+      model: azure-foundry/DeepSeek-V4.1-Flash
+      effort: max
+    - count: 5               # or a run of identical panes starting at the next index
+      agent: pi
+      model: FW-GLM-5.3-Flash
+      effort: max
+```
+
+```bash
+ntm pipeline run security-design-review.yaml --session sdr --provision
+```
+
+Rules:
+
+- Each entry needs `pane` or `count`, never both. Entries are consumed in
+  order: the next declared pane must be exactly the next index after the
+  previous entry, so the layout is contiguous and gap-free. `user_pane: true`
+  reserves pane 1 and starts agents at pane 2; otherwise agents start at 1.
+- `agent` accepts the same names as step `agent:` fields. `model` and `effort`
+  are passed to the same launch path `ntm spawn` uses, so launch specs, pane
+  titles, and readiness gates are identical.
+- The block is inert without `--provision`. `ntm pipeline lint` and
+  `pipeline run --dry-run` validate it; `--provision --dry-run` prints the
+  plan without touching tmux.
+- Provisioning is idempotent: a session that already hosts the declared
+  agents is a no-op; a session whose declared panes are all bare shells or
+  missing is filled; a pane occupied by a different agent, a service, or a
+  dead process fails the run loudly instead of being clobbered. Because tmux
+  cannot insert panes below the end of a layout, a missing index below an
+  existing pane is also a hard error.
+- After provisioning, every declared agent pane must become delivery-ready
+  within a generous retrying window (90s) before the first step dispatches.
 
 ## Variables
 

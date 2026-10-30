@@ -42,6 +42,12 @@ type Workflow struct {
 	// paths produce slog warnings but never flip pipeline status.
 	Outputs []OutputDecl `yaml:"outputs,omitempty" toml:"outputs,omitempty" json:"outputs,omitempty"`
 
+	// Provision declares the optional session/agent layout that
+	// `ntm pipeline run --provision` must satisfy before executing the
+	// workflow (ntm-pnc64.1). The block is inert without the flag; validation
+	// lives in provision.go so lint rejects unusable layouts.
+	Provision *ProvisionSpec `yaml:"provision,omitempty" toml:"provision,omitempty" json:"provision,omitempty"`
+
 	// Global settings
 	Settings WorkflowSettings `yaml:"settings,omitempty" toml:"settings,omitempty" json:"settings,omitempty"`
 
