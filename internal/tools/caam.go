@@ -523,15 +523,6 @@ func (a *CAAMAdapter) GetAccounts(ctx context.Context) ([]CAAMAccount, error) {
 	return status.Accounts, nil
 }
 
-// GetActiveAccount returns the currently active account
-func (a *CAAMAdapter) GetActiveAccount(ctx context.Context) (*CAAMAccount, error) {
-	status, err := a.GetStatus(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return status.ActiveAccount, nil
-}
-
 // GetCurrentCredentials returns credential information for the active account of a provider.
 // CAAM does not expose credentials through the removed `creds` command. Its
 // supported machine-readable source is `caam robot paths`, whose provider IDs

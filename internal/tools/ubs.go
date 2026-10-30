@@ -3,7 +3,6 @@ package tools
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -137,67 +136,4 @@ type UBSScanResult struct {
 	Low        int          `json:"low"`
 	Info       int          `json:"info"`
 	ScanTime   string       `json:"scan_time,omitempty"`
-}
-
-// Scan runs UBS on a path and returns findings
-func (a *UBSAdapter) Scan(ctx context.Context, path string) (*UBSScanResult, error) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute) // Scans can take time
-	defer cancel()
-
-	args := []string{"scan", "--json"}
-	if path != "" {
-		args = append(args, path)
-	}
-
-	cmd := exec.CommandContext(ctx, a.BinaryName(), args...)
-	cmd.WaitDelay = time.Second
-	stdout := NewLimitedBuffer(10 * 1024 * 1024)
-	var stderr bytes.Buffer
-	cmd.Stdout = stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return nil, ErrTimeout
-		}
-		// Non-zero exit is normal if findings exist
-		// Only error if no output
-		if stdout.Len() == 0 {
-			return nil, fmt.Errorf("ubs scan failed: %w: %s", err, stderr.String())
-		}
-	}
-
-	output := stdout.Bytes()
-	if !json.Valid(output) {
-		return nil, fmt.Errorf("ubs returned invalid JSON: %s", string(output))
-	}
-
-	var result UBSScanResult
-	if err := json.Unmarshal(output, &result); err != nil {
-		return nil, fmt.Errorf("failed to parse ubs scan result: %w", err)
-	}
-
-	return &result, nil
-}
-
-// Doctor runs UBS diagnostics
-func (a *UBSAdapter) Doctor(ctx context.Context) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, a.Timeout())
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, a.BinaryName(), "doctor")
-	cmd.WaitDelay = time.Second
-	stdout := NewLimitedBuffer(10 * 1024 * 1024)
-	var stderr bytes.Buffer
-	cmd.Stdout = stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return "", ErrTimeout
-		}
-		return "", fmt.Errorf("ubs doctor failed: %w: %s", err, stderr.String())
-	}
-
-	return stdout.String(), nil
 }

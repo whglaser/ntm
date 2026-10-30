@@ -3,10 +3,8 @@ package tools
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"os/exec"
-	"strings"
 	"time"
 )
 
@@ -104,50 +102,3 @@ func (a *ACFSAdapter) Info(ctx context.Context) (*ToolInfo, error) {
 }
 
 // ACFS-specific methods
-
-// GetInfo returns system overview information
-func (a *ACFSAdapter) GetInfo(ctx context.Context) (json.RawMessage, error) {
-	return a.runCommand(ctx, "info", "--json")
-}
-
-// Doctor runs system health check
-func (a *ACFSAdapter) Doctor(ctx context.Context) (json.RawMessage, error) {
-	return a.runCommand(ctx, "doctor", "--json")
-}
-
-// GetStatus returns installation progress status
-func (a *ACFSAdapter) GetStatus(ctx context.Context) (json.RawMessage, error) {
-	return a.runCommand(ctx, "status", "--json")
-}
-
-// runCommand executes an acfs command and returns raw JSON
-func (a *ACFSAdapter) runCommand(ctx context.Context, args ...string) (json.RawMessage, error) {
-	ctx, cancel := context.WithTimeout(ctx, a.Timeout())
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, a.BinaryName(), args...)
-	cmd.WaitDelay = time.Second
-
-	// Limit output to 10MB
-	stdout := NewLimitedBuffer(10 * 1024 * 1024)
-	var stderr bytes.Buffer
-	cmd.Stdout = stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return nil, ErrTimeout
-		}
-		if strings.Contains(err.Error(), ErrOutputLimitExceeded.Error()) {
-			return nil, fmt.Errorf("acfs output exceeded 10MB limit")
-		}
-		return nil, fmt.Errorf("acfs %s failed: %w: %s", strings.Join(args, " "), err, stderr.String())
-	}
-
-	output := stdout.Bytes()
-	if len(output) > 0 && !json.Valid(output) {
-		return nil, fmt.Errorf("%w: invalid JSON from acfs", ErrSchemaValidation)
-	}
-
-	return output, nil
-}

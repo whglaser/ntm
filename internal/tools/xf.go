@@ -204,28 +204,6 @@ func (a *XFAdapter) Search(ctx context.Context, query string, params XFSearchPar
 	return results, nil
 }
 
-// Doctor runs xf doctor diagnostics
-func (a *XFAdapter) Doctor(ctx context.Context) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, a.Timeout())
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, a.BinaryName(), "doctor")
-	cmd.WaitDelay = time.Second
-	stdout := NewLimitedBuffer(10 * 1024 * 1024)
-	var stderr bytes.Buffer
-	cmd.Stdout = stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return "", ErrTimeout
-		}
-		return "", fmt.Errorf("xf doctor failed: %w: %s", err, stderr.String())
-	}
-
-	return stdout.String(), nil
-}
-
 // xfArchiveStats is the subset of `xf stats --format json` that health reports.
 type xfArchiveStats struct {
 	TweetsCount  int    `json:"tweets_count"`

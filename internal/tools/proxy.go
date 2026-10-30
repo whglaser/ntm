@@ -228,15 +228,6 @@ func (a *ProxyAdapter) InvalidateAvailabilityCache() {
 	proxyAvailabilityMutex.Unlock()
 }
 
-// IsAvailable returns true if rust_proxy is installed and version-compatible.
-func (a *ProxyAdapter) IsAvailable(ctx context.Context) bool {
-	availability, err := a.GetAvailability(ctx)
-	if err != nil || availability == nil {
-		return false
-	}
-	return availability.Available && availability.Compatible
-}
-
 // GetStatus queries runtime status from rust_proxy.
 func (a *ProxyAdapter) GetStatus(ctx context.Context) (*ProxyStatus, error) {
 	path, installed := a.Detect()

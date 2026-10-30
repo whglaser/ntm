@@ -3,7 +3,6 @@ package tools
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -199,26 +198,6 @@ func (a *AMAdapter) Info(ctx context.Context) (*ToolInfo, error) {
 }
 
 // AM-specific methods
-
-// HealthCheck calls the server health endpoint
-// It runs the MCP health_check tool through the shared client, so it reaches
-// the configured endpoint with the bearer attached rather than a hard-coded
-// loopback URL with no credentials (ntm#316).
-func (a *AMAdapter) HealthCheck(ctx context.Context) (json.RawMessage, error) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
-	status, err := a.client().HealthCheck(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("agent mail health check failed: %w", err)
-	}
-
-	encoded, err := json.Marshal(status)
-	if err != nil {
-		return nil, fmt.Errorf("encode agent mail health: %w", err)
-	}
-	return encoded, nil
-}
 
 // ServerURL returns the endpoint this adapter probes: the pinned override
 // when one is set, otherwise the configured (or default) Agent Mail base URL.

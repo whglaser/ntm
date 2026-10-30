@@ -311,11 +311,6 @@ func (a *CASSAdapter) Search(ctx context.Context, query string, limit int) (json
 	return a.runCommand(ctx, args...)
 }
 
-// GetCapabilities returns cass capabilities info
-func (a *CASSAdapter) GetCapabilities(ctx context.Context) (json.RawMessage, error) {
-	return a.runCommand(ctx, "capabilities", "--json")
-}
-
 // runCommand executes a cass command and returns raw JSON
 func (a *CASSAdapter) runCommand(ctx context.Context, args ...string) (json.RawMessage, error) {
 	ctx, cancel := context.WithTimeout(ctx, a.Timeout())

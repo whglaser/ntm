@@ -158,53 +158,6 @@ type DCGStatus struct {
 	AllowedOverrides []string `json:"allowed_overrides,omitempty"`
 }
 
-// GetStatus returns the current DCG status. dcg's native health surface is
-// `dcg doctor`, which emits a structured installation/hook diagnostic when
-// invoked with `--format json`. We treat any successful doctor run as
-// `Enabled=true` since the legacy `BlockedPatterns` / `AllowedOverrides`
-// fields are not surfaced by dcg's JSON shape; the caller side has always
-// tolerated a default-on result here.
-func (a *DCGAdapter) GetStatus(ctx context.Context) (*DCGStatus, error) {
-	ctx, cancel := context.WithTimeout(ctx, a.Timeout())
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, a.BinaryName(), "doctor", "--format", "json")
-	cmd.WaitDelay = time.Second
-	stdout := NewLimitedBuffer(10 * 1024 * 1024)
-	var stderr bytes.Buffer
-	cmd.Stdout = stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return nil, ErrTimeout
-		}
-		// dcg doctor returns non-zero when issues are detected, but the
-		// adapter has historically reported "enabled" in that case to avoid
-		// flapping callers into disabling DCG on transient install issues.
-		return &DCGStatus{Enabled: true}, nil
-	}
-
-	output := stdout.Bytes()
-	// dcg doctor's JSON shape doesn't include BlockedPatterns/AllowedOverrides
-	// today, but valid JSON output is a strong signal that DCG is healthy and
-	// reachable. Try a best-effort decode for forward compatibility, then
-	// fall back to enabled=true.
-	if json.Valid(output) {
-		var status DCGStatus
-		if err := json.Unmarshal(output, &status); err == nil {
-			// dcg doctor emits "ok"/"issues" envelopes; if our enabled flag
-			// wasn't populated we still consider DCG enabled (the binary
-			// answered).
-			if !status.Enabled {
-				status.Enabled = true
-			}
-			return &status, nil
-		}
-	}
-	return &DCGStatus{Enabled: true}, nil
-}
-
 // GetAvailability returns whether dcg is available and compatible, with caching.
 // It logs a warning if dcg is missing or incompatible, but does not return an error.
 func (a *DCGAdapter) GetAvailability(ctx context.Context) (*DCGAvailability, error) {

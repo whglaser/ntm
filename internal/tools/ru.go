@@ -3,7 +3,6 @@ package tools
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -133,85 +132,4 @@ type RURepoStatus struct {
 	Ahead      int    `json:"ahead,omitempty"`
 	Behind     int    `json:"behind,omitempty"`
 	HasChanges bool   `json:"has_changes,omitempty"`
-}
-
-// GetStatus returns the current ru status for all tracked repos
-func (a *RUAdapter) GetStatus(ctx context.Context) (*RUStatus, error) {
-	ctx, cancel := context.WithTimeout(ctx, a.Timeout())
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, a.BinaryName(), "status", "--json", "--no-fetch")
-	cmd.WaitDelay = time.Second
-	stdout := NewLimitedBuffer(10 * 1024 * 1024)
-	var stderr bytes.Buffer
-	cmd.Stdout = stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return nil, ErrTimeout
-		}
-		// Return empty status if command fails
-		return &RUStatus{}, nil
-	}
-
-	output := stdout.Bytes()
-	if !json.Valid(output) {
-		// Return empty status if output is not valid JSON
-		return &RUStatus{}, nil
-	}
-
-	var status RUStatus
-	if err := json.Unmarshal(output, &status); err != nil {
-		return nil, fmt.Errorf("failed to parse ru status: %w", err)
-	}
-
-	return &status, nil
-}
-
-// Sync runs ru sync with optional flags
-func (a *RUAdapter) Sync(ctx context.Context, dryRun bool) error {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute) // Sync can take a while
-	defer cancel()
-
-	args := []string{"sync", "--non-interactive"}
-	if dryRun {
-		args = append(args, "--dry-run")
-	}
-
-	cmd := exec.CommandContext(ctx, a.BinaryName(), args...)
-	cmd.WaitDelay = time.Second
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return ErrTimeout
-		}
-		return fmt.Errorf("ru sync failed: %w: %s", err, stderr.String())
-	}
-
-	return nil
-}
-
-// Doctor runs ru doctor diagnostics
-func (a *RUAdapter) Doctor(ctx context.Context) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, a.Timeout())
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, a.BinaryName(), "doctor")
-	cmd.WaitDelay = time.Second
-	stdout := NewLimitedBuffer(10 * 1024 * 1024)
-	var stderr bytes.Buffer
-	cmd.Stdout = stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return "", ErrTimeout
-		}
-		return "", fmt.Errorf("ru doctor failed: %w: %s", err, stderr.String())
-	}
-
-	return stdout.String(), nil
 }

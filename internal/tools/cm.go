@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/cm"
@@ -185,40 +184,4 @@ func (a *CMAdapter) GetContext(ctx context.Context, taskDescription, workspace, 
 		return nil, fmt.Errorf("cm context returned no successful result")
 	}
 	return json.Marshal(result)
-}
-
-// OnboardStatus returns onboarding status
-func (a *CMAdapter) OnboardStatus(ctx context.Context) (json.RawMessage, error) {
-	return a.runCommand(ctx, "onboard", "status", "--json")
-}
-
-// runCommand executes a cm command and returns raw JSON
-func (a *CMAdapter) runCommand(ctx context.Context, args ...string) (json.RawMessage, error) {
-	ctx, cancel := context.WithTimeout(ctx, a.Timeout())
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, a.BinaryName(), args...)
-	cmd.WaitDelay = time.Second
-	// Limit output to 10MB
-	stdout := NewLimitedBuffer(10 * 1024 * 1024)
-	var stderr bytes.Buffer
-	cmd.Stdout = stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return nil, ErrTimeout
-		}
-		if strings.Contains(err.Error(), ErrOutputLimitExceeded.Error()) {
-			return nil, fmt.Errorf("cm output exceeded 10MB limit")
-		}
-		return nil, fmt.Errorf("cm failed: %w: %s", err, stderr.String())
-	}
-
-	output := stdout.Bytes()
-	if len(output) > 0 && !json.Valid(output) {
-		return nil, fmt.Errorf("%w: invalid JSON from cm", ErrSchemaValidation)
-	}
-
-	return output, nil
 }

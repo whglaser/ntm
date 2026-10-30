@@ -185,30 +185,6 @@ func (a *BDAdapter) GetStats(ctx context.Context, dir string) (json.RawMessage, 
 	return a.runCommand(ctx, dir, "stats", "--json")
 }
 
-// GetReady returns ready issues
-func (a *BDAdapter) GetReady(ctx context.Context, dir string) (json.RawMessage, error) {
-	return a.runCommand(ctx, dir, "ready", "--json")
-}
-
-// GetBlocked returns blocked issues
-func (a *BDAdapter) GetBlocked(ctx context.Context, dir string) (json.RawMessage, error) {
-	return a.runCommand(ctx, dir, "blocked", "--json")
-}
-
-// GetList returns issues matching filter
-func (a *BDAdapter) GetList(ctx context.Context, dir string, status string) (json.RawMessage, error) {
-	args := []string{"list", "--json"}
-	if status != "" {
-		args = append(args, "--status="+status)
-	}
-	return a.runCommand(ctx, dir, args...)
-}
-
-// Show returns details for a specific issue
-func (a *BDAdapter) Show(ctx context.Context, dir, issueID string) (json.RawMessage, error) {
-	return a.runCommand(ctx, dir, "show", issueID, "--json")
-}
-
 // runCommand executes a bd command and returns raw JSON
 func (a *BDAdapter) runCommand(ctx context.Context, dir string, args ...string) (json.RawMessage, error) {
 	ctx, cancel := context.WithTimeout(ctx, a.Timeout())
