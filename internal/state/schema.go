@@ -173,36 +173,6 @@ type ToolHealth struct {
 	LastError    string     `json:"last_error,omitempty"`
 }
 
-// BeadStatus represents the state of a bead assignment.
-type BeadStatus string
-
-const (
-	BeadStatusAssigned   BeadStatus = "assigned"
-	BeadStatusWorking    BeadStatus = "working"
-	BeadStatusCompleted  BeadStatus = "completed"
-	BeadStatusFailed     BeadStatus = "failed"
-	BeadStatusReassigned BeadStatus = "reassigned"
-)
-
-// BeadHistoryEntry represents a state transition for a bead.
-type BeadHistoryEntry struct {
-	ID           int64      `json:"id"`
-	SessionID    string     `json:"session_id,omitempty"`
-	BeadID       string     `json:"bead_id"`
-	BeadTitle    string     `json:"bead_title,omitempty"`
-	FromStatus   BeadStatus `json:"from_status,omitempty"` // Empty for initial assignment
-	ToStatus     BeadStatus `json:"to_status"`
-	AgentID      string     `json:"agent_id,omitempty"`
-	AgentType    string     `json:"agent_type,omitempty"` // cc, cod, gmi
-	AgentName    string     `json:"agent_name,omitempty"` // Agent Mail name
-	Pane         int        `json:"pane,omitempty"`
-	Trigger      string     `json:"trigger,omitempty"`     // What caused the transition
-	Reason       string     `json:"reason,omitempty"`      // Additional context
-	PromptSent   string     `json:"prompt_sent,omitempty"` // Prompt at time of assignment
-	RetryCount   int        `json:"retry_count,omitempty"`
-	TransitionAt time.Time  `json:"transition_at"`
-}
-
 // MigrationInfo tracks applied migrations.
 type MigrationInfo struct {
 	Version   int       `json:"version"`
