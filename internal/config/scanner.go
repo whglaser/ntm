@@ -237,18 +237,6 @@ func ValidateScannerConfig(cfg *ScannerConfig) error {
 	return nil
 }
 
-// GetTimeout returns the timeout as a time.Duration
-func (d *ScannerDefaults) GetTimeout() time.Duration {
-	if d.Timeout == "" {
-		return 120 * time.Second
-	}
-	dur, err := time.ParseDuration(d.Timeout)
-	if err != nil {
-		return 120 * time.Second
-	}
-	return dur
-}
-
 // ProjectScannerConfig represents a project-level scanner configuration
 // typically stored in .ntm.yaml at the project root
 type ProjectScannerConfig struct {
@@ -288,51 +276,4 @@ func applyEnvOverrides(cfg *ScannerConfig) {
 			cfg.Thresholds.CI.FailErrors = n
 		}
 	}
-}
-
-// IsToolEnabled checks if a tool should be run
-func (t *ScannerTools) IsToolEnabled(toolName string) bool {
-	// Check disabled list first
-	for _, d := range t.Disabled {
-		if strings.EqualFold(d, toolName) {
-			return false
-		}
-	}
-
-	// If enabled list is empty, tool is enabled
-	if len(t.Enabled) == 0 {
-		return true
-	}
-
-	// Check enabled list
-	for _, e := range t.Enabled {
-		if strings.EqualFold(e, toolName) {
-			return true
-		}
-	}
-
-	return false
-}
-
-// ShouldBlock returns true if findings should block based on threshold config
-func (t *ThresholdConfig) ShouldBlock(criticalCount, errorCount int) bool {
-	if t.BlockCritical && criticalCount > 0 {
-		return true
-	}
-	if t.BlockErrors > 0 && errorCount >= t.BlockErrors {
-		return true
-	}
-	return false
-}
-
-// ShouldFail returns true if findings should cause a non-zero exit
-func (t *ThresholdConfig) ShouldFail(criticalCount, errorCount int) bool {
-	if t.FailCritical && criticalCount > 0 {
-		return true
-	}
-	// FailErrors < 0 disables this check; >= 0 fails if errorCount exceeds threshold
-	if t.FailErrors >= 0 && errorCount > t.FailErrors {
-		return true
-	}
-	return false
 }

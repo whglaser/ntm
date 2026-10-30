@@ -3650,51 +3650,8 @@ func TestValidateSafetyConfig(t *testing.T) {
 }
 
 // =============================================================================
-// Rotation: GetAccountsForProvider / SuggestNextAccount
+// Rotation: SuggestNextAccount
 // =============================================================================
-
-func TestRotationConfig_GetAccountsForProvider(t *testing.T) {
-	t.Parallel()
-
-	cfg := &RotationConfig{
-		Accounts: []RotationAccount{
-			{Provider: "claude", Email: "a@example.com"},
-			{Provider: "codex", Email: "b@example.com"},
-			{Provider: "claude", Email: "c@example.com"},
-			{Provider: "gemini", Email: "d@example.com"},
-		},
-	}
-
-	tests := []struct {
-		provider string
-		wantLen  int
-	}{
-		{"claude", 2},
-		{"codex", 1},
-		{"gemini", 1},
-		{"unknown", 0},
-		{"", 0},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.provider, func(t *testing.T) {
-			t.Parallel()
-			accounts := cfg.GetAccountsForProvider(tt.provider)
-			if len(accounts) != tt.wantLen {
-				t.Errorf("GetAccountsForProvider(%q) returned %d accounts, want %d", tt.provider, len(accounts), tt.wantLen)
-			}
-		})
-	}
-}
-
-func TestRotationConfig_GetAccountsForProvider_Empty(t *testing.T) {
-	t.Parallel()
-	cfg := &RotationConfig{}
-	accounts := cfg.GetAccountsForProvider("claude")
-	if len(accounts) != 0 {
-		t.Errorf("Expected 0 accounts for empty config, got %d", len(accounts))
-	}
-}
 
 func TestRotationConfig_SuggestNextAccount(t *testing.T) {
 	t.Parallel()

@@ -242,31 +242,6 @@ func TestGetAllocationForBeadCount(t *testing.T) {
 	}
 }
 
-func TestGetTierName(t *testing.T) {
-	cfg := validSwarmConfig()
-
-	tests := []struct {
-		beadCount int
-		expected  string
-	}{
-		{500, "tier1"},
-		{400, "tier1"},
-		{399, "tier2"},
-		{100, "tier2"},
-		{99, "tier3"},
-		{0, "tier3"},
-	}
-
-	for _, tt := range tests {
-		t.Run("", func(t *testing.T) {
-			got := cfg.GetTierName(tt.beadCount)
-			if got != tt.expected {
-				t.Errorf("GetTierName(%d) = %s, want %s", tt.beadCount, got, tt.expected)
-			}
-		})
-	}
-}
-
 func TestSwarmConfigTOMLUnmarshal(t *testing.T) {
 	input := `
 enabled = true

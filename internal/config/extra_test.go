@@ -10,7 +10,6 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/BurntSushi/toml"
 )
@@ -35,104 +34,6 @@ func TestConfigGenerateAgentCommand(t *testing.T) {
 	if cmd != "echo gpt-4" {
 		t.Errorf("Expected 'echo gpt-4', got %q", cmd)
 	}
-}
-
-func TestIsPersonaName(t *testing.T) {
-	cfg := &Config{}
-	// Built-in personas should be recognized
-	if !cfg.IsPersonaName("architect") {
-		t.Error("IsPersonaName should return true for built-in persona 'architect'")
-	}
-	// Unknown names should return false
-	if cfg.IsPersonaName("nonexistent-persona-xyz") {
-		t.Error("IsPersonaName should return false for unknown persona")
-	}
-}
-
-func TestScannerDefaultsGetTimeout(t *testing.T) {
-	d := ScannerDefaults{Timeout: "60s"}
-	if d.GetTimeout() != 60*time.Second {
-		t.Errorf("Expected 60s, got %v", d.GetTimeout())
-	}
-
-	d = ScannerDefaults{Timeout: "invalid"}
-	if d.GetTimeout() != 120*time.Second {
-		t.Errorf("Expected default 120s for invalid, got %v", d.GetTimeout())
-	}
-
-	d = ScannerDefaults{Timeout: ""}
-	if d.GetTimeout() != 120*time.Second {
-		t.Errorf("Expected default 120s for empty, got %v", d.GetTimeout())
-	}
-}
-
-func TestScannerToolsIsToolEnabled(t *testing.T) {
-	// Default (empty) -> all enabled
-	tools := ScannerTools{}
-	if !tools.IsToolEnabled("semgrep") {
-		t.Error("Empty config should enable all tools")
-	}
-
-	// Enabled list
-	tools = ScannerTools{Enabled: []string{"semgrep"}}
-	if !tools.IsToolEnabled("semgrep") {
-		t.Error("Explicitly enabled tool should be enabled")
-	}
-	if tools.IsToolEnabled("gosec") {
-		t.Error("Tool not in enabled list should be disabled")
-	}
-
-	// Disabled list
-	tools = ScannerTools{Disabled: []string{"bandit"}}
-	if tools.IsToolEnabled("bandit") {
-		t.Error("Disabled tool should be disabled")
-	}
-	if !tools.IsToolEnabled("semgrep") {
-		t.Error("Non-disabled tool should be enabled")
-	}
-}
-
-func TestThresholdConfigShouldBlock(t *testing.T) {
-	t.Run("block critical", func(t *testing.T) {
-		tc := ThresholdConfig{BlockCritical: true}
-		if !tc.ShouldBlock(1, 0) {
-			t.Error("Should block on critical")
-		}
-		if tc.ShouldBlock(0, 5) {
-			t.Error("Should not block on errors when BlockErrors=0")
-		}
-	})
-
-	t.Run("block errors", func(t *testing.T) {
-		tc := ThresholdConfig{BlockErrors: 5}
-		if !tc.ShouldBlock(0, 5) {
-			t.Error("Should block on 5 errors")
-		}
-		if tc.ShouldBlock(0, 4) {
-			t.Error("Should not block on 4 errors")
-		}
-	})
-}
-
-func TestThresholdConfigShouldFail(t *testing.T) {
-	t.Run("fail critical", func(t *testing.T) {
-		tc := ThresholdConfig{FailCritical: true}
-		if !tc.ShouldFail(1, 0) {
-			t.Error("Should fail on critical")
-		}
-	})
-
-	t.Run("fail errors", func(t *testing.T) {
-		tc := ThresholdConfig{FailErrors: 0} // Any error fails
-		if !tc.ShouldFail(0, 1) {
-			t.Error("Should fail on 1 error")
-		}
-
-		tc = ThresholdConfig{FailErrors: -1} // Disabled
-		if tc.ShouldFail(0, 100) {
-			t.Error("Should not fail when disabled")
-		}
-	})
 }
 
 func TestInitProjectConfigForce(t *testing.T) {
