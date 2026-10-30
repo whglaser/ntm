@@ -139,17 +139,6 @@ internal/ensemble/types.go:ModeCatalog.ListDefault	bd-ld4j2	reachable only throu
 internal/ensemble/types.go:ModeCatalog.SearchModes	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/ensemble/types.go:ModeCatalog.Version	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/events/bus.go:EventBus.SubscriberCount	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/handoff/constants.go:ValidationErrors.FieldNames	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/handoff/constants.go:ValidationErrors.ForField	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/handoff/constants.go:ValidationErrors.HasErrors	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/handoff/types.go:Handoff.AddBlocker	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/handoff/types.go:Handoff.AddDecision	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/handoff/types.go:Handoff.IsBlocked	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/handoff/types.go:Handoff.IsComplete	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/handoff/validate.go:Handoff.MustValidate	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/handoff/validate.go:Handoff.ValidateAndSetDefaults	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/handoff/validate.go:Handoff.ValidateMinimal	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/handoff/validate.go:truncate	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/integrations/caut/cache.go:UsageCache.Clear	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/integrations/caut/cache.go:UsageCache.GetUpdateCount	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/integrations/caut/cache.go:UsageCache.Snapshot	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it

@@ -140,21 +140,6 @@ func (h *Handoff) AddTask(task string, files ...string) *Handoff {
 	return h
 }
 
-// AddBlocker adds a blocker to the list.
-func (h *Handoff) AddBlocker(blocker string) *Handoff {
-	h.Blockers = append(h.Blockers, blocker)
-	return h
-}
-
-// AddDecision records a key decision.
-func (h *Handoff) AddDecision(key, value string) *Handoff {
-	if h.Decisions == nil {
-		h.Decisions = make(map[string]string)
-	}
-	h.Decisions[key] = value
-	return h
-}
-
 // AddFinding records an important discovery.
 func (h *Handoff) AddFinding(key, value string) *Handoff {
 	if h.Findings == nil {
@@ -212,16 +197,6 @@ func (h *Handoff) SetTokenInfo(used, max int) *Handoff {
 		h.TokensPct = 0
 	}
 	return h
-}
-
-// IsComplete returns true if the handoff is marked as complete.
-func (h *Handoff) IsComplete() bool {
-	return h.Status == StatusComplete
-}
-
-// IsBlocked returns true if the handoff is marked as blocked.
-func (h *Handoff) IsBlocked() bool {
-	return h.Status == StatusBlocked
 }
 
 // HasChanges returns true if any file changes were recorded.

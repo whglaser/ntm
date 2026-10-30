@@ -85,28 +85,3 @@ func (errs ValidationErrors) Error() string {
 	}
 	return fmt.Sprintf("%d validation errors: first=%s", len(errs), errs[0].Error())
 }
-
-// HasErrors returns true if there are any validation errors.
-func (errs ValidationErrors) HasErrors() bool {
-	return len(errs) > 0
-}
-
-// FieldNames returns the list of fields with errors.
-func (errs ValidationErrors) FieldNames() []string {
-	names := make([]string, len(errs))
-	for i, err := range errs {
-		names[i] = err.Field
-	}
-	return names
-}
-
-// ForField returns all errors for a specific field.
-func (errs ValidationErrors) ForField(field string) ValidationErrors {
-	var result ValidationErrors
-	for _, err := range errs {
-		if err.Field == field {
-			result = append(result, err)
-		}
-	}
-	return result
-}

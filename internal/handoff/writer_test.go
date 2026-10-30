@@ -411,8 +411,8 @@ func TestWriterAtomicWriteIntegrity(t *testing.T) {
 		WithStatus(StatusComplete, OutcomeSucceeded).
 		AddTask("Task 1", "file1.go").
 		AddTask("Task 2", "file2.go").
-		AddDecision("approach", "Use atomic writes").
 		AddFinding("insight", "Temp files prevent corruption")
+	h.Decisions = map[string]string{"approach": "Use atomic writes"}
 
 	path, err := w.Write(h, "atomic-test")
 	if err != nil {

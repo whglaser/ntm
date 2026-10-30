@@ -33,28 +33,14 @@ func TestIsValid_InvalidHandoff(t *testing.T) {
 // MustValidate — 0% → 100%
 // ---------------------------------------------------------------------------
 
-func TestMustValidate_ValidHandoff(t *testing.T) {
+func TestValidate_ValidHandoff(t *testing.T) {
 	t.Parallel()
 
 	h := New("test-session").
 		WithGoalAndNow("Implement feature", "Write tests").
 		WithStatus(StatusComplete, OutcomeSucceeded)
 
-	// Should not panic
-	h.MustValidate()
-}
-
-func TestMustValidate_InvalidHandoff_Panics(t *testing.T) {
-	t.Parallel()
-
-	h := &Handoff{} // empty, missing required fields
-
-	defer func() {
-		r := recover()
-		if r == nil {
-			t.Error("expected MustValidate to panic on invalid handoff")
-		}
-	}()
-
-	h.MustValidate()
+	if errs := h.Validate(); len(errs) > 0 {
+		t.Fatalf("expected no validation errors, got %v", errs)
+	}
 }

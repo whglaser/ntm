@@ -108,7 +108,7 @@ func TestHandoffFixtures(t *testing.T) {
 				t.Fatalf("expected no validation errors, got %v", errs)
 			}
 			for _, field := range tc.expectedErrKeys {
-				if len(errs.ForField(field)) == 0 {
+				if len(validationErrorsForField(errs, field)) == 0 {
 					t.Errorf("expected validation error for field %q, got %v", field, errs)
 				}
 			}

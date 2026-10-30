@@ -3,10 +3,21 @@ package handoff
 import (
 	"testing"
 	"time"
-	"unicode/utf8"
 
 	"gopkg.in/yaml.v3"
 )
+
+// validationErrorsForField filters validation errors by field name; the
+// production accessor was removed with the other uncalled validation helpers.
+func validationErrorsForField(errs ValidationErrors, field string) ValidationErrors {
+	var result ValidationErrors
+	for _, err := range errs {
+		if err.Field == field {
+			result = append(result, err)
+		}
+	}
+	return result
+}
 
 func TestNew(t *testing.T) {
 	h := New("test-session")
@@ -30,13 +41,13 @@ func TestHandoffWithMethods(t *testing.T) {
 		WithGoalAndNow("Implement feature X", "Write tests").
 		WithStatus(StatusComplete, OutcomeSucceeded).
 		AddTask("Created handler", "handler.go", "handler_test.go").
-		AddBlocker("Waiting for API review").
-		AddDecision("language", "Go").
 		AddFinding("perf", "10x faster with caching").
 		MarkCreated("new_file.go").
 		MarkModified("existing.go").
 		SetAgentInfo("cc_1", AgentTypeClaude, "%42").
 		SetTokenInfo(50000, 100000)
+	h.Blockers = []string{"Waiting for API review"}
+	h.Decisions = map[string]string{"language": "Go"}
 
 	if h.Goal != "Implement feature X" {
 		t.Errorf("unexpected goal: %s", h.Goal)
@@ -276,76 +287,6 @@ func TestSetDefaults(t *testing.T) {
 	}
 }
 
-func TestValidateAndSetDefaults(t *testing.T) {
-	h := &Handoff{
-		Goal: "Test",
-		Now:  "Continue",
-	}
-
-	errs := h.ValidateAndSetDefaults()
-	if len(errs) > 0 {
-		t.Errorf("expected no errors, got %v", errs)
-	}
-
-	if h.Version == "" {
-		t.Error("expected version to be set")
-	}
-}
-
-func TestValidateMinimal(t *testing.T) {
-	t.Run("valid", func(t *testing.T) {
-		h := &Handoff{Goal: "Test", Now: "Continue"}
-		if err := h.ValidateMinimal(); err != nil {
-			t.Errorf("unexpected error: %v", err)
-		}
-	})
-
-	t.Run("missing goal", func(t *testing.T) {
-		h := &Handoff{Now: "Continue"}
-		err := h.ValidateMinimal()
-		if err == nil {
-			t.Error("expected error for missing goal")
-		}
-		if ve, ok := err.(ValidationError); ok {
-			if ve.Field != "goal" {
-				t.Errorf("expected field=goal, got %s", ve.Field)
-			}
-		}
-	})
-
-	t.Run("missing now", func(t *testing.T) {
-		h := &Handoff{Goal: "Test"}
-		err := h.ValidateMinimal()
-		if err == nil {
-			t.Error("expected error for missing now")
-		}
-	})
-}
-
-func TestIsComplete(t *testing.T) {
-	h := &Handoff{Status: StatusComplete}
-	if !h.IsComplete() {
-		t.Error("expected IsComplete() to return true")
-	}
-
-	h.Status = StatusPartial
-	if h.IsComplete() {
-		t.Error("expected IsComplete() to return false for partial")
-	}
-}
-
-func TestIsBlocked(t *testing.T) {
-	h := &Handoff{Status: StatusBlocked}
-	if !h.IsBlocked() {
-		t.Error("expected IsBlocked() to return true")
-	}
-
-	h.Status = StatusComplete
-	if h.IsBlocked() {
-		t.Error("expected IsBlocked() to return false for complete")
-	}
-}
-
 func TestHasChanges(t *testing.T) {
 	h := &Handoff{}
 	if h.HasChanges() {
@@ -374,9 +315,9 @@ func TestYAMLSerialization(t *testing.T) {
 		WithGoalAndNow("Implement feature", "Write tests").
 		WithStatus(StatusComplete, OutcomeSucceeded).
 		AddTask("Created handler", "handler.go").
-		AddDecision("approach", "TDD").
 		MarkCreated("new.go").
 		SetAgentInfo("cc_1", AgentTypeClaude, "%42")
+	original.Decisions = map[string]string{"approach": "TDD"}
 
 	// Serialize
 	data, err := yaml.Marshal(original)
@@ -476,14 +417,17 @@ func TestValidationErrorsCollection(t *testing.T) {
 		t.Errorf("expected at least 4 errors, got %d: %v", len(errs), errs)
 	}
 
-	// Test FieldNames
-	names := errs.FieldNames()
-	if len(names) != len(errs) {
-		t.Errorf("FieldNames length mismatch")
+	// Error fields are reported per field
+	fields := make([]string, len(errs))
+	for i, err := range errs {
+		fields[i] = err.Field
+	}
+	if len(fields) != len(errs) {
+		t.Errorf("field names length mismatch")
 	}
 
-	// Test ForField
-	goalErrs := errs.ForField("goal")
+	// Test per-field filtering
+	goalErrs := validationErrorsForField(errs, "goal")
 	if len(goalErrs) != 1 {
 		t.Errorf("expected 1 error for goal field, got %d", len(goalErrs))
 	}
@@ -499,8 +443,8 @@ func TestValidate_AllowsGeneralSession(t *testing.T) {
 	}
 
 	errs := h.Validate()
-	if errs.HasErrors() {
-		if len(errs.ForField("session")) > 0 {
+	if len(errs) > 0 {
+		if len(validationErrorsForField(errs, "session")) > 0 {
 			t.Fatalf("expected session=general to be allowed, got errors: %v", errs)
 		}
 	}
@@ -543,7 +487,7 @@ func TestValidate_TokensPctOutOfRange(t *testing.T) {
 			}
 
 			errs := h.Validate()
-			if len(errs.ForField("tokens_pct")) != 1 {
+			if len(validationErrorsForField(errs, "tokens_pct")) != 1 {
 				t.Fatalf("expected tokens_pct validation error, got: %v", errs)
 			}
 		})
@@ -589,7 +533,7 @@ func TestValidate_InvalidTokenCounts(t *testing.T) {
 			}
 
 			errs := h.Validate()
-			if len(errs.ForField(tt.field)) != 1 {
+			if len(validationErrorsForField(errs, tt.field)) != 1 {
 				t.Fatalf("expected %s validation error, got: %v", tt.field, errs)
 			}
 		})
@@ -627,8 +571,8 @@ func TestValidationErrorsError(t *testing.T) {
 
 	// Single
 	errs = ValidationErrors{{Field: "f", Message: "m"}}
-	if !errs.HasErrors() {
-		t.Error("expected HasErrors() to return true")
+	if len(errs) == 0 {
+		t.Error("expected non-empty validation errors")
 	}
 
 	// Multiple
@@ -660,9 +604,9 @@ func BenchmarkValidation(b *testing.B) {
 		WithGoalAndNow("Benchmark goal", "Benchmark now").
 		WithStatus(StatusComplete, OutcomeSucceeded).
 		AddTask("Task 1", "file1.go", "file2.go").
-		AddDecision("key", "value").
 		MarkCreated("new.go").
 		SetAgentInfo("cc_1", AgentTypeClaude, "%42")
+	h.Decisions = map[string]string{"key": "value"}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -675,8 +619,8 @@ func BenchmarkYAMLMarshal(b *testing.B) {
 		WithGoalAndNow("Benchmark goal", "Benchmark now").
 		WithStatus(StatusComplete, OutcomeSucceeded).
 		AddTask("Task 1", "file1.go", "file2.go").
-		AddDecision("key", "value").
 		MarkCreated("new.go")
+	h.Decisions = map[string]string{"key": "value"}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -713,38 +657,5 @@ func TestCreatedAtPreserved(t *testing.T) {
 	}
 	if h.UpdatedAt.IsZero() {
 		t.Error("UpdatedAt should be set")
-	}
-}
-
-func TestTruncate(t *testing.T) {
-	tests := []struct {
-		name   string
-		input  string
-		maxLen int
-		want   string
-	}{
-		{"short string", "hello", 10, "hello"},
-		{"exact length", "hello", 5, "hello"},
-		{"needs truncation", "hello world", 8, "hello..."},
-		{"maxLen 3", "hello", 3, "hel"},
-		{"maxLen 2", "hello", 2, "he"},
-		{"maxLen 1", "hello", 1, "h"},
-		{"maxLen 0", "hello", 0, ""},
-		{"maxLen negative", "hello", -1, ""},
-		{"empty string", "", 5, ""},
-		{"unicode truncation", "éclair", 4, "é..."},
-		{"unicode short max", "éclair", 2, "éc"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := truncate(tt.input, tt.maxLen)
-			if got != tt.want {
-				t.Errorf("truncate(%q, %d) = %q, want %q", tt.input, tt.maxLen, got, tt.want)
-			}
-			if !utf8.ValidString(got) {
-				t.Errorf("truncate(%q, %d) returned invalid UTF-8: %q", tt.input, tt.maxLen, got)
-			}
-		})
 	}
 }

@@ -144,7 +144,7 @@ func TestScoreQualityRoundsToNearestInsteadOfTruncating(t *testing.T) {
 	h.Test = "t"
 	h.AddTask("done", "internal/handoff/types.go")
 	h.MarkModified("internal/handoff/types.go")
-	h.AddDecision("d", "x")
+	h.Decisions = map[string]string{"d": "x"}
 	h.Next = []string{"keep going"}
 	h.ActiveBeads = []string{"bd-x"}
 	h.AgentMailThreads = []string{"thread"}
@@ -181,7 +181,7 @@ func highQualityHandoff(now time.Time) *Handoff {
 	h.WithStatus(StatusComplete, OutcomeSucceeded)
 	h.Test = "rch exec -- go test -short -count=1 ./internal/handoff/..."
 	h.AddTask("Added scoring helpers", "internal/handoff/quality.go", "internal/handoff/quality_test.go")
-	h.AddDecision("scoring", "Use deterministic coverage, recency, actionability, and traceability dimensions")
+	h.Decisions = map[string]string{"scoring": "Use deterministic coverage, recency, actionability, and traceability dimensions"}
 	h.AddFinding("artifact", "Quality report is emitted in YAML")
 	h.Next = []string{"Wire score into additional robot surfaces"}
 	h.ActiveBeads = []string{"bd-2mb03.6.3"}

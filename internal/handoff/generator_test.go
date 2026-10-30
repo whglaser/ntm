@@ -676,7 +676,7 @@ func TestGenerateHandoffJSONSerializable(t *testing.T) {
 	}
 
 	// Add some data to verify serialization
-	h.AddDecision("architecture", "microservices")
+	h.Decisions = map[string]string{"architecture": "microservices"}
 	h.AddFinding("bottleneck", "database")
 	h.ActiveBeads = []string{"bd-1234: Test bead"}
 	h.AgentMailThreads = []string{"[thread-1] Test message (from: agent-a)"}
