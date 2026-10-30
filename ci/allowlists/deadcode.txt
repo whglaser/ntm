@@ -116,22 +116,10 @@ internal/context/rotation.go:Rotator.ManualRotate	bd-ld4j2	reachable only throug
 internal/context/rotation.go:Rotator.rotateAgent	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/cost/tracker.go:PricingMatch.Known	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/dispatch/dispatch.go:Prepared.Targets	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/ensemble/compare.go:ComparisonResult.HasConclusionChanges	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/ensemble/compare.go:ComparisonResult.HasContributionChanges	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/ensemble/compare.go:ComparisonResult.HasFindingChanges	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/ensemble/compare.go:ComparisonResult.HasModeChanges	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/ensemble/compare.go:ComparisonResult.IsEmpty	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/ensemble/compare.go:ComparisonResult.JSON	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/ensemble/contributions.go:ContributionReport.JSON	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/ensemble/ensemble_loader.go:EnsembleRegistry.Count	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/ensemble/explanation.go:ExplanationLayer.JSON	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/ensemble/provenance.go:ProvenanceChain.Validate	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/ensemble/similarity.go:RedundancyAnalysis.GetHighRedundancyPairs	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/ensemble/similarity.go:RedundancyAnalysis.Render	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/ensemble/similarity.go:RedundancyAnalysis.SuggestReplacements	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/ensemble/similarity.go:classifySimilarity	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/ensemble/similarity.go:diversityNote	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/ensemble/similarity.go:interpretScore	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/ensemble/types.go:AssignmentStatus.IsTerminal	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/ensemble/types.go:ModeCatalog.Count	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/ensemble/types.go:ModeCatalog.ListByTier	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
@@ -533,3 +521,8 @@ internal/tui/dashboard/panels/panel.go:PanelBase.HandlesOwnHeight	permanent	defa
 internal/swarm/orchestrator.go:SessionOrchestrator.CreateSessions	permanent	build-tag blind spot: gate runs untagged; reachable in release builds via tag-gated internal/ensemble/manager.go:150 (ensemble_experimental)
 internal/swarm/prompt_injector.go:PromptInjector.InjectPrompt	permanent	build-tag blind spot: gate runs untagged; satisfies ensemble.BasicInjector and is called from tag-gated internal/ensemble/injector.go + pipeline.go (ensemble_experimental)
 internal/swarm/agent_launcher.go:formatPaneTarget	permanent	build-tag blind spot: gate runs untagged; reached in tagged builds via swarm.GetPaneTarget (pane_launcher.go) from tag-gated internal/ensemble/manager.go:830 pane dispatch (ensemble_experimental)
+# permanent: e2e-tagged surface coverage (bd-ld4j2 batch 11)
+internal/ensemble/similarity.go:RedundancyAnalysis.Render	permanent	renders the redundancy report asserted by the e2e-tagged test e2e/ensemble_metrics_test.go (e2e + ensemble_experimental); the untagged gate cannot see that call path, but deleting it breaks tagged test compilation
+internal/ensemble/similarity.go:interpretScore	permanent	reached by RedundancyAnalysis.Render, which the e2e-tagged e2e/ensemble_metrics_test.go exercises
+internal/ensemble/similarity.go:classifySimilarity	permanent	reached by RedundancyAnalysis.Render, which the e2e-tagged e2e/ensemble_metrics_test.go exercises
+internal/ensemble/similarity.go:diversityNote	permanent	reached by RedundancyAnalysis.Render, which the e2e-tagged e2e/ensemble_metrics_test.go exercises

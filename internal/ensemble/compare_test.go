@@ -375,11 +375,6 @@ func TestCompare_FullIntegration(t *testing.T) {
 	if len(result.ContributionDiff.ScoreDeltas) != 1 {
 		t.Errorf("Expected 1 score delta (deductive), got %d", len(result.ContributionDiff.ScoreDeltas))
 	}
-
-	// Result should not be empty
-	if result.IsEmpty() {
-		t.Error("Expected result to not be empty")
-	}
 }
 
 func TestCompare_Determinism(t *testing.T) {
@@ -411,8 +406,8 @@ func TestCompare_Determinism(t *testing.T) {
 	result2 := Compare(runA, runB)
 
 	// Compare JSON outputs for determinism
-	json1, _ := result1.JSON()
-	json2, _ := result2.JSON()
+	json1, _ := json.MarshalIndent(result1, "", "  ")
+	json2, _ := json.MarshalIndent(result2, "", "  ")
 
 	// Parse back to remove timestamp fields
 	var parsed1, parsed2 map[string]interface{}
@@ -434,50 +429,6 @@ func TestCompare_Determinism(t *testing.T) {
 	}
 }
 
-func TestCompareHelpers(t *testing.T) {
-	t.Log("TEST: TestCompareHelpers - starting")
-
-	result := &ComparisonResult{
-		ModeDiff: ModeDiff{
-			AddedCount:   1,
-			RemovedCount: 0,
-		},
-		FindingsDiff: FindingsDiff{
-			NewCount:     2,
-			MissingCount: 0,
-			ChangedCount: 1,
-		},
-		ConclusionDiff: ConclusionDiff{
-			SynthesisChanged: true,
-		},
-		ContributionDiff: ContributionDiff{
-			RankChanges: []RankChange{{ModeID: "mode-a", Delta: 1}},
-		},
-	}
-
-	t.Logf("TEST: TestCompareHelpers - testing helper methods")
-
-	if !result.HasModeChanges() {
-		t.Error("HasModeChanges should return true")
-	}
-
-	if !result.HasFindingChanges() {
-		t.Error("HasFindingChanges should return true")
-	}
-
-	if !result.HasConclusionChanges() {
-		t.Error("HasConclusionChanges should return true")
-	}
-
-	if !result.HasContributionChanges() {
-		t.Error("HasContributionChanges should return true")
-	}
-
-	if result.IsEmpty() {
-		t.Error("IsEmpty should return false")
-	}
-}
-
 func TestCompare_EmptyInputs(t *testing.T) {
 	t.Log("TEST: TestCompare_EmptyInputs - starting")
 
@@ -489,10 +440,6 @@ func TestCompare_EmptyInputs(t *testing.T) {
 	result := Compare(runA, runB)
 
 	t.Logf("TEST: TestCompare_EmptyInputs - summary: %s", result.Summary)
-
-	if !result.IsEmpty() {
-		t.Error("Empty inputs should produce empty result")
-	}
 
 	if result.Summary != "No differences found" {
 		t.Errorf("Expected 'No differences found', got %q", result.Summary)

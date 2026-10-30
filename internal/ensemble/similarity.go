@@ -39,76 +39,8 @@ type PairSimilarity struct {
 	UniqueToB int `json:"unique_to_b" yaml:"unique_to_b"`
 }
 
-// GetHighRedundancyPairs returns pairs above the given similarity threshold.
-func (r *RedundancyAnalysis) GetHighRedundancyPairs(threshold float64) []PairSimilarity {
-	if r == nil {
-		return nil
-	}
-
-	var result []PairSimilarity
-	for _, pair := range r.PairwiseScores {
-		if pair.Similarity >= threshold {
-			result = append(result, pair)
-		}
-	}
-	return result
-}
-
-// SuggestReplacements suggests alternative modes for redundant pairs.
-func (r *RedundancyAnalysis) SuggestReplacements(catalog *ModeCatalog) []string {
-	if r == nil || catalog == nil {
-		return nil
-	}
-
-	highRedundancy := r.GetHighRedundancyPairs(0.5)
-	if len(highRedundancy) == 0 {
-		return []string{"No high-redundancy pairs found - mode selection is diverse"}
-	}
-
-	var suggestions []string
-	suggestedModes := make(map[string]bool)
-
-	for _, pair := range highRedundancy {
-		// Get the categories of the redundant modes
-		modeA := catalog.GetMode(pair.ModeA)
-		modeB := catalog.GetMode(pair.ModeB)
-
-		if modeA == nil || modeB == nil {
-			continue
-		}
-
-		// If both modes are in the same category, suggest a mode from a different category
-		if modeA.Category == modeB.Category {
-			// Find an alternative from a different category
-			for _, cat := range AllCategories() {
-				if cat == modeA.Category {
-					continue
-				}
-				alternatives := catalog.ListByCategory(cat)
-				for _, alt := range alternatives {
-					if alt.Tier == TierCore && !suggestedModes[alt.ID] {
-						suggestion := fmt.Sprintf("Consider replacing %s with %s (%s) for more diverse analysis",
-							pair.ModeB, alt.ID, alt.Category)
-						suggestions = append(suggestions, suggestion)
-						suggestedModes[alt.ID] = true
-						break
-					}
-				}
-				if len(suggestions) > 0 {
-					break
-				}
-			}
-		}
-	}
-
-	if len(suggestions) == 0 {
-		suggestions = append(suggestions, "Redundant modes span multiple categories - consider domain-specific alternatives")
-	}
-
-	return suggestions
-}
-
 // Render produces a human-readable redundancy report.
+// Exercised by the e2e-tagged ensemble metrics test (e2e/ensemble_metrics_test.go).
 func (r *RedundancyAnalysis) Render() string {
 	if r == nil {
 		return "No redundancy data available"

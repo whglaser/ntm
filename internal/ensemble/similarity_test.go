@@ -1,73 +1,12 @@
 package ensemble
 
 import (
-	"strings"
 	"testing"
 )
 
-func TestRedundancyAnalysis_SuggestReplacements(t *testing.T) {
-	analysis := &RedundancyAnalysis{
-		PairwiseScores: []PairSimilarity{
-			{ModeA: "mode-a", ModeB: "mode-b", Similarity: 0.9},
-		},
-	}
-
-	catalog, err := NewModeCatalog([]ReasoningMode{
-		{ID: "mode-a", Name: "A", Category: CategoryFormal, Tier: TierCore, ShortDesc: "A"},
-		{ID: "mode-b", Name: "B", Category: CategoryFormal, Tier: TierCore, ShortDesc: "B"},
-		{ID: "alt-1", Name: "Alt", Category: CategoryUncertainty, Tier: TierCore, ShortDesc: "Alt"},
-	}, "test")
-	if err != nil {
-		t.Fatalf("NewModeCatalog error: %v", err)
-	}
-
-	suggestions := analysis.SuggestReplacements(catalog)
-	if len(suggestions) == 0 {
-		t.Fatal("expected suggestions")
-	}
-
-	joined := strings.Join(suggestions, "\n")
-	if !strings.Contains(joined, "mode-b") || !strings.Contains(joined, "alt-1") {
-		t.Fatalf("unexpected suggestions: %v", suggestions)
-	}
-}
-
-func TestGetHighRedundancyPairs(t *testing.T) {
-	analysis := &RedundancyAnalysis{
-		OverallScore: 0.4,
-		PairwiseScores: []PairSimilarity{
-			{ModeA: "a", ModeB: "b", Similarity: 0.8},
-			{ModeA: "a", ModeB: "c", Similarity: 0.3},
-			{ModeA: "b", ModeB: "c", Similarity: 0.6},
-		},
-	}
-
-	// Threshold 0.5
-	high := analysis.GetHighRedundancyPairs(0.5)
-	if len(high) != 2 {
-		t.Errorf("expected 2 pairs above 0.5, got %d", len(high))
-	}
-
-	// Threshold 0.7
-	high = analysis.GetHighRedundancyPairs(0.7)
-	if len(high) != 1 {
-		t.Errorf("expected 1 pair above 0.7, got %d", len(high))
-	}
-
-	// Threshold 0.9
-	high = analysis.GetHighRedundancyPairs(0.9)
-	if len(high) != 0 {
-		t.Errorf("expected 0 pairs above 0.9, got %d", len(high))
-	}
-}
-
-func TestGetHighRedundancyPairs_NilAnalysis(t *testing.T) {
-	var analysis *RedundancyAnalysis
-	high := analysis.GetHighRedundancyPairs(0.5)
-	if high != nil {
-		t.Error("expected nil for nil analysis")
-	}
-}
+// =============================================================================
+// Redundancy render helpers (exercised by the e2e ensemble metrics test)
+// =============================================================================
 
 func TestRedundancyAnalysis_Render(t *testing.T) {
 	analysis := &RedundancyAnalysis{

@@ -1,7 +1,6 @@
 package ensemble
 
 import (
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -683,41 +682,3 @@ func absInt(x int) int {
 }
 
 // ComparisonResultJSON returns the comparison result as JSON.
-func (r *ComparisonResult) JSON() ([]byte, error) {
-	return json.MarshalIndent(r, "", "  ")
-}
-
-// IsEmpty returns true if there are no differences.
-func (r *ComparisonResult) IsEmpty() bool {
-	return r.ModeDiff.AddedCount == 0 &&
-		r.ModeDiff.RemovedCount == 0 &&
-		r.FindingsDiff.NewCount == 0 &&
-		r.FindingsDiff.MissingCount == 0 &&
-		r.FindingsDiff.ChangedCount == 0 &&
-		len(r.ConclusionDiff.ThesisChanges) == 0 &&
-		!r.ConclusionDiff.SynthesisChanged &&
-		len(r.ContributionDiff.ScoreDeltas) == 0 &&
-		len(r.ContributionDiff.RankChanges) == 0
-}
-
-// HasModeChanges returns true if mode composition changed.
-func (r *ComparisonResult) HasModeChanges() bool {
-	return r.ModeDiff.AddedCount > 0 || r.ModeDiff.RemovedCount > 0
-}
-
-// HasFindingChanges returns true if any findings changed.
-func (r *ComparisonResult) HasFindingChanges() bool {
-	return r.FindingsDiff.NewCount > 0 ||
-		r.FindingsDiff.MissingCount > 0 ||
-		r.FindingsDiff.ChangedCount > 0
-}
-
-// HasConclusionChanges returns true if conclusions changed.
-func (r *ComparisonResult) HasConclusionChanges() bool {
-	return len(r.ConclusionDiff.ThesisChanges) > 0 || r.ConclusionDiff.SynthesisChanged
-}
-
-// HasContributionChanges returns true if contribution scores changed.
-func (r *ComparisonResult) HasContributionChanges() bool {
-	return len(r.ContributionDiff.ScoreDeltas) > 0 || len(r.ContributionDiff.RankChanges) > 0
-}
