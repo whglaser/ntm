@@ -321,6 +321,12 @@ func ClassifyCommandError(err error) CommandErrorClass {
 	if err == nil {
 		return CommandErrorClass{Kind: CommandErrorNone}
 	}
+	if errors.Is(err, ErrKillServerRefused) {
+		// A deliberate refusal is caller error, not an unhealthy tmux: it must
+		// not feed the circuit breaker or invite a retry of the same lethal
+		// command.
+		return CommandErrorClass{Kind: CommandErrorCommandFailed}
+	}
 
 	// Match on STDERR alone when we have it. The flattened error string also
 	// contains the argv, and for send-keys the argv is the agent's prompt —
@@ -434,9 +440,133 @@ func buildRemoteShellCommand(command string, args ...string) string {
 	return strings.Join(parts, " ")
 }
 
+// ErrKillServerRefused is returned when a kill-server invocation would act on
+// the operator's ambient tmux server (the socket this process inherited at
+// startup, or the default per-user socket).
+//
+// A single unisolated test could previously run `tmux kill-server` against the
+// developer's default server and take every live session with it (ntm-6c7of),
+// so the refusal lives in the exec path every caller shares. Tests and other
+// automation must isolate with TMUX_TMPDIR or an explicit -S/-L first; the
+// operator can always opt in with NTM_ALLOW_KILL_SERVER=1.
+var ErrKillServerRefused = errors.New("refusing to kill an ambient tmux server")
+
+// AllowKillServerEnv is the explicit operator opt-in for killing the
+// ambient/default server. It exists for the operator, not for tests: a test
+// that needs it is reaching a server it does not own.
+const AllowKillServerEnv = "NTM_ALLOW_KILL_SERVER"
+
+// ambientTmuxSocketPath is the socket this process inherited at startup,
+// captured before any test can clear TMUX. It is empty when ntm did not start
+// inside tmux.
+var ambientTmuxSocketPath = func() string {
+	path, _, _ := strings.Cut(os.Getenv("TMUX"), ",")
+	return strings.TrimSpace(path)
+}()
+
+// guardAmbientKillServer refuses `tmux kill-server` unless the invocation
+// provably targets a private server or the operator opted in. The socket
+// resolution mirrors the tmux client: explicit -S wins, then -L under the
+// TMUX_TMPDIR root, then the ambient TMUX socket, then the default socket.
+func guardAmbientKillServer(args []string) error {
+	if !isKillServerCommand(args) {
+		return nil
+	}
+	if os.Getenv(AllowKillServerEnv) == "1" {
+		return nil
+	}
+	if killServerTargetsPrivateServer(args, os.Getenv, ambientTmuxSocketPath) {
+		return nil
+	}
+	return fmt.Errorf(
+		"%w; set %s=1 to override, or isolate with TMUX_TMPDIR/-S before retrying",
+		ErrKillServerRefused, AllowKillServerEnv,
+	)
+}
+
+// isKillServerCommand reports whether the argv invokes tmux's kill-server.
+func isKillServerCommand(args []string) bool {
+	for _, arg := range args {
+		if arg == "kill-server" {
+			return true
+		}
+	}
+	return false
+}
+
+// socketFlagValue extracts the value of a tmux socket flag (-S path or
+// -L name) in its separated, attached, or equals forms.
+func socketFlagValue(args []string, flag string) (string, bool) {
+	for i, arg := range args {
+		switch {
+		case arg == flag:
+			if i+1 < len(args) {
+				return args[i+1], true
+			}
+			return "", true
+		case strings.HasPrefix(arg, flag+"="):
+			return arg[len(flag)+1:], true
+		case strings.HasPrefix(arg, flag) && len(arg) > len(flag):
+			return arg[len(flag):], true
+		}
+	}
+	return "", false
+}
+
+// killServerSocketPath resolves the socket a kill-server invocation would
+// reach, following the same precedence as the tmux client binary. It returns
+// the empty string only when an explicit socket flag carries no value.
+func killServerSocketPath(args []string, getenv func(string) string) string {
+	if path, ok := socketFlagValue(args, "-S"); ok {
+		return strings.TrimSpace(path)
+	}
+	root := strings.TrimSpace(getenv("TMUX_TMPDIR"))
+	if root == "" {
+		root = "/tmp"
+	}
+	perUser := filepath.Join(root, fmt.Sprintf("tmux-%d", os.Getuid()))
+	if name, ok := socketFlagValue(args, "-L"); ok {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return ""
+		}
+		return filepath.Join(perUser, name)
+	}
+	if tmuxEnv := strings.TrimSpace(getenv("TMUX")); tmuxEnv != "" {
+		path, _, _ := strings.Cut(tmuxEnv, ",")
+		return strings.TrimSpace(path)
+	}
+	return filepath.Join(perUser, "default")
+}
+
+// defaultTmuxSocketPath is the socket tmux uses for the user's default server
+// when neither TMUX nor TMUX_TMPDIR is set.
+func defaultTmuxSocketPath() string {
+	return filepath.Join("/tmp", fmt.Sprintf("tmux-%d", os.Getuid()), "default")
+}
+
+// killServerTargetsPrivateServer reports whether the kill-server invocation
+// resolves to a socket other than the ambient and default user servers.
+// Killing a private server is the deliberate test/automation operation this
+// guard protects, so it stays allowed.
+func killServerTargetsPrivateServer(args []string, getenv func(string) string, ambient string) bool {
+	target := killServerSocketPath(args, getenv)
+	if target == "" {
+		return false
+	}
+	target = filepath.Clean(target)
+	if ambient = strings.TrimSpace(ambient); ambient != "" && target == filepath.Clean(ambient) {
+		return false
+	}
+	return target != defaultTmuxSocketPath()
+}
+
 func runLocalContext(ctx context.Context, args ...string) (string, error) {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if err := guardAmbientKillServer(args); err != nil {
+		return "", err
 	}
 	binary := BinaryPath()
 	cmd := exec.CommandContext(ctx, binary, args...)

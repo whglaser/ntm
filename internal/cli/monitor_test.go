@@ -51,6 +51,12 @@ func TestAccountRotationMonitorRealTmux(t *testing.T) {
 		t.Skip("real tmux unavailable")
 	}
 	dir := t.TempDir()
+	// Keep the ambient-server guard satisfied: the wrapper below redirects
+	// every command to its own -S socket, and the private TMUX_TMPDIR marks
+	// this process as isolated so the cleanup kill-server is allowed
+	// (ntm-6c7of).
+	t.Setenv("TMUX", "")
+	t.Setenv("TMUX_TMPDIR", dir)
 	// Isolate the server, including its configuration and environment, from
 	// any operator sessions. A spare session keeps the server PID unchanged
 	// while the monitored name is replaced.
