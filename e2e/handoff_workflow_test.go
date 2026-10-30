@@ -327,8 +327,8 @@ func TestHandoffWithFileChanges(t *testing.T) {
 		MarkCreated("db/connection.go", "db/migrations.go").
 		MarkModified("config/database.yaml").
 		MarkDeleted("legacy/old_db.go").
-		AddDecision("orm", "Using GORM v2").
 		AddFinding("performance", "Query time reduced by 40%")
+	h.Decisions = map[string]string{"orm": "Using GORM v2"}
 
 	path, err := writer.Write(h, "refactor")
 	if err != nil {
@@ -661,10 +661,12 @@ func TestHandoffWithBlockers(t *testing.T) {
 
 	h := handoff.New("blocked-session").
 		WithGoalAndNow("Partial implementation", "Resolve blockers first").
-		WithStatus(handoff.StatusBlocked, handoff.OutcomePartialMinus).
-		AddBlocker("Waiting for API review").
-		AddBlocker("Need database credentials").
-		AddBlocker("Dependency version conflict")
+		WithStatus(handoff.StatusBlocked, handoff.OutcomePartialMinus)
+	h.Blockers = []string{
+		"Waiting for API review",
+		"Need database credentials",
+		"Dependency version conflict",
+	}
 
 	path, err := writer.Write(h, "blocked")
 	if err != nil {
@@ -686,9 +688,6 @@ func TestHandoffWithBlockers(t *testing.T) {
 	suite.logger.Log("[E2E-HANDOFF] Blockers: %v", restored.Blockers)
 
 	// Verify blocked status
-	if !restored.IsBlocked() {
-		t.Error("[E2E-HANDOFF] Expected IsBlocked() to return true")
-	}
 	if restored.Status != handoff.StatusBlocked {
 		t.Errorf("[E2E-HANDOFF] Status mismatch: got %s, want blocked", restored.Status)
 	}

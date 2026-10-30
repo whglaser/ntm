@@ -3,6 +3,7 @@
 package tmux
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -72,9 +73,9 @@ func TestCaptureForHealthCheck(t *testing.T) {
 	SendKeys(target, "echo HEALTH_TEST", true)
 	time.Sleep(200 * time.Millisecond)
 
-	output, err := DefaultClient.CaptureForHealthCheck(target)
+	output, err := DefaultClient.CaptureForHealthCheckContext(context.Background(), target)
 	if err != nil {
-		t.Fatalf("CaptureForHealthCheck failed: %v", err)
+		t.Fatalf("CaptureForHealthCheckContext failed: %v", err)
 	}
 
 	if !strings.Contains(output, "HEALTH_TEST") {
@@ -93,9 +94,9 @@ func TestCaptureForFullContext(t *testing.T) {
 	SendKeys(target, "echo CONTEXT_TEST", true)
 	time.Sleep(200 * time.Millisecond)
 
-	output, err := DefaultClient.CaptureForFullContext(target)
+	output, err := DefaultClient.CaptureForFullContextContext(context.Background(), target)
 	if err != nil {
-		t.Fatalf("CaptureForFullContext failed: %v", err)
+		t.Fatalf("CaptureForFullContextContext failed: %v", err)
 	}
 
 	if !strings.Contains(output, "CONTEXT_TEST") {
@@ -114,9 +115,9 @@ func TestCaptureForCheckpoint(t *testing.T) {
 	SendKeys(target, "echo CHECKPOINT_TEST", true)
 	time.Sleep(200 * time.Millisecond)
 
-	output, err := DefaultClient.CaptureForCheckpoint(target)
+	output, err := DefaultClient.CapturePaneOutputContext(context.Background(), target, LinesCheckpoint)
 	if err != nil {
-		t.Fatalf("CaptureForCheckpoint failed: %v", err)
+		t.Fatalf("CapturePaneOutputContext(LinesCheckpoint) failed: %v", err)
 	}
 
 	if !strings.Contains(output, "CHECKPOINT_TEST") {

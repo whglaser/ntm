@@ -865,23 +865,13 @@ func TestSwarmOrchestrator_RemoteSupport(t *testing.T) {
 				orchestrator = NewRemoteSessionOrchestrator(tc.host)
 			}
 
-			t.Logf("[TEST] Host: %q, IsRemote: %v, Expected: %v",
-				tc.host, orchestrator.IsRemote(), tc.expectRemote)
+			t.Logf("[TEST] Host: %q, clientRemote: %q, Expected remote: %v",
+				tc.host, orchestrator.tmuxClient().Remote, tc.expectRemote)
 
-			if orchestrator.IsRemote() != tc.expectRemote {
-				t.Errorf("[TEST] FAIL: IsRemote() = %v, want %v",
-					orchestrator.IsRemote(), tc.expectRemote)
+			if got := orchestrator.tmuxClient().Remote; got != tc.host {
+				t.Errorf("[TEST] FAIL: client remote = %q, want %q", got, tc.host)
 			} else {
-				t.Log("[TEST] PASS: remote detection correct")
-			}
-
-			if tc.expectRemote {
-				if orchestrator.RemoteHost() != tc.host {
-					t.Errorf("[TEST] FAIL: RemoteHost() = %q, want %q",
-						orchestrator.RemoteHost(), tc.host)
-				} else {
-					t.Logf("[TEST] PASS: RemoteHost() = %q", orchestrator.RemoteHost())
-				}
+				t.Log("[TEST] PASS: remote configuration correct")
 			}
 		})
 	}

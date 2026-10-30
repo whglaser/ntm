@@ -510,87 +510,21 @@ func TestGeometryResult_WithTolerance(t *testing.T) {
 	}
 }
 
-func TestSessionOrchestrator_TmuxBinaryPath(t *testing.T) {
-	orch := NewSessionOrchestrator()
-
-	path := orch.TmuxBinaryPath()
-
-	// Should return a non-empty path
-	if path == "" {
-		t.Error("expected non-empty tmux binary path")
-	}
-
-	// Should prefer explicit paths over just "tmux"
-	// Common locations: /usr/bin/tmux, /usr/local/bin/tmux, /opt/homebrew/bin/tmux
-	validPaths := []string{
-		"/usr/bin/tmux",
-		"/usr/local/bin/tmux",
-		"/opt/homebrew/bin/tmux",
-		"tmux", // fallback
-	}
-
-	found := false
-	for _, valid := range validPaths {
-		if path == valid {
-			found = true
-			break
+func TestSessionOrchestrator_RemoteConfig(t *testing.T) {
+	t.Run("local orchestrator", func(t *testing.T) {
+		orch := NewSessionOrchestrator()
+		if got := orch.tmuxClient().Remote; got != "" {
+			t.Errorf("local orchestrator client remote = %q, want empty", got)
 		}
-	}
+	})
 
-	if !found {
-		t.Logf("tmux binary path: %s (not in expected list, but may be valid)", path)
-	}
-}
-
-func TestSessionOrchestrator_GetTmuxBinaryInfo(t *testing.T) {
-	orch := NewSessionOrchestrator()
-
-	info := orch.GetTmuxBinaryInfo()
-
-	if info == nil {
-		t.Fatal("expected non-nil TmuxBinaryInfo")
-	}
-
-	if info.Path == "" {
-		t.Error("expected non-empty path in TmuxBinaryInfo")
-	}
-
-	// Default orchestrator should use local tmux
-	if info.IsRemote {
-		t.Error("expected IsRemote=false for default orchestrator")
-	}
-}
-
-func TestTmuxBinaryInfo(t *testing.T) {
-	info := TmuxBinaryInfo{
-		Path:      "/usr/bin/tmux",
-		Available: true,
-		IsRemote:  false,
-	}
-
-	if info.Path != "/usr/bin/tmux" {
-		t.Errorf("expected path /usr/bin/tmux, got %q", info.Path)
-	}
-
-	if !info.Available {
-		t.Error("expected Available=true")
-	}
-
-	if info.IsRemote {
-		t.Error("expected IsRemote=false")
-	}
-}
-
-func TestTmuxBinaryInfo_Remote(t *testing.T) {
-	info := TmuxBinaryInfo{
-		Path:      "/usr/bin/tmux",
-		Available: true,
-		IsRemote:  true,
-	}
-
-	if !info.IsRemote {
-		t.Error("expected IsRemote=true for remote configuration")
-	}
+	t.Run("remote orchestrator", func(t *testing.T) {
+		const host = "ubuntu@10.0.0.5"
+		orch := NewRemoteSessionOrchestrator(host)
+		if got := orch.tmuxClient().Remote; got != host {
+			t.Errorf("remote orchestrator client remote = %q, want %q", got, host)
+		}
+	})
 }
 
 func TestNewRemoteSessionOrchestrator(t *testing.T) {
@@ -611,149 +545,5 @@ func TestNewRemoteSessionOrchestrator(t *testing.T) {
 
 	if orch.StaggerDelay != 300*time.Millisecond {
 		t.Errorf("expected StaggerDelay 300ms, got %v", orch.StaggerDelay)
-	}
-}
-
-func TestSessionOrchestrator_IsRemote(t *testing.T) {
-	t.Run("local orchestrator", func(t *testing.T) {
-		orch := NewSessionOrchestrator()
-		if orch.IsRemote() {
-			t.Error("expected IsRemote()=false for local orchestrator")
-		}
-	})
-
-	t.Run("remote orchestrator", func(t *testing.T) {
-		orch := NewRemoteSessionOrchestrator("user@host")
-		if !orch.IsRemote() {
-			t.Error("expected IsRemote()=true for remote orchestrator")
-		}
-	})
-}
-
-func TestSessionOrchestrator_RemoteHost(t *testing.T) {
-	t.Run("local orchestrator", func(t *testing.T) {
-		orch := NewSessionOrchestrator()
-		host := orch.RemoteHost()
-		if host != "" {
-			t.Errorf("expected empty RemoteHost for local orchestrator, got %q", host)
-		}
-	})
-
-	t.Run("remote orchestrator", func(t *testing.T) {
-		expected := "ubuntu@10.0.0.5"
-		orch := NewRemoteSessionOrchestrator(expected)
-		host := orch.RemoteHost()
-		if host != expected {
-			t.Errorf("expected RemoteHost=%q, got %q", expected, host)
-		}
-	})
-}
-
-func TestSessionOrchestrator_TestConnection_Local(t *testing.T) {
-	orch := NewSessionOrchestrator()
-
-	// Local connection test should work if tmux is installed
-	err := orch.TestConnection()
-	if err != nil {
-		t.Logf("local connection test: %v (tmux may not be installed)", err)
-	}
-}
-
-func TestSessionOrchestrator_GetTmuxBinaryInfo_Remote(t *testing.T) {
-	orch := NewRemoteSessionOrchestrator("user@remote-host")
-
-	info := orch.GetTmuxBinaryInfo()
-
-	if info == nil {
-		t.Fatal("expected non-nil TmuxBinaryInfo")
-	}
-
-	if !info.IsRemote {
-		t.Error("expected IsRemote=true for remote orchestrator")
-	}
-}
-
-func TestRemoteConnectionInfo(t *testing.T) {
-	t.Run("local orchestrator", func(t *testing.T) {
-		orch := NewSessionOrchestrator()
-		info := orch.GetRemoteConnectionInfo()
-
-		if info == nil {
-			t.Fatal("expected non-nil RemoteConnectionInfo")
-		}
-
-		if info.IsRemote {
-			t.Error("expected IsRemote=false for local orchestrator")
-		}
-
-		if info.Host != "" {
-			t.Errorf("expected empty Host for local orchestrator, got %q", info.Host)
-		}
-	})
-
-	t.Run("remote orchestrator structure", func(t *testing.T) {
-		host := "admin@server.example.com"
-		orch := NewRemoteSessionOrchestrator(host)
-		info := orch.GetRemoteConnectionInfo()
-
-		if info == nil {
-			t.Fatal("expected non-nil RemoteConnectionInfo")
-		}
-
-		if !info.IsRemote {
-			t.Error("expected IsRemote=true for remote orchestrator")
-		}
-
-		if info.Host != host {
-			t.Errorf("expected Host=%q, got %q", host, info.Host)
-		}
-
-		// Connection will fail since the host doesn't exist, but structure should be correct
-		if info.Connected {
-			t.Logf("unexpectedly connected to %s (may be a real host)", host)
-		}
-	})
-}
-
-func TestRemoteConnectionInfo_Struct(t *testing.T) {
-	info := RemoteConnectionInfo{
-		Host:        "user@host",
-		IsRemote:    true,
-		Connected:   true,
-		TmuxVersion: "tmux 3.4",
-		Error:       "",
-	}
-
-	if info.Host != "user@host" {
-		t.Errorf("expected Host=user@host, got %q", info.Host)
-	}
-
-	if !info.IsRemote {
-		t.Error("expected IsRemote=true")
-	}
-
-	if !info.Connected {
-		t.Error("expected Connected=true")
-	}
-
-	if info.TmuxVersion != "tmux 3.4" {
-		t.Errorf("expected TmuxVersion='tmux 3.4', got %q", info.TmuxVersion)
-	}
-}
-
-func TestRemoteConnectionInfo_Failed(t *testing.T) {
-	info := RemoteConnectionInfo{
-		Host:      "user@unreachable",
-		IsRemote:  true,
-		Connected: false,
-		Error:     "connection refused",
-	}
-
-	if info.Connected {
-		t.Error("expected Connected=false for failed connection")
-	}
-
-	if info.Error == "" {
-		t.Error("expected non-empty Error for failed connection")
 	}
 }
