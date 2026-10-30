@@ -139,25 +139,6 @@ func TestReasoningMode_Validate(t *testing.T) {
 	}
 }
 
-func TestAssignmentStatus_IsTerminal(t *testing.T) {
-	tests := []struct {
-		status   AssignmentStatus
-		terminal bool
-	}{
-		{AssignmentPending, false},
-		{AssignmentInjecting, false},
-		{AssignmentActive, false},
-		{AssignmentDone, true},
-		{AssignmentError, true},
-	}
-
-	for _, tt := range tests {
-		if got := tt.status.IsTerminal(); got != tt.terminal {
-			t.Errorf("AssignmentStatus(%q).IsTerminal() = %v, want %v", tt.status, got, tt.terminal)
-		}
-	}
-}
-
 func TestEnsembleStatus_IsTerminal(t *testing.T) {
 	tests := []struct {
 		status   EnsembleStatus

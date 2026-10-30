@@ -256,11 +256,6 @@ func (r *EnsembleRegistry) ListByTag(tag string) []EnsemblePreset {
 	return result
 }
 
-// Count returns the number of ensembles.
-func (r *EnsembleRegistry) Count() int {
-	return len(r.ensembles)
-}
-
 // Global singleton for thread-safe ensemble registry access.
 var (
 	globalRegistry     *EnsembleRegistry

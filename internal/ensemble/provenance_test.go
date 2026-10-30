@@ -416,57 +416,6 @@ func TestFormatProvenance_WithCitations(t *testing.T) {
 	}
 }
 
-func TestProvenanceChain_Validate(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name    string
-		chain   ProvenanceChain
-		wantErr bool
-	}{
-		{
-			"valid",
-			ProvenanceChain{
-				FindingID:    "f1",
-				SourceMode:   "m1",
-				OriginalText: "text",
-				Steps:        []ProvenanceStep{{Stage: "discovery", Action: "found"}},
-			},
-			false,
-		},
-		{
-			"missing finding_id",
-			ProvenanceChain{SourceMode: "m1", OriginalText: "text", Steps: []ProvenanceStep{{Stage: "s"}}},
-			true,
-		},
-		{
-			"missing source_mode",
-			ProvenanceChain{FindingID: "f1", OriginalText: "text", Steps: []ProvenanceStep{{Stage: "s"}}},
-			true,
-		},
-		{
-			"missing original_text",
-			ProvenanceChain{FindingID: "f1", SourceMode: "m1", Steps: []ProvenanceStep{{Stage: "s"}}},
-			true,
-		},
-		{
-			"missing steps",
-			ProvenanceChain{FindingID: "f1", SourceMode: "m1", OriginalText: "text"},
-			true,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			err := tc.chain.Validate()
-			if (err != nil) != tc.wantErr {
-				t.Errorf("Validate() err = %v, wantErr = %v", err, tc.wantErr)
-			}
-		})
-	}
-}
-
 func TestTruncateText(t *testing.T) {
 	t.Parallel()
 

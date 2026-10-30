@@ -109,16 +109,6 @@ internal/context/rotation.go:Rotator.ManualRotate	bd-ld4j2	reachable only throug
 internal/context/rotation.go:Rotator.rotateAgent	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/cost/tracker.go:PricingMatch.Known	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/dispatch/dispatch.go:Prepared.Targets	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/ensemble/contributions.go:ContributionReport.JSON	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/ensemble/ensemble_loader.go:EnsembleRegistry.Count	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/ensemble/explanation.go:ExplanationLayer.JSON	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/ensemble/provenance.go:ProvenanceChain.Validate	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/ensemble/types.go:AssignmentStatus.IsTerminal	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/ensemble/types.go:ModeCatalog.Count	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/ensemble/types.go:ModeCatalog.ListByTier	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/ensemble/types.go:ModeCatalog.ListDefault	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/ensemble/types.go:ModeCatalog.SearchModes	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/ensemble/types.go:ModeCatalog.Version	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/events/bus.go:EventBus.SubscriberCount	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/integrations/caut/cache.go:UsageCache.Clear	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/integrations/caut/cache.go:UsageCache.GetUpdateCount	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
@@ -519,3 +509,9 @@ internal/ensemble/similarity.go:RedundancyAnalysis.Render	permanent	renders the 
 internal/ensemble/similarity.go:interpretScore	permanent	reached by RedundancyAnalysis.Render, which the e2e-tagged e2e/ensemble_metrics_test.go exercises
 internal/ensemble/similarity.go:classifySimilarity	permanent	reached by RedundancyAnalysis.Render, which the e2e-tagged e2e/ensemble_metrics_test.go exercises
 internal/ensemble/similarity.go:diversityNote	permanent	reached by RedundancyAnalysis.Render, which the e2e-tagged e2e/ensemble_metrics_test.go exercises
+# permanent: test-inspection accessors (bd-ld4j2 batch 13)
+internal/ensemble/types.go:ModeCatalog.Count	permanent	test-inspection accessor for the live mode catalog: reached by internal/ensemble/loader_test.go (12 sites) and types_test.go, which assert catalog load counts; no production caller
+internal/ensemble/types.go:ModeCatalog.ListByTier	permanent	test-inspection accessor for the live mode catalog: reached by internal/ensemble/types_test.go (TestModeCatalog_ListByTier)
+internal/ensemble/types.go:ModeCatalog.ListDefault	permanent	test-inspection accessor for the live mode catalog: reached by internal/ensemble/types_test.go (TestModeCatalog_ListDefault); delegates to ListByTier
+internal/ensemble/types.go:ModeCatalog.SearchModes	permanent	test-inspection accessor for the live mode catalog: reached by internal/ensemble/types_test.go (TestModeCatalog_Basic search assertions)
+internal/ensemble/types.go:ModeCatalog.Version	permanent	test-inspection accessor for the live mode catalog: reached by internal/ensemble/types_test.go (TestModeCatalog_Basic)

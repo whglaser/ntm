@@ -193,7 +193,7 @@ func TestExplanationLayer_JSON(t *testing.T) {
 	tracker.RecordConclusion("c1", ConclusionFinding, "Test", []string{"mode-a"}, 0.8)
 	layer := tracker.GenerateLayer()
 
-	data, err := layer.JSON()
+	data, err := json.MarshalIndent(layer, "", "  ")
 	if err != nil {
 		t.Fatalf("JSON error: %v", err)
 	}

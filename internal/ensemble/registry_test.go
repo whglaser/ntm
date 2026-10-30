@@ -20,8 +20,8 @@ func TestEnsembleRegistry_Basics(t *testing.T) {
 	}
 
 	registry := NewEnsembleRegistry(presets, catalog)
-	if registry.Count() != 2 {
-		t.Fatalf("Count() = %d, want 2", registry.Count())
+	if len(registry.ensembles) != 2 {
+		t.Fatalf("ensemble count = %d, want 2", len(registry.ensembles))
 	}
 	if registry.Get("one") == nil {
 		t.Fatal("expected preset 'one' to exist")

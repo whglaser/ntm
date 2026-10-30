@@ -1,7 +1,6 @@
 package ensemble
 
 import (
-	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -303,14 +302,6 @@ func FormatExplanation(layer *ExplanationLayer) string {
 	}
 
 	return b.String()
-}
-
-// JSON returns the explanation layer as indented JSON.
-func (layer *ExplanationLayer) JSON() ([]byte, error) {
-	if layer == nil {
-		return nil, fmt.Errorf("nil explanation layer")
-	}
-	return json.MarshalIndent(layer, "", "  ")
 }
 
 // BuildExplanationFromMerge creates explanations from merge results.

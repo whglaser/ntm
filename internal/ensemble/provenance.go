@@ -3,7 +3,6 @@ package ensemble
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -377,21 +376,4 @@ func truncateText(text string, maxLen int) string {
 		return text
 	}
 	return text[:maxLen-3] + "..."
-}
-
-// Validate checks that a provenance chain is valid.
-func (p *ProvenanceChain) Validate() error {
-	if p.FindingID == "" {
-		return errors.New("finding_id is required")
-	}
-	if p.SourceMode == "" {
-		return errors.New("source_mode is required")
-	}
-	if p.OriginalText == "" {
-		return errors.New("original_text is required")
-	}
-	if len(p.Steps) == 0 {
-		return errors.New("at least one step is required")
-	}
-	return nil
 }

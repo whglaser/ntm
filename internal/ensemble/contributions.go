@@ -1,7 +1,6 @@
 package ensemble
 
 import (
-	"encoding/json"
 	"sort"
 	"time"
 )
@@ -287,11 +286,6 @@ func (t *ContributionTracker) GenerateReport() *ContributionReport {
 	}
 
 	return report
-}
-
-// JSON returns the report as indented JSON.
-func (r *ContributionReport) JSON() ([]byte, error) {
-	return json.MarshalIndent(r, "", "  ")
 }
 
 // TrackContributionsFromMerge populates contribution data from merge results.

@@ -344,7 +344,7 @@ func TestContributionReport_JSON(t *testing.T) {
 	tracker.RecordSurvivingFinding("mode-a", "F")
 	report := tracker.GenerateReport()
 
-	data, err := report.JSON()
+	data, err := json.MarshalIndent(report, "", "  ")
 	if err != nil {
 		t.Fatalf("JSON error: %v", err)
 	}

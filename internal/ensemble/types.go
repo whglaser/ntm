@@ -300,11 +300,6 @@ func (s AssignmentStatus) String() string {
 	return string(s)
 }
 
-// IsTerminal returns true if this is a final status (done or error).
-func (s AssignmentStatus) IsTerminal() bool {
-	return s == AssignmentDone || s == AssignmentError
-}
-
 // EnsembleStatus tracks the overall ensemble session state.
 type EnsembleStatus string
 
