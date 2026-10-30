@@ -223,66 +223,6 @@ func TestDeriveHealthState(t *testing.T) {
 	}
 }
 
-func TestGetBestAgent(t *testing.T) {
-	scorer := NewAgentScorer(DefaultRoutingConfig())
-
-	agents := []ScoredAgent{
-		{PaneID: "cc_1", Score: 50, Excluded: false},
-		{PaneID: "cc_2", Score: 80, Excluded: false},
-		{PaneID: "cc_3", Score: 100, Excluded: true}, // Excluded, should not be selected
-		{PaneID: "cc_4", Score: 60, Excluded: false},
-	}
-
-	best := scorer.GetBestAgent(agents)
-	if best == nil {
-		t.Fatal("GetBestAgent() returned nil")
-	}
-	if best.PaneID != "cc_2" {
-		t.Errorf("GetBestAgent() = %s, want cc_2", best.PaneID)
-	}
-}
-
-func TestGetBestAgent_AllExcluded(t *testing.T) {
-	scorer := NewAgentScorer(DefaultRoutingConfig())
-
-	agents := []ScoredAgent{
-		{PaneID: "cc_1", Score: 50, Excluded: true},
-		{PaneID: "cc_2", Score: 80, Excluded: true},
-	}
-
-	best := scorer.GetBestAgent(agents)
-	if best != nil {
-		t.Errorf("GetBestAgent() should return nil when all excluded, got %s", best.PaneID)
-	}
-}
-
-func TestGetAvailableAgents(t *testing.T) {
-	scorer := NewAgentScorer(DefaultRoutingConfig())
-
-	agents := []ScoredAgent{
-		{PaneID: "cc_1", Score: 50, Excluded: false},
-		{PaneID: "cc_2", Score: 80, Excluded: false},
-		{PaneID: "cc_3", Score: 100, Excluded: true},
-		{PaneID: "cc_4", Score: 60, Excluded: false},
-	}
-
-	available := scorer.GetAvailableAgents(agents)
-	if len(available) != 3 {
-		t.Errorf("GetAvailableAgents() returned %d agents, want 3", len(available))
-	}
-
-	// Check sorted by score descending
-	if available[0].PaneID != "cc_2" {
-		t.Errorf("First available should be cc_2, got %s", available[0].PaneID)
-	}
-	if available[1].PaneID != "cc_4" {
-		t.Errorf("Second available should be cc_4, got %s", available[1].PaneID)
-	}
-	if available[2].PaneID != "cc_1" {
-		t.Errorf("Third available should be cc_1, got %s", available[2].PaneID)
-	}
-}
-
 func TestExcludePanes(t *testing.T) {
 	agents := []ScoredAgent{
 		{PaneID: "cc_1", PaneIndex: 1},
@@ -1117,38 +1057,6 @@ func TestRouterRoute(t *testing.T) {
 	})
 }
 
-func TestRouterRouteWithRelaxation(t *testing.T) {
-	router := NewRouter()
-
-	t.Run("returns immediately if primary succeeds", func(t *testing.T) {
-		agents := []ScoredAgent{
-			{PaneID: "cc_1", Score: 80, State: StateWaiting, Excluded: false},
-		}
-
-		result := router.RouteWithRelaxation(agents, StrategyLeastLoaded, RoutingContext{})
-		if result.Selected == nil {
-			t.Fatal("RouteWithRelaxation() returned nil")
-		}
-		if result.Selected.PaneID != "cc_1" {
-			t.Errorf("Selected = %s, want cc_1", result.Selected.PaneID)
-		}
-	})
-
-	t.Run("relaxes THINKING exclusion", func(t *testing.T) {
-		agents := []ScoredAgent{
-			{PaneID: "cc_1", Score: 80, State: StateThinking, Excluded: true, ExcludeReason: "agent is currently generating"},
-		}
-
-		result := router.RouteWithRelaxation(agents, StrategyLeastLoaded, RoutingContext{})
-		if result.Selected == nil {
-			t.Fatal("RouteWithRelaxation() should include THINKING agents")
-		}
-		if result.Selected.PaneID != "cc_1" {
-			t.Errorf("Selected = %s, want cc_1", result.Selected.PaneID)
-		}
-	})
-}
-
 func TestFilterExcluded(t *testing.T) {
 	agents := []ScoredAgent{
 		{PaneID: "cc_1", Excluded: false},
@@ -1511,22 +1419,6 @@ func TestRoundRobinAvailableEdgeCase(t *testing.T) {
 	})
 }
 
-func TestRouteWithRelaxationNoEffect(t *testing.T) {
-	router := NewRouter()
-
-	t.Run("relaxation has no effect on non-THINKING agents", func(t *testing.T) {
-		agents := []ScoredAgent{
-			{PaneID: "cc_1", State: StateGenerating, Excluded: true, ExcludeReason: "agent is currently generating"},
-		}
-
-		result := router.RouteWithRelaxation(agents, StrategyLeastLoaded, RoutingContext{})
-		// GENERATING (not THINKING) should not be relaxed
-		if result.Selected != nil {
-			t.Error("Relaxation should not affect GENERATING agents")
-		}
-	})
-}
-
 func TestEmptyAgentsListAllStrategies(t *testing.T) {
 	router := NewRouter()
 
@@ -1809,18 +1701,6 @@ func TestAgentScorerMapping(t *testing.T) {
 		}
 	})
 
-	t.Run("SetAgentMapping", func(t *testing.T) {
-		mapping := map[string]string{
-			"%10": "RedStone",
-			"%11": "PurpleBear",
-		}
-		scorer.SetAgentMapping(mapping)
-
-		name, ok := scorer.GetAgentNameForPane("%10")
-		if !ok || name != "RedStone" {
-			t.Errorf("After SetAgentMapping: GetAgentNameForPane(%%10) = %q, %v", name, ok)
-		}
-	})
 }
 
 func TestCheckReservationWarning_Disabled(t *testing.T) {

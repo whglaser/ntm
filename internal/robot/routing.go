@@ -280,16 +280,6 @@ func (rc *ReservationCache) GetHoldersForPath(path string) []string {
 	return holders
 }
 
-// GetAllReservations returns all cached reservations.
-func (rc *ReservationCache) GetAllReservations() []agentmail.FileReservation {
-	rc.mu.RLock()
-	defer rc.mu.RUnlock()
-
-	result := make([]agentmail.FileReservation, len(rc.reservations))
-	copy(result, rc.reservations)
-	return result
-}
-
 // GetReservedPathsForAgent returns all paths reserved by a specific agent.
 func (rc *ReservationCache) GetReservedPathsForAgent(agentName string) []string {
 	rc.mu.RLock()
@@ -567,11 +557,6 @@ func (s *AgentScorer) wireReservationAffinity(cfg *config.Config, session string
 		slog.Warn("[robot.route] affinity: reservation cache refresh failed; bonus degrades to 0",
 			"session", session, "error", err)
 	}
-}
-
-// SetAgentMapping sets the mapping from pane IDs to Agent Mail agent names.
-func (s *AgentScorer) SetAgentMapping(mapping map[string]string) {
-	s.agentMapping = mapping
 }
 
 // MapPaneToAgent adds a mapping from pane ID to Agent Mail agent name.
@@ -938,44 +923,6 @@ func deriveHealthState(state AgentState) HealthState {
 	default:
 		return HealthHealthy
 	}
-}
-
-// GetBestAgent returns the agent with the highest score.
-func (s *AgentScorer) GetBestAgent(scored []ScoredAgent) *ScoredAgent {
-	var best *ScoredAgent
-
-	for i := range scored {
-		if scored[i].Excluded {
-			continue
-		}
-		if best == nil || scored[i].Score > best.Score {
-			best = &scored[i]
-		}
-	}
-
-	return best
-}
-
-// GetAvailableAgents returns all non-excluded agents sorted by score.
-func (s *AgentScorer) GetAvailableAgents(scored []ScoredAgent) []ScoredAgent {
-	var available []ScoredAgent
-
-	for _, agent := range scored {
-		if !agent.Excluded {
-			available = append(available, agent)
-		}
-	}
-
-	// Sort by score descending
-	for i := 0; i < len(available); i++ {
-		for j := i + 1; j < len(available); j++ {
-			if available[j].Score > available[i].Score {
-				available[i], available[j] = available[j], available[i]
-			}
-		}
-	}
-
-	return available
 }
 
 // ExcludePanes applies explicit index exclusions and physical-pane exclusions.
@@ -1504,34 +1451,6 @@ func (r *Router) Route(agents []ScoredAgent, strategy StrategyName, ctx RoutingC
 	}
 
 	result.Reason = "no suitable agent found"
-	return result
-}
-
-// RouteWithRelaxation tries routing with progressively relaxed constraints.
-func (r *Router) RouteWithRelaxation(agents []ScoredAgent, strategy StrategyName, ctx RoutingContext) RoutingResult {
-	// First try with normal constraints
-	result := r.Route(agents, strategy, ctx)
-	if result.Selected != nil {
-		return result
-	}
-
-	// Relax constraint: include THINKING agents (which are close to WAITING)
-	// These agents might have been excluded but are nearly ready for work.
-	relaxedAgents := make([]ScoredAgent, len(agents))
-	copy(relaxedAgents, agents)
-	for i := range relaxedAgents {
-		if relaxedAgents[i].State == StateThinking && relaxedAgents[i].Excluded {
-			relaxedAgents[i].Excluded = false
-			relaxedAgents[i].ExcludeReason = ""
-		}
-	}
-
-	result = r.Route(relaxedAgents, strategy, ctx)
-	if result.Selected != nil {
-		result.Reason = "relaxed constraints (included THINKING)"
-		return result
-	}
-
 	return result
 }
 

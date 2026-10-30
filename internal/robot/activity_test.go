@@ -26,103 +26,6 @@ func TestNewVelocityTracker(t *testing.T) {
 	}
 }
 
-func TestVelocityTracker_CurrentVelocity(t *testing.T) {
-	tracker := NewVelocityTracker("test")
-
-	// Empty tracker should return 0
-	if v := tracker.CurrentVelocity(); v != 0 {
-		t.Errorf("expected 0 velocity for empty tracker, got %f", v)
-	}
-
-	// Add samples
-	tracker.mu.Lock()
-	tracker.addSampleLocked(VelocitySample{Velocity: 5.0})
-	tracker.addSampleLocked(VelocitySample{Velocity: 10.0})
-	tracker.mu.Unlock()
-
-	// Should return last sample's velocity
-	if v := tracker.CurrentVelocity(); v != 10.0 {
-		t.Errorf("expected velocity 10.0, got %f", v)
-	}
-}
-
-func TestVelocityTracker_AverageVelocity(t *testing.T) {
-	tracker := NewVelocityTracker("test")
-
-	// Empty tracker should return 0
-	if v := tracker.AverageVelocity(); v != 0 {
-		t.Errorf("expected 0 average for empty tracker, got %f", v)
-	}
-
-	// Add samples with known velocities
-	tracker.mu.Lock()
-	tracker.addSampleLocked(VelocitySample{Velocity: 5.0})
-	tracker.addSampleLocked(VelocitySample{Velocity: 10.0})
-	tracker.addSampleLocked(VelocitySample{Velocity: 15.0})
-	tracker.mu.Unlock()
-
-	// Average should be (5 + 10 + 15) / 3 = 10
-	expected := 10.0
-	if v := tracker.AverageVelocity(); v != expected {
-		t.Errorf("expected average %f, got %f", expected, v)
-	}
-}
-
-func TestVelocityTracker_RecentVelocity(t *testing.T) {
-	tracker := NewVelocityTracker("test")
-
-	// Empty tracker should return 0
-	if v := tracker.RecentVelocity(2); v != 0 {
-		t.Errorf("expected 0 for empty tracker, got %f", v)
-	}
-
-	// Add samples
-	tracker.mu.Lock()
-	tracker.addSampleLocked(VelocitySample{Velocity: 5.0})
-	tracker.addSampleLocked(VelocitySample{Velocity: 10.0})
-	tracker.addSampleLocked(VelocitySample{Velocity: 15.0})
-	tracker.addSampleLocked(VelocitySample{Velocity: 20.0})
-	tracker.mu.Unlock()
-
-	// Recent 2 should be (15 + 20) / 2 = 17.5
-	if v := tracker.RecentVelocity(2); v != 17.5 {
-		t.Errorf("expected 17.5, got %f", v)
-	}
-
-	// Recent 0 or negative should use all samples
-	expected := (5.0 + 10.0 + 15.0 + 20.0) / 4.0
-	if v := tracker.RecentVelocity(0); v != expected {
-		t.Errorf("expected %f for n=0, got %f", expected, v)
-	}
-
-	// Recent larger than samples should use all
-	if v := tracker.RecentVelocity(100); v != expected {
-		t.Errorf("expected %f for n=100, got %f", expected, v)
-	}
-}
-
-func TestVelocityTracker_GetSamples(t *testing.T) {
-	tracker := NewVelocityTracker("test")
-
-	tracker.mu.Lock()
-	tracker.addSampleLocked(VelocitySample{Velocity: 5.0})
-	tracker.addSampleLocked(VelocitySample{Velocity: 10.0})
-	tracker.mu.Unlock()
-
-	samples := tracker.GetSamples()
-
-	// Should be a copy
-	if len(samples) != 2 {
-		t.Errorf("expected 2 samples, got %d", len(samples))
-	}
-
-	// Modifying copy shouldn't affect original
-	samples[0].Velocity = 999.0
-	if tracker.Samples[0].Velocity == 999.0 {
-		t.Error("GetSamples should return a copy, not the original")
-	}
-}
-
 func TestVelocityTracker_LastOutputAge(t *testing.T) {
 	tracker := NewVelocityTracker("test")
 
@@ -192,29 +95,6 @@ func TestVelocityTracker_LastOutputTime(t *testing.T) {
 	}
 }
 
-func TestVelocityTracker_Reset(t *testing.T) {
-	tracker := NewVelocityTracker("test")
-
-	// Add some state
-	tracker.mu.Lock()
-	tracker.addSampleLocked(VelocitySample{Velocity: 5.0})
-	tracker.LastCapture = "some content"
-	tracker.LastCaptureAt = time.Now()
-	tracker.mu.Unlock()
-
-	tracker.Reset()
-
-	if len(tracker.Samples) != 0 {
-		t.Errorf("expected empty samples after reset, got %d", len(tracker.Samples))
-	}
-	if tracker.LastCapture != "" {
-		t.Errorf("expected empty LastCapture after reset")
-	}
-	if !tracker.LastCaptureAt.IsZero() {
-		t.Errorf("expected zero LastCaptureAt after reset")
-	}
-}
-
 func TestVelocityTracker_UpdateWithOutput(t *testing.T) {
 	tracker := NewVelocityTracker("test")
 
@@ -252,11 +132,6 @@ func TestVelocityTracker_UpdateWithOutput(t *testing.T) {
 	}
 	if tracker.LastCapture != "hello world" {
 		t.Errorf("expected LastCapture='hello world', got %q", tracker.LastCapture)
-	}
-
-	// Verify sample count
-	if tracker.SampleCount() != 2 {
-		t.Errorf("expected 2 samples, got %d", tracker.SampleCount())
 	}
 }
 
@@ -1072,81 +947,12 @@ func TestStateClassifier_recordTransition(t *testing.T) {
 	}
 }
 
-func TestStateClassifier_CurrentState(t *testing.T) {
-	sc := NewStateClassifier("test", nil)
-
-	if sc.CurrentState() != StateUnknown {
-		t.Errorf("expected UNKNOWN, got %s", sc.CurrentState())
-	}
-
-	sc.currentState = StateGenerating
-	if sc.CurrentState() != StateGenerating {
-		t.Errorf("expected GENERATING, got %s", sc.CurrentState())
-	}
-}
-
-func TestStateClassifier_Reset(t *testing.T) {
-	sc := NewStateClassifier("test", nil)
-
-	// Add some state
-	sc.currentState = StateGenerating
-	sc.recordTransition(StateUnknown, StateGenerating, 0.85, "test")
-	sc.pendingState = StateWaiting
-	sc.lastPatterns = []string{"pattern1"}
-
-	sc.Reset()
-
-	if sc.currentState != StateUnknown {
-		t.Errorf("expected UNKNOWN after reset")
-	}
-	if len(sc.stateHistory) != 0 {
-		t.Error("expected empty history after reset")
-	}
-	if sc.pendingState != "" {
-		t.Error("expected empty pending state after reset")
-	}
-	if sc.lastPatterns != nil {
-		t.Error("expected nil patterns after reset")
-	}
-}
-
 func TestStateClassifier_SetAgentType(t *testing.T) {
 	sc := NewStateClassifier("test", nil)
 
 	sc.SetAgentType("codex")
 	if sc.agentType != "codex" {
 		t.Errorf("expected 'codex', got %s", sc.agentType)
-	}
-}
-
-func TestStateClassifier_GetStateHistory(t *testing.T) {
-	sc := NewStateClassifier("test", nil)
-
-	sc.recordTransition(StateUnknown, StateGenerating, 0.85, "test1")
-	sc.recordTransition(StateGenerating, StateWaiting, 0.90, "test2")
-
-	history := sc.GetStateHistory()
-
-	if len(history) != 2 {
-		t.Errorf("expected 2 transitions, got %d", len(history))
-	}
-
-	// Modifying copy shouldn't affect original
-	history = nil
-	if len(sc.stateHistory) != 2 {
-		t.Error("GetStateHistory should return a copy")
-	}
-}
-
-func TestStateClassifier_StateDuration(t *testing.T) {
-	sc := NewStateClassifier("test", nil)
-	sc.stateSince = time.Now().Add(-10 * time.Second)
-
-	duration := sc.StateDuration()
-
-	// Should be approximately 10 seconds (allow some margin)
-	if duration < 9*time.Second || duration > 11*time.Second {
-		t.Errorf("expected ~10s duration, got %v", duration)
 	}
 }
 
@@ -1166,88 +972,6 @@ func TestActivityMonitor_GetOrCreate(t *testing.T) {
 	sc3 := am.GetOrCreate("pane2")
 	if sc3 == sc1 {
 		t.Error("should create new classifier for different pane")
-	}
-}
-
-func TestActivityMonitor_Get(t *testing.T) {
-	am := NewActivityMonitor(nil)
-
-	// Non-existent
-	if am.Get("nonexistent") != nil {
-		t.Error("expected nil for non-existent")
-	}
-
-	am.GetOrCreate("pane1")
-	if am.Get("pane1") == nil {
-		t.Error("expected classifier")
-	}
-}
-
-func TestActivityMonitor_Remove(t *testing.T) {
-	am := NewActivityMonitor(nil)
-
-	am.GetOrCreate("pane1")
-	am.GetOrCreate("pane2")
-
-	am.Remove("pane1")
-
-	if am.Get("pane1") != nil {
-		t.Error("pane1 should be removed")
-	}
-	if am.Get("pane2") == nil {
-		t.Error("pane2 should still exist")
-	}
-}
-
-func TestActivityMonitor_GetAllStates(t *testing.T) {
-	am := NewActivityMonitor(nil)
-
-	sc1 := am.GetOrCreate("pane1")
-	sc2 := am.GetOrCreate("pane2")
-
-	sc1.mu.Lock()
-	sc1.currentState = StateGenerating
-	sc1.mu.Unlock()
-
-	sc2.mu.Lock()
-	sc2.currentState = StateWaiting
-	sc2.mu.Unlock()
-
-	states := am.GetAllStates()
-
-	if states["pane1"] != StateGenerating {
-		t.Errorf("expected GENERATING, got %s", states["pane1"])
-	}
-	if states["pane2"] != StateWaiting {
-		t.Errorf("expected WAITING, got %s", states["pane2"])
-	}
-}
-
-func TestActivityMonitor_Clear(t *testing.T) {
-	am := NewActivityMonitor(nil)
-
-	am.GetOrCreate("pane1")
-	am.GetOrCreate("pane2")
-
-	am.Clear()
-
-	if am.Count() != 0 {
-		t.Errorf("expected 0 after clear, got %d", am.Count())
-	}
-}
-
-func TestActivityMonitor_Count(t *testing.T) {
-	am := NewActivityMonitor(nil)
-
-	if am.Count() != 0 {
-		t.Errorf("expected 0, got %d", am.Count())
-	}
-
-	am.GetOrCreate("pane1")
-	am.GetOrCreate("pane2")
-
-	if am.Count() != 2 {
-		t.Errorf("expected 2, got %d", am.Count())
 	}
 }
 
@@ -2173,18 +1897,15 @@ func TestActivityMonitorConcurrentAccess(t *testing.T) {
 		go func(idx int) {
 			paneID := "pane_" + string(rune('0'+idx))
 			sc := am.GetOrCreate(paneID)
-			_ = sc.CurrentState()
-			_ = am.GetAllStates()
+			if again := am.GetOrCreate(paneID); again != sc {
+				t.Errorf("GetOrCreate(%q) returned different classifiers under concurrency", paneID)
+			}
 			done <- true
 		}(i)
 	}
 
 	for i := 0; i < 10; i++ {
 		<-done
-	}
-
-	if am.Count() != 10 {
-		t.Errorf("expected 10 classifiers, got %d", am.Count())
 	}
 }
 
@@ -2195,66 +1916,13 @@ func TestStateClassifierConcurrentAccess(t *testing.T) {
 	done := make(chan bool)
 	for i := 0; i < 10; i++ {
 		go func() {
-			_ = sc.CurrentState()
-			_ = sc.GetStateHistory()
-			_ = sc.StateDuration()
+			_, _ = sc.Classify()
 			done <- true
 		}()
 	}
 
 	for i := 0; i < 10; i++ {
 		<-done
-	}
-}
-
-func TestVelocityTrackerResetClearsPersistedBaseline(t *testing.T) {
-
-	store := newMockWatermarkStore()
-	paneID := "reset-store-pane"
-	tracker := NewVelocityTracker(paneID, WithWatermarkStore(store))
-
-	if _, err := tracker.UpdateWithOutput("persisted baseline"); err != nil {
-		t.Fatalf("initial update failed: %v", err)
-	}
-	if tracker.baselineHash == "" {
-		t.Fatal("expected baseline hash after initial update")
-	}
-	if tracker.baselineRuneCount == 0 {
-		t.Fatal("expected baseline rune count after initial update")
-	}
-
-	tracker.Reset()
-
-	if tracker.baselineHash != "" {
-		t.Fatalf("baseline hash should be cleared after reset, got %q", tracker.baselineHash)
-	}
-	if tracker.baselineRuneCount != 0 {
-		t.Fatalf("baseline rune count should be 0 after reset, got %d", tracker.baselineRuneCount)
-	}
-
-	wm, err := store.GetWatermark(WatermarkTypeVelocity, paneID)
-	if err != nil {
-		t.Fatalf("get watermark after reset: %v", err)
-	}
-	if wm == nil {
-		t.Fatal("expected watermark to exist after reset")
-	}
-	if wm.BaselineHash != "" {
-		t.Fatalf("persisted baseline hash should be cleared after reset, got %q", wm.BaselineHash)
-	}
-	if wm.BaselineCursor == nil || *wm.BaselineCursor != 0 {
-		t.Fatalf("persisted baseline cursor should be 0 after reset, got %v", wm.BaselineCursor)
-	}
-	if wm.LastTs != nil {
-		t.Fatalf("persisted last timestamp should be cleared after reset, got %v", *wm.LastTs)
-	}
-
-	restarted := NewVelocityTracker(paneID, WithWatermarkStore(store))
-	if restarted.baselineHash != "" {
-		t.Fatalf("restarted tracker should not restore a baseline hash after reset, got %q", restarted.baselineHash)
-	}
-	if restarted.baselineRuneCount != 0 {
-		t.Fatalf("restarted tracker should not restore a baseline rune count after reset, got %d", restarted.baselineRuneCount)
 	}
 }
 

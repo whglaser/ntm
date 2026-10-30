@@ -17,12 +17,6 @@
 //   - FormatTOON: TOON format (token-efficient tabular encoding)
 //   - FormatAuto: Automatic selection based on environment (future)
 //
-// # Content-Type Hints
-//
-// Each renderer provides a content-type hint for tooling integration:
-//   - JSON: "application/json"
-//   - TOON: "text/x-toon"
-//
 // # Backward Compatibility
 //
 // The JSON renderer produces output identical to the existing encodeJSON/outputJSON
@@ -94,13 +88,6 @@ type Renderer interface {
 	// Render encodes the payload to the renderer's format.
 	// Returns the encoded string and any encoding error.
 	Render(payload any) (string, error)
-
-	// ContentType returns the MIME type hint for this format.
-	// Useful for HTTP responses or format detection.
-	ContentType() string
-
-	// Format returns the RobotFormat this renderer produces.
-	Format() RobotFormat
 }
 
 // =============================================================================
@@ -132,16 +119,6 @@ func (r *JSONRenderer) Render(payload any) (string, error) {
 	return buf.String(), nil
 }
 
-// ContentType returns the JSON MIME type.
-func (r *JSONRenderer) ContentType() string {
-	return "application/json"
-}
-
-// Format returns FormatJSON.
-func (r *JSONRenderer) Format() RobotFormat {
-	return FormatJSON
-}
-
 // =============================================================================
 // TOON Renderer
 // =============================================================================
@@ -168,16 +145,6 @@ func NewTOONRenderer() *TOONRenderer {
 // Returns an error for unsupported payload shapes.
 func (r *TOONRenderer) Render(payload any) (string, error) {
 	return toonEncode(payload, r.Delimiter)
-}
-
-// ContentType returns the TOON MIME type.
-func (r *TOONRenderer) ContentType() string {
-	return "text/x-toon"
-}
-
-// Format returns FormatTOON.
-func (r *TOONRenderer) Format() RobotFormat {
-	return FormatTOON
 }
 
 // =============================================================================
@@ -248,21 +215,4 @@ func OutputTo(w io.Writer, payload any, format RobotFormat) error {
 	}
 	_, err = io.WriteString(w, output)
 	return err
-}
-
-// =============================================================================
-// Render Result (for advanced use cases)
-// =============================================================================
-
-// RenderResult contains both the rendered output and metadata.
-// Use this when you need the content-type along with the rendered string.
-type RenderResult struct {
-	// Output is the rendered payload string.
-	Output string
-
-	// ContentType is the MIME type of the output.
-	ContentType string
-
-	// Format is the format that was used for rendering.
-	Format RobotFormat
 }

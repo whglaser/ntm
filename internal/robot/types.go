@@ -415,12 +415,6 @@ func (d *ErrorDetails) WithChildPID(pid int) *ErrorDetails {
 	return d
 }
 
-// WithProcessState sets the process state on ErrorDetails.
-func (d *ErrorDetails) WithProcessState(state string) *ErrorDetails {
-	d.ProcessState = state
-	return d
-}
-
 // WithLastOutput sets truncated last output on ErrorDetails.
 func (d *ErrorDetails) WithLastOutput(output string, maxLen int) *ErrorDetails {
 	if len(output) > maxLen {
@@ -440,18 +434,6 @@ func (d *ErrorDetails) WithAttemptedActions(actions ...string) *ErrorDetails {
 // WithAgentType sets the agent type on ErrorDetails.
 func (d *ErrorDetails) WithAgentType(agentType string) *ErrorDetails {
 	d.AgentType = agentType
-	return d
-}
-
-// WithExitMethod sets the exit method on ErrorDetails.
-func (d *ErrorDetails) WithExitMethod(method string) *ErrorDetails {
-	d.ExitMethod = method
-	return d
-}
-
-// WithDuration sets the duration in milliseconds on ErrorDetails.
-func (d *ErrorDetails) WithDuration(ms int) *ErrorDetails {
-	d.DurationMs = ms
 	return d
 }
 

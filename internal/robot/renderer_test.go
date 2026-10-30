@@ -203,22 +203,6 @@ func TestJSONRendererRender(t *testing.T) {
 	})
 }
 
-func TestJSONRendererContentType(t *testing.T) {
-	r := NewJSONRenderer()
-	ct := r.ContentType()
-	if ct != "application/json" {
-		t.Errorf("ContentType() = %q, want %q", ct, "application/json")
-	}
-}
-
-func TestJSONRendererFormat(t *testing.T) {
-	r := NewJSONRenderer()
-	f := r.Format()
-	if f != FormatJSON {
-		t.Errorf("Format() = %q, want %q", f, FormatJSON)
-	}
-}
-
 // =============================================================================
 // TOON Renderer Tests
 // =============================================================================
@@ -327,22 +311,6 @@ func TestTOONRendererRoundTripMap(t *testing.T) {
 	assertToonDecodesToPayload(t, output, payload)
 }
 
-func TestTOONRendererContentType(t *testing.T) {
-	r := NewTOONRenderer()
-	ct := r.ContentType()
-	if ct != "text/x-toon" {
-		t.Errorf("ContentType() = %q, want %q", ct, "text/x-toon")
-	}
-}
-
-func TestTOONRendererFormat(t *testing.T) {
-	r := NewTOONRenderer()
-	f := r.Format()
-	if f != FormatTOON {
-		t.Errorf("Format() = %q, want %q", f, FormatTOON)
-	}
-}
-
 // =============================================================================
 // Global Render Function Tests
 // =============================================================================
@@ -420,8 +388,8 @@ func TestGetRenderer(t *testing.T) {
 			if r == nil {
 				t.Fatal("GetRenderer() returned nil")
 			}
-			// Check it's a valid renderer by calling a method
-			_ = r.ContentType()
+			// Check it's a valid renderer by encoding a payload
+			_, _ = r.Render(map[string]int{"probe": 1})
 		})
 	}
 }
@@ -465,10 +433,6 @@ func TestOutputTo(t *testing.T) {
 		assertToonDecodesToPayload(t, output, payload)
 	})
 }
-
-// =============================================================================
-// RenderResult Tests
-// =============================================================================
 
 // =============================================================================
 // Backward Compatibility Tests
@@ -534,17 +498,6 @@ func TestRendererInterfaceCompliance(t *testing.T) {
 
 	for _, tc := range renderers {
 		t.Run(tc.name, func(t *testing.T) {
-			// All methods should be callable without panic
-			ct := tc.renderer.ContentType()
-			if ct == "" {
-				t.Error("ContentType() should not return empty string")
-			}
-
-			f := tc.renderer.Format()
-			if !f.IsValid() {
-				t.Errorf("Format() returned invalid format: %q", f)
-			}
-
 			// Render should return some result (error or output)
 			output, err := tc.renderer.Render(map[string]string{"test": "data"})
 			if err == nil && output == "" {

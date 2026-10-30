@@ -123,7 +123,9 @@ func TestClassifyWithOutput_StateTransitionHistory(t *testing.T) {
 	// Move to a known state (not UNKNOWN)
 	_, _ = sc.ClassifyWithOutput("Error: rate limit")
 
-	history := sc.GetStateHistory()
+	sc.mu.Lock()
+	history := sc.getHistoryCopy()
+	sc.mu.Unlock()
 	if len(history) == 0 {
 		t.Fatal("expected at least one state transition")
 	}

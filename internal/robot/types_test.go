@@ -894,14 +894,14 @@ func TestErrorDetails(t *testing.T) {
 	}
 
 	// Test all builder methods
+	details.ProcessState = "running"
+	details.ExitMethod = "escape_then_exit"
+	details.DurationMs = 3500
 	details.
 		WithChildPID(54321).
-		WithProcessState("running").
 		WithLastOutput("some output here", 20).
 		WithAttemptedActions("action1", "action2").
 		WithAgentType("gmi").
-		WithExitMethod("escape_then_exit").
-		WithDuration(3500).
 		SetExtra("custom_field", "custom_value")
 
 	if details.ChildPID != 54321 {
@@ -954,9 +954,9 @@ func TestErrorDetailsLastOutputTruncation(t *testing.T) {
 func TestStructuredErrorJSON(t *testing.T) {
 	details := NewErrorDetails().
 		WithChildPID(12345).
-		WithProcessState("zombie").
 		WithAttemptedActions("ctrl-c", "kill-9").
 		WithAgentType("cc")
+	details.ProcessState = "zombie"
 
 	structErr := NewStructuredError(ErrCodeSoftExitFailed, "Agent stuck").
 		WithPhase("soft_exit").
