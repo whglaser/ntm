@@ -27,8 +27,8 @@ func TestTriggerRegistryCreatesStandardTriggers(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Create(%s): %v", config.Type, err)
 			}
-			if trigger.Type() != config.Type {
-				t.Errorf("Type() = %q, want %q", trigger.Type(), config.Type)
+			if trigger == nil {
+				t.Fatalf("Create(%s) returned a nil trigger", config.Type)
 			}
 		})
 	}

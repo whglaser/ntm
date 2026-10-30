@@ -18,9 +18,6 @@ func TestAntigravityAgentType(t *testing.T) {
 		}
 	}
 
-	if got := AgentTypeAntigravity.DisplayName(); got != "Antigravity CLI" {
-		t.Errorf("DisplayName = %q, want \"Antigravity CLI\"", got)
-	}
 	if got := AgentTypeAntigravity.ProfileName(); got != "Antigravity" {
 		t.Errorf("ProfileName = %q, want \"Antigravity\"", got)
 	}

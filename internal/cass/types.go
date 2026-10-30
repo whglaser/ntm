@@ -139,11 +139,6 @@ type SearchResponse struct {
 	Aggregations *Aggregations `json:"aggregations,omitempty"`
 }
 
-// HasResults returns true if the response contains any hits
-func (r SearchResponse) HasResults() bool {
-	return len(r.Hits) > 0
-}
-
 // HasMore returns true if there are more results available (via cursor or count)
 func (r SearchResponse) HasMore() bool {
 	if r.Meta != nil && r.Meta.HasMore() {
@@ -338,26 +333,6 @@ type Capabilities struct {
 	Features        []string `json:"features"`
 	Connectors      []string `json:"connectors"`
 	Limits          Limits   `json:"limits"`
-}
-
-// HasFeature checks if a feature is supported
-func (c Capabilities) HasFeature(feature string) bool {
-	for _, f := range c.Features {
-		if f == feature {
-			return true
-		}
-	}
-	return false
-}
-
-// HasConnector checks if a connector is supported
-func (c Capabilities) HasConnector(connector string) bool {
-	for _, conn := range c.Connectors {
-		if conn == connector {
-			return true
-		}
-	}
-	return false
 }
 
 // CASSError represents an error returned by the CASS API

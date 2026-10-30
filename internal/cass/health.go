@@ -24,14 +24,6 @@ func (c *Client) Version(ctx context.Context) (string, error) {
 	return strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(string(output)), "cass")), nil
 }
 
-// Health performs CASS's dedicated health check.
-func (c *Client) Health(ctx context.Context) (*StatusResponse, error) {
-	if !c.IsInstalled() {
-		return nil, ErrNotInstalled
-	}
-	return c.runStatusCmd(ctx, "health")
-}
-
 // Status returns full index status
 func (c *Client) Status(ctx context.Context) (*StatusResponse, error) {
 	if !c.IsInstalled() {
@@ -79,15 +71,6 @@ func (c *Client) Capabilities(ctx context.Context) (*Capabilities, error) {
 	}
 
 	return &response, nil
-}
-
-// IsHealthy returns true if CASS is healthy and index is fresh
-func (c *Client) IsHealthy(ctx context.Context) bool {
-	status, err := c.Health(ctx)
-	if err != nil {
-		return false
-	}
-	return status.IsHealthy()
 }
 
 // NeedsReindex returns true if index is stale or missing

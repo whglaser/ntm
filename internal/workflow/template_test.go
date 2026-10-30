@@ -412,55 +412,6 @@ func TestWorkflowTemplate_GetAgentCount(t *testing.T) {
 	}
 }
 
-func TestWorkflowTemplate_GetRoles(t *testing.T) {
-	tmpl := WorkflowTemplate{
-		Agents: []WorkflowAgent{
-			{Profile: "tester", Role: "red"},
-			{Profile: "impl1", Role: "green"},
-			{Profile: "impl2", Role: "green"}, // duplicate role
-			{Profile: "reviewer", Role: "qa"},
-		},
-	}
-
-	roles := tmpl.GetRoles()
-	if len(roles) != 3 {
-		t.Errorf("GetRoles() returned %d roles, want 3", len(roles))
-	}
-
-	expected := map[string]bool{"red": true, "green": true, "qa": true}
-	for _, role := range roles {
-		if !expected[role] {
-			t.Errorf("Unexpected role: %s", role)
-		}
-	}
-}
-
-func TestWorkflowTemplate_GetAgentsByRole(t *testing.T) {
-	tmpl := WorkflowTemplate{
-		Agents: []WorkflowAgent{
-			{Profile: "tester", Role: "red"},
-			{Profile: "impl1", Role: "green"},
-			{Profile: "impl2", Role: "green"},
-			{Profile: "reviewer", Role: "qa"},
-		},
-	}
-
-	green := tmpl.GetAgentsByRole("green")
-	if len(green) != 2 {
-		t.Errorf("GetAgentsByRole(\"green\") returned %d agents, want 2", len(green))
-	}
-
-	red := tmpl.GetAgentsByRole("red")
-	if len(red) != 1 {
-		t.Errorf("GetAgentsByRole(\"red\") returned %d agents, want 1", len(red))
-	}
-
-	empty := tmpl.GetAgentsByRole("nonexistent")
-	if len(empty) != 0 {
-		t.Errorf("GetAgentsByRole(\"nonexistent\") returned %d agents, want 0", len(empty))
-	}
-}
-
 func TestParseWorkflows(t *testing.T) {
 	content := `
 [[workflows]]

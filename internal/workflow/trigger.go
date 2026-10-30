@@ -21,7 +21,6 @@ const defaultCommandTriggerTimeout = 30 * time.Second
 // needed by triggers that consume a continuous source, such as filesystem
 // notifications; all implementations are safe to Stop more than once.
 type RuntimeTrigger interface {
-	Type() TriggerType
 	Check(*TriggerContext) (bool, error)
 	Start(*TriggerContext) error
 	Stop() error
@@ -124,7 +123,6 @@ type fileBaseline struct {
 }
 
 type fileTrigger struct {
-	kind    TriggerType
 	pattern string
 	op      fsnotify.Op
 
@@ -144,14 +142,12 @@ type fileTrigger struct {
 }
 
 func newFileCreatedTrigger(config Trigger) (RuntimeTrigger, error) {
-	return &fileTrigger{kind: TriggerFileCreated, pattern: config.Pattern, op: fsnotify.Create}, nil
+	return &fileTrigger{pattern: config.Pattern, op: fsnotify.Create}, nil
 }
 
 func newFileModifiedTrigger(config Trigger) (RuntimeTrigger, error) {
-	return &fileTrigger{kind: TriggerFileModified, pattern: config.Pattern, op: fsnotify.Write}, nil
+	return &fileTrigger{pattern: config.Pattern, op: fsnotify.Write}, nil
 }
-
-func (t *fileTrigger) Type() TriggerType { return t.kind }
 
 func (t *fileTrigger) Start(ctx *TriggerContext) error {
 	if ctx == nil || strings.TrimSpace(ctx.ProjectRoot) == "" {
@@ -371,21 +367,18 @@ func (t *fileTrigger) Stop() error {
 }
 
 type commandTrigger struct {
-	kind        TriggerType
 	command     string
 	timeout     time.Duration
 	wantSuccess bool
 }
 
 func newCommandSuccessTrigger(config Trigger) (RuntimeTrigger, error) {
-	return &commandTrigger{kind: TriggerCommandSuccess, command: config.Command, wantSuccess: true}, nil
+	return &commandTrigger{command: config.Command, wantSuccess: true}, nil
 }
 
 func newCommandFailureTrigger(config Trigger) (RuntimeTrigger, error) {
-	return &commandTrigger{kind: TriggerCommandFailure, command: config.Command}, nil
+	return &commandTrigger{command: config.Command}, nil
 }
-
-func (t *commandTrigger) Type() TriggerType { return t.kind }
 
 func (t *commandTrigger) Start(_ *TriggerContext) error { return nil }
 
@@ -445,8 +438,6 @@ func newAgentSaysTrigger(config Trigger) (RuntimeTrigger, error) {
 	return &agentSaysTrigger{pattern: pattern, role: config.Role}, nil
 }
 
-func (t *agentSaysTrigger) Type() TriggerType { return TriggerAgentSays }
-
 func (t *agentSaysTrigger) Start(_ *TriggerContext) error { return nil }
 
 func (t *agentSaysTrigger) Stop() error { return nil }
@@ -474,8 +465,6 @@ type allAgentsIdleTrigger struct {
 func newAllAgentsIdleTrigger(config Trigger) (RuntimeTrigger, error) {
 	return &allAgentsIdleTrigger{role: config.Role, idle: time.Duration(config.IdleMinutes) * time.Minute}, nil
 }
-
-func (t *allAgentsIdleTrigger) Type() TriggerType { return TriggerAllAgentsIdle }
 
 func (t *allAgentsIdleTrigger) Start(_ *TriggerContext) error { return nil }
 
@@ -508,8 +497,6 @@ type ManualTrigger struct {
 func newManualTrigger(config Trigger) (RuntimeTrigger, error) {
 	return &ManualTrigger{label: config.Label, fired: make(chan struct{}, 1)}, nil
 }
-
-func (t *ManualTrigger) Type() TriggerType { return TriggerManual }
 
 func (t *ManualTrigger) Start(_ *TriggerContext) error { return nil }
 
@@ -546,8 +533,6 @@ type timeElapsedTrigger struct {
 func newTimeElapsedTrigger(config Trigger) (RuntimeTrigger, error) {
 	return &timeElapsedTrigger{duration: time.Duration(config.Minutes) * time.Minute}, nil
 }
-
-func (t *timeElapsedTrigger) Type() TriggerType { return TriggerTimeElapsed }
 
 func (t *timeElapsedTrigger) Start(ctx *TriggerContext) error {
 	t.mu.Lock()

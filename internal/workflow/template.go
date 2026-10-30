@@ -375,30 +375,6 @@ func (t *WorkflowTemplate) GetAgentCount() int {
 	return count
 }
 
-// GetRoles returns a list of all unique roles in the workflow.
-func (t *WorkflowTemplate) GetRoles() []string {
-	seen := make(map[string]bool)
-	var roles []string
-	for _, agent := range t.Agents {
-		if !seen[agent.Role] {
-			seen[agent.Role] = true
-			roles = append(roles, agent.Role)
-		}
-	}
-	return roles
-}
-
-// GetAgentsByRole returns all agents with the specified role.
-func (t *WorkflowTemplate) GetAgentsByRole(role string) []WorkflowAgent {
-	var agents []WorkflowAgent
-	for _, agent := range t.Agents {
-		if agent.Role == role {
-			agents = append(agents, agent)
-		}
-	}
-	return agents
-}
-
 // WorkflowsFile represents a TOML file containing workflow templates.
 type WorkflowsFile struct {
 	Workflows []WorkflowTemplate `toml:"workflows"`
