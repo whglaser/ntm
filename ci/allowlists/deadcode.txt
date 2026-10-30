@@ -197,23 +197,13 @@ internal/tmux/session.go:SetPaneAgentTypeContext	ntm-9n7x8	upstream f477c62c deb
 internal/tools/am.go:AMAdapter.ServerURL	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tools/am.go:AMAdapter.SetServerURL	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tools/am.go:AMAdapter.SetToken	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tools/bd.go:BDAdapter.GetStats	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tools/bd.go:BDAdapter.runCommand	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tools/caam.go:CAAMAdapter.HasMultipleAccounts	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tools/caam.go:CAAMAdapter.InvalidateCache	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tools/caam.go:CAAMAdapter.IsAvailable	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tools/caut.go:CautAdapter.InvalidateAvailabilityCache	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tools/cm.go:CMAdapter.Connect	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tools/cm.go:CMAdapter.SetServerPort	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tools/dcg.go:DCGAdapter.InvalidateAvailabilityCache	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tools/proxy.go:ProxyAdapter.InvalidateAvailabilityCache	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tools/pt.go:PTAdapter.ClassifyProcess	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tools/pt.go:PTAdapter.InvalidateStatusCache	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tools/rano.go:RanoAdapter.GetProcessStats	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tools/rano.go:RanoAdapter.GetProcessStatsWithWindow	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tools/rano.go:RanoAdapter.InvalidateAvailabilityCache	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tools/rch.go:RCHAdapter.HasHealthyWorkers	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tools/rch.go:RCHAdapter.InvalidateAvailabilityCache	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tools/rch.go:RCHAdapter.IsAvailable	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tools/rch.go:RCHAdapter.SelectWorker	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tui/components/scrollable_panel.go:ScrollablePanel.AtBottom	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
@@ -507,3 +497,11 @@ internal/tmux/backpressure.go:Client.CaptureBackpressureInputs	permanent	reached
 internal/tmux/backpressure.go:captureBackpressureTracker.inputs	permanent	hand reached by the integration-tagged capture backpressure snapshot test
 internal/tmux/backpressure.go:isCaptureTimeout	permanent	hand reached by CaptureBackpressureInput (integration-tagged coverage above)
 internal/tmux/backpressure.go:firstNonEmpty	permanent	hand reached by CaptureBackpressureInput (integration-tagged coverage above)
+# permanent: test-helper (bd-ld4j2 batch 19)
+internal/tools/caam.go:CAAMAdapter.InvalidateCache	permanent	test cache-reset fixture: reached by internal/robot/account_status_codex_filter_test.go, internal/serve/accounts_test.go, internal/serve/handler_branch_test.go, internal/tools/caam_test.go
+internal/tools/caut.go:CautAdapter.InvalidateAvailabilityCache	permanent	test cache-reset fixture: reached by internal/robot/quota_status_test.go and internal/tools/caut_test.go
+internal/tools/dcg.go:DCGAdapter.InvalidateAvailabilityCache	permanent	test cache-reset fixture: reached by internal/cli/send_test.go, internal/robot/dcg_check_test.go, internal/robot/dcg_status_test.go, internal/tools/contract_test.go
+internal/tools/proxy.go:ProxyAdapter.InvalidateAvailabilityCache	permanent	test cache-reset fixture: reached by internal/tools/proxy_test.go
+internal/tools/pt.go:PTAdapter.InvalidateStatusCache	permanent	test cache-reset fixture: reached by internal/cli/serve_test.go and internal/tools/pt_test.go
+internal/tools/rano.go:RanoAdapter.InvalidateAvailabilityCache	permanent	test cache-reset fixture: reached by internal/tools/rano_test.go
+internal/tools/rch.go:RCHAdapter.InvalidateAvailabilityCache	permanent	test cache-reset fixture: reached by internal/robot/rch_status_test.go and internal/tools/rch_test.go

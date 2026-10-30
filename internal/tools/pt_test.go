@@ -341,8 +341,8 @@ func TestPTClassifyProcessWhenNotInstalled(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// ClassifyProcess should return error when pt is not installed
-	_, err := adapter.ClassifyProcess(ctx, 1)
+	// ClassifyProcesses should return error when pt is not installed
+	_, err := adapter.ClassifyProcesses(ctx, []int{1})
 	if err == nil {
 		t.Error("Expected error when pt is not installed")
 	}

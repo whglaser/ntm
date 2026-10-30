@@ -148,9 +148,9 @@ func TestPTPassiveWatchEmptyInvalidAndCancelled(t *testing.T) {
 		t.Fatal("invalid/cancelled/empty request invoked PT")
 	}
 	t.Setenv("NTM_TEST_PT_WATCH_MODE", "empty")
-	single, err := a.ClassifyProcess(context.Background(), 42)
-	if err != nil || single.Classification != PTClassUnknown || single.Confidence != 0 {
-		t.Fatalf("empty watch became health proof: %+v %v", single, err)
+	results, err := a.ClassifyProcesses(context.Background(), []int{42})
+	if err != nil || len(results) != 1 || results[0].Classification != PTClassUnknown || results[0].Confidence != 0 {
+		t.Fatalf("empty watch became health proof: %+v %v", results, err)
 	}
 }
 
