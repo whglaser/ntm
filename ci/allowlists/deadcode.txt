@@ -244,20 +244,7 @@ internal/status/types.go:AgentStatus.IdleDuration	bd-ld4j2	reachable only throug
 internal/status/types.go:ErrorType.Message	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/status/unified.go:UnifiedDetector.DetectAll	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/status/unified.go:UnifiedDetector.DetectAllContext	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/swarm/agent_launcher.go:LaunchCommand.ToSimpleCommand	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/swarm/agent_launcher.go:LaunchCommandBuilder.BuildSwarmCommands	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/swarm/agent_launcher.go:LaunchCommandBuilder.WithAgentPath	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/swarm/agent_launcher.go:LaunchCommandBuilder.WithEnvVars	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/swarm/agent_launcher.go:LaunchCommandBuilder.WithFullPaths	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/swarm/agent_launcher.go:LaunchCommandBuilder.WithLogger	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/swarm/agent_launcher.go:formatPaneTarget	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/swarm/agent_launcher.go:formatPaneTargetWithWindow	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/swarm/agent_launcher.go:swarmPaneTargetFromPlanIndex	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/swarm/agent_launcher.go:swarmTmuxPaneIndex	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/swarm/claude_config_home.go:ClaudeConfigProvisioner.CredentialIsolated	ntm-9n7x8	upstream f477c62c debt (upstream G1 gate red): unreachable from cmd/ntm; its credentialState helper chain is dead; wire or delete upstream
-internal/swarm/orchestrator.go:SessionOrchestrator.DestroySessions	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/swarm/pane_launcher.go:PaneLauncher.WithCDDelay	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/swarm/pane_launcher.go:PaneLauncher.WithValidatePaths	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tmux/backpressure.go:CaptureBackpressureInput	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tmux/backpressure.go:Client.CaptureBackpressureInputs	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tmux/backpressure.go:captureBackpressureTracker.inputs	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
@@ -545,3 +532,4 @@ internal/tui/dashboard/panels/panel.go:PanelBase.HandlesOwnHeight	permanent	defa
 # permanent: build-tag ensemble_experimental (bd-ld4j2 batch 8)
 internal/swarm/orchestrator.go:SessionOrchestrator.CreateSessions	permanent	build-tag blind spot: gate runs untagged; reachable in release builds via tag-gated internal/ensemble/manager.go:150 (ensemble_experimental)
 internal/swarm/prompt_injector.go:PromptInjector.InjectPrompt	permanent	build-tag blind spot: gate runs untagged; satisfies ensemble.BasicInjector and is called from tag-gated internal/ensemble/injector.go + pipeline.go (ensemble_experimental)
+internal/swarm/agent_launcher.go:formatPaneTarget	permanent	build-tag blind spot: gate runs untagged; reached in tagged builds via swarm.GetPaneTarget (pane_launcher.go) from tag-gated internal/ensemble/manager.go:830 pane dispatch (ensemble_experimental)

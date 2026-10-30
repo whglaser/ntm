@@ -184,28 +184,6 @@ func parseMinIntOutput(output string) (int, error) {
 	return minVal, nil
 }
 
-func formatPaneTargetWithWindow(session string, windowIndex int, paneIndex int) string {
-	return fmt.Sprintf("%s:%d.%d", session, windowIndex, paneIndex)
-}
-
-func swarmTmuxPaneIndex(basePaneIndex, planPaneIndex int) (int, error) {
-	if planPaneIndex < 0 {
-		return 0, fmt.Errorf("plan pane index must be >= 0, got %d", planPaneIndex)
-	}
-	if planPaneIndex == 0 {
-		return basePaneIndex, nil
-	}
-	return basePaneIndex + (planPaneIndex - 1), nil
-}
-
-func swarmPaneTargetFromPlanIndex(session string, targeting swarmSessionTargeting, planPaneIndex int) (string, error) {
-	tmuxPaneIndex, err := swarmTmuxPaneIndex(targeting.BasePaneIndex, planPaneIndex)
-	if err != nil {
-		return "", err
-	}
-	return formatPaneTargetWithWindow(session, targeting.WindowIndex, tmuxPaneIndex), nil
-}
-
 // DefaultAgentCommands maps agent types to their default binary names.
 var DefaultAgentCommands = map[string]string{
 	"cc":       "claude",       // Claude Code CLI
@@ -295,12 +273,6 @@ func (lc LaunchCommand) envPrefix() string {
 	return strings.Join(assignments, " ") + " "
 }
 
-// ToSimpleCommand returns just the binary name without arguments.
-// This is used when we want to rely on shell aliases.
-func (lc LaunchCommand) ToSimpleCommand() string {
-	return lc.Binary
-}
-
 // LaunchCommandBuilder generates agent launch commands with proper
 // binary paths, arguments, and environment configuration.
 type LaunchCommandBuilder struct {
@@ -334,33 +306,9 @@ func NewLaunchCommandBuilder() *LaunchCommandBuilder {
 	}
 }
 
-// WithAgentPath sets a custom binary path for an agent type.
-func (b *LaunchCommandBuilder) WithAgentPath(agentType, path string) *LaunchCommandBuilder {
-	b.AgentPaths[agentType] = path
-	return b
-}
-
 // WithAgentArgs sets custom arguments for an agent type.
 func (b *LaunchCommandBuilder) WithAgentArgs(agentType string, args []string) *LaunchCommandBuilder {
 	b.AgentArgs[agentType] = args
-	return b
-}
-
-// WithEnvVars sets environment variables for an agent type.
-func (b *LaunchCommandBuilder) WithEnvVars(agentType string, env map[string]string) *LaunchCommandBuilder {
-	b.EnvVars[agentType] = env
-	return b
-}
-
-// WithLogger sets a custom logger.
-func (b *LaunchCommandBuilder) WithLogger(logger *slog.Logger) *LaunchCommandBuilder {
-	b.Logger = logger
-	return b
-}
-
-// WithFullPaths enables using full binary paths instead of shell aliases.
-func (b *LaunchCommandBuilder) WithFullPaths(enabled bool) *LaunchCommandBuilder {
-	b.UseFullPaths = enabled
 	return b
 }
 
@@ -464,27 +412,6 @@ func (b *LaunchCommandBuilder) BuildLaunchCommand(spec PaneSpec, workDir string)
 		"env_keys", envKeys)
 
 	return cmd
-}
-
-// BuildSwarmCommands builds launch commands for all panes in a SwarmPlan.
-func (b *LaunchCommandBuilder) BuildSwarmCommands(plan *SwarmPlan) []LaunchCommand {
-	if plan == nil {
-		return nil
-	}
-
-	var commands []LaunchCommand
-	for _, session := range plan.Sessions {
-		for _, pane := range session.Panes {
-			workDir := pane.Project
-			if workDir == "" {
-				workDir = plan.ScanDir
-			}
-			cmd := b.BuildLaunchCommand(pane, workDir)
-			commands = append(commands, cmd)
-		}
-	}
-
-	return commands
 }
 
 func normalizedSwarmLaunchableAgentType(agentType string) string {

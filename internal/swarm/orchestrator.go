@@ -277,25 +277,6 @@ func (o *SessionOrchestrator) DestroySession(sessionName string) error {
 }
 
 // DestroySessions destroys all sessions created from a SwarmPlan.
-func (o *SessionOrchestrator) DestroySessions(plan *SwarmPlan) error {
-	if plan == nil {
-		return nil
-	}
-
-	var errs []error
-	for _, spec := range plan.Sessions {
-		if err := o.DestroySession(spec.Name); err != nil {
-			errs = append(errs, err)
-		}
-	}
-
-	if len(errs) > 0 {
-		return fmt.Errorf("failed to destroy %d session(s): %v", len(errs), errs[0])
-	}
-
-	return nil
-}
-
 // SessionExists checks if a session with the given name exists.
 func (o *SessionOrchestrator) SessionExists(sessionName string) bool {
 	return o.tmuxClient().SessionExists(sessionName)

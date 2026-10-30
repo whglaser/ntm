@@ -215,7 +215,8 @@ func TestValidateProjectPath(t *testing.T) {
 }
 
 func TestLaunchAgentInPaneContextCancellation(t *testing.T) {
-	launcher := NewPaneLauncher().WithValidatePaths(false)
+	launcher := NewPaneLauncher()
+	launcher.ValidatePaths = false
 
 	// Create a cancelled context
 	ctx, cancel := context.WithCancel(context.Background())
@@ -241,7 +242,8 @@ func TestLaunchAgentInPaneContextCancellation(t *testing.T) {
 }
 
 func TestLaunchAgentInPaneInvalidPath(t *testing.T) {
-	launcher := NewPaneLauncher().WithValidatePaths(true)
+	launcher := NewPaneLauncher()
+	launcher.ValidatePaths = true
 
 	paneSpec := PaneSpec{
 		Index:     1,
@@ -271,7 +273,8 @@ func TestLaunchAgentInPaneRejectsProjectFile(t *testing.T) {
 		t.Fatalf("create project file: %v", err)
 	}
 
-	launcher := NewPaneLauncher().WithValidatePaths(true)
+	launcher := NewPaneLauncher()
+	launcher.ValidatePaths = true
 	result, err := launcher.LaunchAgentInPane(context.Background(), "test", PaneSpec{
 		Index:     1,
 		AgentType: "cc",
@@ -290,7 +293,8 @@ func TestLaunchAgentInPaneRejectsProjectFile(t *testing.T) {
 }
 
 func TestLaunchSessionEmptyPanes(t *testing.T) {
-	launcher := NewPaneLauncher().WithValidatePaths(false)
+	launcher := NewPaneLauncher()
+	launcher.ValidatePaths = false
 
 	sessionSpec := SessionSpec{
 		Name:      "test",
@@ -312,7 +316,8 @@ func TestLaunchSessionEmptyPanes(t *testing.T) {
 }
 
 func TestLaunchSessionContextCancellation(t *testing.T) {
-	launcher := NewPaneLauncher().WithValidatePaths(false)
+	launcher := NewPaneLauncher()
+	launcher.ValidatePaths = false
 
 	// Create a context that cancels after a short time
 	ctx, cancel := context.WithCancel(context.Background())
@@ -389,7 +394,8 @@ func TestIsCodexProvider(t *testing.T) {
 }
 
 func TestPaneLauncherLaunchSwarmEmptyPlan(t *testing.T) {
-	launcher := NewPaneLauncher().WithValidatePaths(false)
+	launcher := NewPaneLauncher()
+	launcher.ValidatePaths = false
 	plan := &SwarmPlan{
 		Sessions:    []SessionSpec{},
 		TotalAgents: 0,
@@ -434,26 +440,8 @@ func TestPaneLauncherTmuxClientHelper(t *testing.T) {
 func TestPaneLauncherChaining(t *testing.T) {
 	launcher := NewPaneLauncher()
 
-	// Test WithCDDelay
-	result := launcher.WithCDDelay(200 * time.Millisecond)
-	if result != launcher {
-		t.Error("WithCDDelay should return the same launcher for chaining")
-	}
-	if launcher.CDDelay != 200*time.Millisecond {
-		t.Errorf("expected CDDelay of 200ms, got %v", launcher.CDDelay)
-	}
-
-	// Test WithValidatePaths
-	result = launcher.WithValidatePaths(false)
-	if result != launcher {
-		t.Error("WithValidatePaths should return the same launcher for chaining")
-	}
-	if launcher.ValidatePaths {
-		t.Error("expected ValidatePaths to be false")
-	}
-
 	// Test WithLogger
-	result = launcher.WithLogger(nil)
+	result := launcher.WithLogger(nil)
 	if result != launcher {
 		t.Error("WithLogger should return the same launcher for chaining")
 	}

@@ -239,33 +239,6 @@ func TestResolveSwarmSessionTargeting_BaseIndexOne(t *testing.T) {
 	}
 }
 
-func TestSwarmPaneTargetFromPlanIndex(t *testing.T) {
-	t.Parallel()
-
-	targeting := swarmSessionTargeting{WindowIndex: 0, BasePaneIndex: 0}
-	target, err := swarmPaneTargetFromPlanIndex("test", targeting, 1)
-	if err != nil {
-		t.Fatalf("swarmPaneTargetFromPlanIndex returned error: %v", err)
-	}
-	if target != "test:0.0" {
-		t.Fatalf("target = %q, want %q", target, "test:0.0")
-	}
-
-	targeting = swarmSessionTargeting{WindowIndex: 1, BasePaneIndex: 1}
-	target, err = swarmPaneTargetFromPlanIndex("test", targeting, 1)
-	if err != nil {
-		t.Fatalf("swarmPaneTargetFromPlanIndex returned error: %v", err)
-	}
-	if target != "test:1.1" {
-		t.Fatalf("target = %q, want %q", target, "test:1.1")
-	}
-
-	_, err = swarmPaneTargetFromPlanIndex("test", targeting, -1)
-	if err == nil {
-		t.Fatalf("expected error for negative plan pane index")
-	}
-}
-
 func TestAgentConstants(t *testing.T) {
 	if AgentCC != "cc" {
 		t.Errorf("AgentCC = %q, want %q", AgentCC, "cc")
@@ -464,18 +437,6 @@ func TestLaunchCommandToShellCommand(t *testing.T) {
 	}
 }
 
-func TestLaunchCommandToSimpleCommand(t *testing.T) {
-	cmd := LaunchCommand{
-		Binary: "claude",
-		Args:   []string{"--dangerously-skip-permissions"},
-	}
-
-	result := cmd.ToSimpleCommand()
-	if result != "claude" {
-		t.Errorf("ToSimpleCommand() = %q, want %q", result, "claude")
-	}
-}
-
 func TestBuildLaunchCommand(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -585,7 +546,8 @@ func TestBuildLaunchCommand(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			builder := NewLaunchCommandBuilder().WithFullPaths(tt.useFullPaths)
+			builder := NewLaunchCommandBuilder()
+			builder.UseFullPaths = tt.useFullPaths
 			spec := PaneSpec{
 				Index:     1,
 				AgentType: tt.agentType,
@@ -620,9 +582,9 @@ func TestBuildLaunchCommand(t *testing.T) {
 }
 
 func TestBuildLaunchCommandWithCustomPath(t *testing.T) {
-	builder := NewLaunchCommandBuilder().
-		WithFullPaths(true).
-		WithAgentPath("cc", "/custom/path/to/claude")
+	builder := NewLaunchCommandBuilder()
+	builder.UseFullPaths = true
+	builder.AgentPaths["cc"] = "/custom/path/to/claude"
 
 	spec := PaneSpec{
 		Index:     1,
@@ -661,8 +623,8 @@ func TestBuildLaunchCommandWithCustomArgs(t *testing.T) {
 }
 
 func TestBuildLaunchCommandWithEnvVars(t *testing.T) {
-	builder := NewLaunchCommandBuilder().
-		WithEnvVars("cc", map[string]string{"API_KEY": "secret", "DEBUG": "true"})
+	builder := NewLaunchCommandBuilder()
+	builder.EnvVars["cc"] = map[string]string{"API_KEY": "secret", "DEBUG": "true"}
 
 	spec := PaneSpec{
 		Index:     1,
@@ -691,11 +653,11 @@ func TestBuildLaunchCommandWithEnvVars(t *testing.T) {
 }
 
 func TestBuildLaunchCommandCustomOverridesApplyToAliases(t *testing.T) {
-	builder := NewLaunchCommandBuilder().
-		WithFullPaths(true).
-		WithAgentPath("cod", "/custom/codex").
-		WithAgentArgs("cod", []string{"--fast"}).
-		WithEnvVars("cod", map[string]string{"OPENAI_PROFILE": "prod"})
+	builder := NewLaunchCommandBuilder()
+	builder.UseFullPaths = true
+	builder.AgentPaths["cod"] = "/custom/codex"
+	builder.AgentArgs["cod"] = []string{"--fast"}
+	builder.EnvVars["cod"] = map[string]string{"OPENAI_PROFILE": "prod"}
 
 	spec := PaneSpec{
 		Index:     1,
@@ -714,81 +676,6 @@ func TestBuildLaunchCommandCustomOverridesApplyToAliases(t *testing.T) {
 	}
 	if len(cmd.Env) != 1 || cmd.Env[0] != "OPENAI_PROFILE=prod" {
 		t.Fatalf("BuildLaunchCommand().Env = %v, want [OPENAI_PROFILE=prod]", cmd.Env)
-	}
-}
-
-func TestBuildSwarmCommands(t *testing.T) {
-	builder := NewLaunchCommandBuilder()
-
-	plan := &SwarmPlan{
-		ScanDir: "/projects",
-		Sessions: []SessionSpec{
-			{
-				Name:      "test-session",
-				AgentType: "cc",
-				PaneCount: 2,
-				Panes: []PaneSpec{
-					{Index: 1, AgentType: "cc", Project: "/projects/foo"},
-					{Index: 2, AgentType: "cc", Project: "/projects/bar"},
-				},
-			},
-		},
-	}
-
-	commands := builder.BuildSwarmCommands(plan)
-
-	if len(commands) != 2 {
-		t.Errorf("BuildSwarmCommands() returned %d commands, want 2", len(commands))
-		return
-	}
-
-	// Check first command
-	if commands[0].WorkDir != "/projects/foo" {
-		t.Errorf("commands[0].WorkDir = %q, want %q", commands[0].WorkDir, "/projects/foo")
-	}
-
-	// Check second command
-	if commands[1].WorkDir != "/projects/bar" {
-		t.Errorf("commands[1].WorkDir = %q, want %q", commands[1].WorkDir, "/projects/bar")
-	}
-}
-
-func TestBuildSwarmCommandsNilPlan(t *testing.T) {
-	builder := NewLaunchCommandBuilder()
-	commands := builder.BuildSwarmCommands(nil)
-
-	if commands != nil {
-		t.Errorf("BuildSwarmCommands(nil) returned %v, want nil", commands)
-	}
-}
-
-func TestBuildSwarmCommandsFallbackToScanDir(t *testing.T) {
-	builder := NewLaunchCommandBuilder()
-
-	plan := &SwarmPlan{
-		ScanDir: "/default/dir",
-		Sessions: []SessionSpec{
-			{
-				Name:      "test-session",
-				AgentType: "cc",
-				PaneCount: 1,
-				Panes: []PaneSpec{
-					{Index: 1, AgentType: "cc", Project: ""}, // Empty project
-				},
-			},
-		},
-	}
-
-	commands := builder.BuildSwarmCommands(plan)
-
-	if len(commands) != 1 {
-		t.Errorf("BuildSwarmCommands() returned %d commands, want 1", len(commands))
-		return
-	}
-
-	// Should fall back to ScanDir
-	if commands[0].WorkDir != "/default/dir" {
-		t.Errorf("commands[0].WorkDir = %q, want %q (should fallback to ScanDir)", commands[0].WorkDir, "/default/dir")
 	}
 }
 
@@ -874,45 +761,11 @@ func TestLaunchCommand_ToShellCommandCarriesEnv(t *testing.T) {
 func TestLaunchCommandBuilderChaining(t *testing.T) {
 	builder := NewLaunchCommandBuilder()
 
-	// Test WithAgentPath chaining
-	result := builder.WithAgentPath("cc", "/usr/local/bin/claude")
-	if result != builder {
-		t.Error("WithAgentPath should return the same builder for chaining")
-	}
-	if builder.AgentPaths["cc"] != "/usr/local/bin/claude" {
-		t.Errorf("expected AgentPaths[cc] to be /usr/local/bin/claude, got %q", builder.AgentPaths["cc"])
-	}
-
-	// Test WithAgentArgs chaining
-	result = builder.WithAgentArgs("cc", []string{"--custom-arg"})
+	result := builder.WithAgentArgs("cc", []string{"--custom-arg"})
 	if result != builder {
 		t.Error("WithAgentArgs should return the same builder for chaining")
 	}
 	if len(builder.AgentArgs["cc"]) != 1 || builder.AgentArgs["cc"][0] != "--custom-arg" {
 		t.Errorf("expected AgentArgs[cc] to be [--custom-arg], got %v", builder.AgentArgs["cc"])
-	}
-
-	// Test WithEnvVars chaining
-	result = builder.WithEnvVars("cc", map[string]string{"FOO": "bar"})
-	if result != builder {
-		t.Error("WithEnvVars should return the same builder for chaining")
-	}
-	if builder.EnvVars["cc"]["FOO"] != "bar" {
-		t.Errorf("expected EnvVars[cc][FOO] to be bar, got %q", builder.EnvVars["cc"]["FOO"])
-	}
-
-	// Test WithFullPaths chaining
-	result = builder.WithFullPaths(true)
-	if result != builder {
-		t.Error("WithFullPaths should return the same builder for chaining")
-	}
-	if !builder.UseFullPaths {
-		t.Error("expected UseFullPaths to be true")
-	}
-
-	// Test WithLogger chaining
-	result = builder.WithLogger(nil)
-	if result != builder {
-		t.Error("WithLogger should return the same builder for chaining")
 	}
 }

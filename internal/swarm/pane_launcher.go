@@ -86,18 +86,6 @@ func (pl *PaneLauncher) WithCmdBuilder(builder *LaunchCommandBuilder) *PaneLaunc
 	return pl
 }
 
-// WithCDDelay sets the delay before changing directory and launching.
-func (pl *PaneLauncher) WithCDDelay(delay time.Duration) *PaneLauncher {
-	pl.CDDelay = delay
-	return pl
-}
-
-// WithValidatePaths sets whether to validate project paths exist.
-func (pl *PaneLauncher) WithValidatePaths(validate bool) *PaneLauncher {
-	pl.ValidatePaths = validate
-	return pl
-}
-
 // WithLogger sets a custom logger.
 func (pl *PaneLauncher) WithLogger(logger *slog.Logger) *PaneLauncher {
 	pl.Logger = logger

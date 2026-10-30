@@ -457,35 +457,6 @@ func TestSwarmOrchestrator_OrchestrationResultTracking(t *testing.T) {
 	}
 }
 
-func TestSwarmOrchestrator_GracefulShutdown(t *testing.T) {
-	t.Log("[TEST] TestSwarmOrchestrator_GracefulShutdown: testing graceful shutdown logic")
-
-	orchestrator := NewSessionOrchestrator()
-
-	// Test destroying sessions from a plan
-	plan := &SwarmPlan{
-		Sessions: []SessionSpec{
-			{Name: "cc_agents_1", AgentType: "cc", PaneCount: 2},
-			{Name: "cod_agents_1", AgentType: "cod", PaneCount: 2},
-			{Name: "gmi_agents_1", AgentType: "gmi", PaneCount: 2},
-		},
-	}
-
-	t.Logf("[TEST] Plan has %d sessions to destroy", len(plan.Sessions))
-
-	// Test DestroySessions with nil plan (should not error)
-	err := orchestrator.DestroySessions(nil)
-	if err != nil {
-		t.Errorf("[TEST] FAIL: DestroySessions(nil) returned error: %v", err)
-	} else {
-		t.Log("[TEST] PASS: DestroySessions(nil) handled gracefully")
-	}
-
-	// Note: Actual session destruction would require real tmux
-	// This test verifies the function doesn't crash with valid input structures
-	t.Log("[TEST] PASS: graceful shutdown logic verified")
-}
-
 func TestSwarmOrchestrator_StaggerDelay(t *testing.T) {
 	t.Log("[TEST] TestSwarmOrchestrator_StaggerDelay: testing stagger delay configuration")
 
