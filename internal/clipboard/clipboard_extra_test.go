@@ -60,13 +60,8 @@ func TestChooseBackendWSLNoPowershell(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	// wslBackend with hasPaste=false
-	wb, ok := b.(*wslBackend)
-	if !ok {
+	if _, ok := b.(*wslBackend); !ok {
 		t.Fatalf("expected *wslBackend, got %T", b)
-	}
-	if wb.hasPaste {
-		t.Error("expected hasPaste=false without powershell.exe")
 	}
 }
 
@@ -82,24 +77,6 @@ func TestChooseBackendWSLNoClipExeFallthrough(t *testing.T) {
 	}
 	if b.name() != "xclip" {
 		t.Errorf("expected xclip fallback, got %s", b.name())
-	}
-}
-
-func TestChooseBackendWaylandNoPaste(t *testing.T) {
-	t.Parallel()
-	det := newStubDetector("linux",
-		map[string]string{"XDG_SESSION_TYPE": "wayland"},
-		map[string]bool{"wl-copy": true}, "")
-	b, err := chooseBackend(det)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	wb, ok := b.(*wlBackend)
-	if !ok {
-		t.Fatalf("expected *wlBackend, got %T", b)
-	}
-	if wb.hasPaste {
-		t.Error("expected hasPaste=false without wl-paste")
 	}
 }
 
@@ -171,28 +148,6 @@ func TestNewWithDetector(t *testing.T) {
 			t.Error("expected nil clipboard on error")
 		}
 	})
-}
-
-// =============================================================================
-// Backend paste error paths
-// =============================================================================
-
-func TestWlBackendPasteUnavailable(t *testing.T) {
-	t.Parallel()
-	b := wlBackend{hasPaste: false}
-	_, err := b.paste()
-	if err == nil {
-		t.Fatal("expected error when wl-paste unavailable")
-	}
-}
-
-func TestWslBackendPasteUnavailable(t *testing.T) {
-	t.Parallel()
-	b := wslBackend{hasPaste: false}
-	_, err := b.paste()
-	if err == nil {
-		t.Fatal("expected error when powershell.exe unavailable")
-	}
 }
 
 // =============================================================================

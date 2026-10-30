@@ -56,14 +56,6 @@ internal/cli/spawn_state.go:SpawnState.GetPromptStatuses	bd-ld4j2	reachable only
 internal/cli/spawn_state.go:SpawnState.IsComplete	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/cli/spawn_state.go:SpawnState.PendingCount	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/cli/spawn_state.go:SpawnState.TimeUntilNextPrompt	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/clipboard/clipboard.go:clipCmdOutput	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/clipboard/clipboard.go:clipboardImpl.Paste	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/clipboard/clipboard.go:pbcopyBackend.paste	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/clipboard/clipboard.go:tmuxBackend.paste	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/clipboard/clipboard.go:wlBackend.paste	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/clipboard/clipboard.go:wslBackend.paste	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/clipboard/clipboard.go:xclipBackend.paste	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/clipboard/clipboard.go:xselBackend.paste	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/cm/client.go:CLIClient.FormatForRecovery	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/cm/client.go:Client.Port	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/cm/client.go:truncate	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it

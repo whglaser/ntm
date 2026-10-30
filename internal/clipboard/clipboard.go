@@ -19,12 +19,6 @@ import (
 // unresponsive Wayland compositor, slow PowerShell on WSL).
 const clipTimeout = 5 * time.Second
 
-// clipWaitDelay bounds Cmd.Wait after a clipboard helper exits but leaves a
-// descendant holding its stdout pipe. CommandContext only terminates the
-// direct child; without this delay, Output can wait indefinitely for that
-// descendant to close the inherited descriptor.
-const clipWaitDelay = 250 * time.Millisecond
-
 // clipCmdRun creates and runs a command that reads from stdin, with timeout.
 func clipCmdRun(text string, name string, args ...string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), clipTimeout)
@@ -34,21 +28,10 @@ func clipCmdRun(text string, name string, args ...string) error {
 	return cmd.Run()
 }
 
-// clipCmdOutput runs a command and returns its stdout, with timeout.
-func clipCmdOutput(name string, args ...string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), clipTimeout)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, name, args...)
-	cmd.WaitDelay = clipWaitDelay
-	out, err := cmd.Output()
-	return string(out), err
-}
-
-// Clipboard exposes a unified copy/paste interface across platforms.
+// Clipboard exposes a unified copy-only interface across platforms.
 // Use New() to pick the best available backend at runtime.
 type Clipboard interface {
 	Copy(text string) error
-	Paste() (string, error)
 	Available() bool
 	Backend() string
 }
@@ -56,7 +39,6 @@ type Clipboard interface {
 // backend is an internal abstraction implemented per platform/tool.
 type backend interface {
 	copy(text string) error
-	paste() (string, error)
 	available() bool
 	name() string
 }
@@ -86,7 +68,6 @@ type clipboardImpl struct {
 }
 
 func (c *clipboardImpl) Copy(text string) error { return c.b.copy(text) }
-func (c *clipboardImpl) Paste() (string, error) { return c.b.paste() }
 func (c *clipboardImpl) Available() bool        { return c.b.available() }
 func (c *clipboardImpl) Backend() string        { return c.b.name() }
 
@@ -115,17 +96,14 @@ func chooseBackend(det detector) (backend, error) {
 	case "linux":
 		if isWSL(det) {
 			if det.lookPath("clip.exe") == nil {
-				// paste uses powershell.exe if present; copy still works without.
-				hasPowershell := det.lookPath("powershell.exe") == nil
-				return &wslBackend{hasPaste: hasPowershell}, nil
+				return &wslBackend{}, nil
 			}
 			// Fall through to other Linux options if clip.exe unavailable.
 		}
 
 		if isWayland(det) {
 			if det.lookPath("wl-copy") == nil {
-				hasPaste := det.lookPath("wl-paste") == nil
-				return &wlBackend{hasPaste: hasPaste}, nil
+				return &wlBackend{}, nil
 			}
 		}
 
@@ -141,13 +119,11 @@ func chooseBackend(det detector) (backend, error) {
 
 		// As a last resort on Linux, try Wayland if present even without env hint.
 		if det.lookPath("wl-copy") == nil {
-			hasPaste := det.lookPath("wl-paste") == nil
-			return &wlBackend{hasPaste: hasPaste}, nil
+			return &wlBackend{}, nil
 		}
 
 		if det.lookPath("clip.exe") == nil {
-			hasPowershell := det.lookPath("powershell.exe") == nil
-			return &wslBackend{hasPaste: hasPowershell}, nil
+			return &wslBackend{}, nil
 		}
 
 		if det.lookPath("tmux") == nil && det.getenv("TMUX") != "" {
@@ -187,24 +163,13 @@ func (pbcopyBackend) copy(text string) error {
 	return clipCmdRun(text, "pbcopy")
 }
 
-func (pbcopyBackend) paste() (string, error) {
-	return clipCmdOutput("pbpaste")
-}
-
 func (pbcopyBackend) available() bool { return true }
 func (pbcopyBackend) name() string    { return "pbcopy" }
 
-type wlBackend struct{ hasPaste bool }
+type wlBackend struct{}
 
 func (b wlBackend) copy(text string) error {
 	return clipCmdRun(text, "wl-copy")
-}
-
-func (b wlBackend) paste() (string, error) {
-	if !b.hasPaste {
-		return "", errors.New("wl-paste not available")
-	}
-	return clipCmdOutput("wl-paste")
 }
 
 func (b wlBackend) available() bool { return true }
@@ -216,10 +181,6 @@ func (xclipBackend) copy(text string) error {
 	return clipCmdRun(text, "xclip", "-selection", "clipboard")
 }
 
-func (xclipBackend) paste() (string, error) {
-	return clipCmdOutput("xclip", "-selection", "clipboard", "-o")
-}
-
 func (xclipBackend) available() bool { return true }
 func (xclipBackend) name() string    { return "xclip" }
 
@@ -229,24 +190,13 @@ func (xselBackend) copy(text string) error {
 	return clipCmdRun(text, "xsel", "--clipboard", "--input")
 }
 
-func (xselBackend) paste() (string, error) {
-	return clipCmdOutput("xsel", "--clipboard", "--output")
-}
-
 func (xselBackend) available() bool { return true }
 func (xselBackend) name() string    { return "xsel" }
 
-type wslBackend struct{ hasPaste bool }
+type wslBackend struct{}
 
 func (b wslBackend) copy(text string) error {
 	return clipCmdRun(text, "clip.exe")
-}
-
-func (b wslBackend) paste() (string, error) {
-	if !b.hasPaste {
-		return "", errors.New("paste not available on WSL without powershell.exe")
-	}
-	return clipCmdOutput("powershell.exe", "Get-Clipboard")
 }
 
 func (b wslBackend) available() bool { return true }
@@ -256,10 +206,6 @@ type tmuxBackend struct{}
 
 func (tmuxBackend) copy(text string) error {
 	return clipCmdRun(text, tmux.BinaryPath(), "load-buffer", "-")
-}
-
-func (tmuxBackend) paste() (string, error) {
-	return clipCmdOutput(tmux.BinaryPath(), "show-buffer")
 }
 
 func (tmuxBackend) available() bool { return true }
