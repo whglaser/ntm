@@ -398,34 +398,6 @@ func TestTemplateSource_String(t *testing.T) {
 // Template.HasVariable (bd-8gkp7)
 // =============================================================================
 
-func TestTemplate_HasVariable(t *testing.T) {
-	t.Parallel()
-	tmpl := &Template{
-		Variables: []VariableSpec{
-			{Name: "file", Required: true},
-			{Name: "session", Required: false},
-		},
-	}
-
-	if !tmpl.HasVariable("file") {
-		t.Error("HasVariable(file) should return true")
-	}
-	if !tmpl.HasVariable("session") {
-		t.Error("HasVariable(session) should return true")
-	}
-	if tmpl.HasVariable("nonexistent") {
-		t.Error("HasVariable(nonexistent) should return false")
-	}
-}
-
-func TestTemplate_HasVariable_Empty(t *testing.T) {
-	t.Parallel()
-	tmpl := &Template{}
-	if tmpl.HasVariable("anything") {
-		t.Error("HasVariable should return false for template with no variables")
-	}
-}
-
 func TestParse_WithUnknownFrontmatterField(t *testing.T) {
 	content := `---
 name: strict_template

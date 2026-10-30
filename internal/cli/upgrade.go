@@ -161,11 +161,6 @@ func (e *upgradeError) Error() string {
 }
 
 // JSON returns a machine-readable JSON representation of the error
-func (e *upgradeError) JSON() string {
-	data, _ := json.MarshalIndent(e, "", "  ")
-	return string(data)
-}
-
 // parseAssetInfo extracts OS/arch information from an asset name
 func parseAssetInfo(name, targetOS, targetArch, targetVersion string) assetInfo {
 	info := assetInfo{Name: name, Match: "none"}

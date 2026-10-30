@@ -197,20 +197,6 @@ func (s *Scanner) ScanDirectory(ctx context.Context, dir string) (*ScanResult, e
 	return s.Scan(ctx, dir, DefaultOptions())
 }
 
-// ScanStaged runs UBS on staged files only.
-func (s *Scanner) ScanStaged(ctx context.Context, dir string) (*ScanResult, error) {
-	opts := DefaultOptions()
-	opts.StagedOnly = true
-	return s.Scan(ctx, dir, opts)
-}
-
-// ScanDiff runs UBS on modified files only.
-func (s *Scanner) ScanDiff(ctx context.Context, dir string) (*ScanResult, error) {
-	opts := DefaultOptions()
-	opts.DiffOnly = true
-	return s.Scan(ctx, dir, opts)
-}
-
 // buildArgs constructs command-line arguments for UBS.
 func (s *Scanner) buildArgs(path string, opts ScanOptions) []string {
 	args := []string{"--format=json"}

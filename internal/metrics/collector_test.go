@@ -1,7 +1,6 @@
 package metrics
 
 import (
-	"encoding/json"
 	"testing"
 	"time"
 )
@@ -148,35 +147,6 @@ func TestCompareSnapshots(t *testing.T) {
 	// Should have no regressions
 	if len(result.Regressions) != 0 {
 		t.Errorf("expected no regressions, got %v", result.Regressions)
-	}
-}
-
-func TestExportFormats(t *testing.T) {
-	c := NewCollector(nil, "test-session")
-
-	recordLatencyForTest(c, "test_op", 100*time.Millisecond)
-
-	report, err := c.GenerateReport()
-	if err != nil {
-		t.Fatalf("GenerateReport failed: %v", err)
-	}
-
-	// Test JSON export
-	jsonData, err := report.ExportJSON()
-	if err != nil {
-		t.Fatalf("ExportJSON failed: %v", err)
-	}
-	if len(jsonData) == 0 {
-		t.Error("JSON export should not be empty")
-	}
-
-	// Test CSV export
-	csvData := report.ExportCSV()
-	if csvData == "" {
-		t.Error("CSV export should not be empty")
-	}
-	if !contains(csvData, "operation") || !contains(csvData, "test_op") {
-		t.Error("CSV should contain header and test_op data")
 	}
 }
 
@@ -627,71 +597,6 @@ func TestGetTargetStatus_EdgeCases(t *testing.T) {
 					tt.current, tt.target, tt.lowerIsBetter, got, tt.want)
 			}
 		})
-	}
-}
-
-func TestExportCSV_Empty(t *testing.T) {
-	report := &MetricsReport{
-		SessionID:    "test",
-		LatencyStats: map[string]LatencyStats{},
-	}
-
-	csv := report.ExportCSV()
-
-	// Should have header only
-	if csv != "operation,count,min_ms,max_ms,avg_ms,p50_ms,p95_ms,p99_ms\n" {
-		t.Errorf("empty CSV should only have header, got %q", csv)
-	}
-}
-
-func TestExportCSV_MultipleOperations(t *testing.T) {
-	report := &MetricsReport{
-		SessionID: "test",
-		LatencyStats: map[string]LatencyStats{
-			"op1": {Count: 10, MinMs: 1, MaxMs: 100, AvgMs: 50, P50Ms: 45, P95Ms: 95, P99Ms: 99},
-			"op2": {Count: 5, MinMs: 10, MaxMs: 50, AvgMs: 30, P50Ms: 28, P95Ms: 48, P99Ms: 50},
-		},
-	}
-
-	csv := report.ExportCSV()
-
-	// Should contain both operations
-	if !containsHelper(csv, "op1,10,") {
-		t.Error("CSV should contain op1 data")
-	}
-	if !containsHelper(csv, "op2,5,") {
-		t.Error("CSV should contain op2 data")
-	}
-}
-
-func TestExportJSON_ValidJSON(t *testing.T) {
-	c := NewCollector(nil, "test-session")
-
-	recordAPICallForTest(c, "test", "op")
-	recordLatencyForTest(c, "test_op", 100*time.Millisecond)
-
-	report, err := c.GenerateReport()
-	if err != nil {
-		t.Fatalf("GenerateReport failed: %v", err)
-	}
-
-	jsonData, err := report.ExportJSON()
-	if err != nil {
-		t.Fatalf("ExportJSON failed: %v", err)
-	}
-
-	// Verify it's valid JSON by unmarshaling
-	var parsed MetricsReport
-	if err := json.Unmarshal(jsonData, &parsed); err != nil {
-		t.Errorf("ExportJSON produced invalid JSON: %v", err)
-	}
-
-	// Verify key fields survived round-trip
-	if parsed.SessionID != "test-session" {
-		t.Errorf("SessionID = %q, want %q", parsed.SessionID, "test-session")
-	}
-	if parsed.APICallCounts["test:op"] != 1 {
-		t.Errorf("APICallCounts[test:op] = %d, want 1", parsed.APICallCounts["test:op"])
 	}
 }
 

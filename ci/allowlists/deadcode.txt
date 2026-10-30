@@ -56,7 +56,6 @@ internal/cli/spawn_state.go:SpawnState.GetPromptStatuses	bd-ld4j2	reachable only
 internal/cli/spawn_state.go:SpawnState.IsComplete	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/cli/spawn_state.go:SpawnState.PendingCount	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/cli/spawn_state.go:SpawnState.TimeUntilNextPrompt	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/cli/upgrade.go:upgradeError.JSON	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/clipboard/clipboard.go:clipCmdOutput	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/clipboard/clipboard.go:clipboardImpl.Paste	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/clipboard/clipboard.go:pbcopyBackend.paste	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
@@ -139,7 +138,6 @@ internal/ensemble/types.go:ModeCatalog.ListByTier	bd-ld4j2	reachable only throug
 internal/ensemble/types.go:ModeCatalog.ListDefault	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/ensemble/types.go:ModeCatalog.SearchModes	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/ensemble/types.go:ModeCatalog.Version	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/events/bus.go:EventBus.EnableRobotMode	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/events/bus.go:EventBus.SubscriberCount	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/handoff/constants.go:ValidationErrors.FieldNames	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/handoff/constants.go:ValidationErrors.ForField	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
@@ -157,9 +155,6 @@ internal/integrations/caut/cache.go:UsageCache.GetUpdateCount	bd-ld4j2	reachable
 internal/integrations/caut/cache.go:UsageCache.Snapshot	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/integrations/caut/cache.go:UsageCache.UpdateAllUsage	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/integrations/caut/cache.go:UsageCache.UpdateUsage	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/metrics/collector.go:MetricsReport.ExportCSV	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/metrics/collector.go:MetricsReport.ExportJSON	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/output/errors.go:CLIError.WithCause	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/pipeline/deps.go:DependencyGraph.IsFailed	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/pipeline/deps.go:DependencyGraph.Resolve	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/pipeline/executor.go:Executor.SetDetector	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
@@ -191,10 +186,8 @@ internal/robot/routing.go:AgentScorer.ScoreAgentsWithContext	bd-ld4j2	reachable 
 internal/rotation/provider.go:ClaudeProvider.AuthSuccessPatterns	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/rotation/provider.go:CodexProvider.AuthSuccessPatterns	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/rotation/provider.go:GeminiProvider.AuthSuccessPatterns	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/scanner/scanner.go:Scanner.ScanDiff	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/scanner/scanner.go:Scanner.ScanDirectory	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/scanner/scanner.go:Scanner.ScanFile	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/scanner/scanner.go:Scanner.ScanStaged	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/scanner/types.go:ScanResult.FilterByFile	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/scanner/types.go:ScanResult.FilterBySeverity	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/scanner/types.go:ScanResult.TotalIssues	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
@@ -303,7 +296,6 @@ internal/swarm/prompt_injector.go:PromptInjector.WithAdaptiveDelay	bd-ld4j2	reac
 internal/swarm/prompt_injector.go:PromptInjector.WithRateLimitTracker	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/swarm/prompt_injector.go:PromptInjector.WithStaggerDelay	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/swarm/prompt_injector.go:PromptInjector.sessionOrchestrator	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/templates/template.go:Template.HasVariable	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tmux/backpressure.go:CaptureBackpressureInput	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tmux/backpressure.go:Client.CaptureBackpressureInputs	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tmux/backpressure.go:captureBackpressureTracker.inputs	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it

@@ -259,9 +259,8 @@ func TestFormatCLIError_WithCode(t *testing.T) {
 func TestFormatCLIError_WithCauseAndHint(t *testing.T) {
 	t.Parallel()
 
-	e := NewCLIError("deploy failed").
-		WithCause("network timeout").
-		WithHint("check VPN connection")
+	e := NewCLIError("deploy failed").WithHint("check VPN connection")
+	e.Cause = "network timeout"
 	out := FormatCLIError(e)
 
 	if !strings.Contains(out, "Cause: network timeout") {
@@ -277,8 +276,8 @@ func TestFormatCLIError_AllFields(t *testing.T) {
 
 	e := NewCLIError("auth failed").
 		WithCode("E401").
-		WithCause("token expired").
 		WithHint("refresh token with 'ntm auth refresh'")
+	e.Cause = "token expired"
 	out := FormatCLIError(e)
 
 	if !strings.Contains(out, "Error: auth failed") {

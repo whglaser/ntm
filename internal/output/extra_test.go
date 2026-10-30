@@ -234,9 +234,9 @@ func TestCLIErrorBasic(t *testing.T) {
 
 func TestCLIErrorChaining(t *testing.T) {
 	err := NewCLIError("failed").
-		WithCause("network timeout").
 		WithHint("check connection").
 		WithCode("NET_TIMEOUT")
+	err.Cause = "network timeout"
 
 	if err.Message != "failed" {
 		t.Errorf("Message = %q", err.Message)
@@ -258,9 +258,9 @@ func TestFormatCLIErrorPlain(t *testing.T) {
 	defer os.Unsetenv("NO_COLOR")
 
 	err := NewCLIError("test error").
-		WithCause("something went wrong").
 		WithHint("try again").
 		WithCode("TEST")
+	err.Cause = "something went wrong"
 
 	output := FormatCLIError(err)
 
