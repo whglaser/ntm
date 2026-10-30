@@ -117,14 +117,6 @@ internal/pipeline/state_resume.go:Executor.ResumeWithOptions	bd-ld4j2	reachable 
 internal/quota/quota.go:QuotaInfo.Health	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/quota/quota.go:QuotaInfo.IsHealthy	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/quota/quota.go:QuotaInfo.IsStale	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/ratelimit/tracker.go:RateLimitTracker.ClearCooldown	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/ratelimit/tracker.go:RateLimitTracker.GetAllProviders	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/ratelimit/tracker.go:RateLimitTracker.GetProviderState	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/ratelimit/tracker.go:RateLimitTracker.GetRecentEvents	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/ratelimit/tracker.go:RateLimitTracker.IsInCooldown	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/ratelimit/tracker.go:RateLimitTracker.RecordRateLimit	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/ratelimit/tracker.go:RateLimitTracker.Reset	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/ratelimit/tracker.go:RateLimitTracker.ResetAll	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/robot/adapters/work_coordination.go:WorkCoordinationAdapter.LastError	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/robot/patterns.go:PatternLibrary.AddPattern	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/robot/patterns.go:PatternLibrary.GetPatterns	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
@@ -506,3 +498,12 @@ internal/status/compaction.go:CompactionDetector.EventsForPane	permanent	test-in
 internal/status/compaction.go:CompactionDetector.HasRecentCompaction	permanent	test-inspection accessor for live compaction detection: reached by internal/status/compaction_test.go (TestCompactionDetector_HasRecentCompaction)
 internal/status/recovery.go:CompactionRecoveryIntegration.Detector	permanent	test-inspection accessor for the live integration wiring: reached cross-package by internal/cli/monitor_compaction_test.go and internal/status/recovery_test.go
 internal/status/recovery.go:CompactionRecoveryIntegration.Recovery	permanent	test-inspection accessor for the live integration wiring: reached cross-package by internal/cli/monitor_compaction_test.go and internal/status/recovery_test.go
+# permanent: test-helper (bd-ld4j2 batch 16)
+internal/ratelimit/tracker.go:RateLimitTracker.RecordRateLimit	permanent	test fixture: records a rate-limit event without imposing a cooldown; reached by internal/cli/spawn_stagger_test.go, internal/robot/spawn_pacing_test.go, internal/swarm/prompt_injector_test.go, internal/ratelimit/tracker_test.go (live API is RecordRateLimitWithCooldown/RecordSuccess)
+internal/ratelimit/tracker.go:RateLimitTracker.GetProviderState	permanent	test-inspection accessor for live tracker state: reached by internal/resilience/monitor_test.go, internal/swarm/prompt_injector_test.go, internal/cli/swarm_test.go, internal/ratelimit/tracker_test.go
+internal/ratelimit/tracker.go:RateLimitTracker.IsInCooldown	permanent	test-inspection predicate for live cooldown state: reached by internal/ratelimit/tracker_test.go (8 sites); the live production predicate is CooldownRemaining
+internal/ratelimit/tracker.go:RateLimitTracker.ClearCooldown	permanent	tracker test reset helper: reached by internal/ratelimit/tracker_test.go (TestClearCooldown, TestClearCooldown_UnknownProvider)
+internal/ratelimit/tracker.go:RateLimitTracker.GetAllProviders	permanent	test-inspection accessor: reached by internal/ratelimit/tracker_test.go (TestGetAllProviders)
+internal/ratelimit/tracker.go:RateLimitTracker.GetRecentEvents	permanent	test-inspection accessor for recorded events: reached by internal/ratelimit/tracker_test.go (TestGetRecentEvents, TestGetRecentEvents_Empty)
+internal/ratelimit/tracker.go:RateLimitTracker.Reset	permanent	tracker test reset helper: reached by internal/ratelimit/tracker_test.go (TestReset)
+internal/ratelimit/tracker.go:RateLimitTracker.ResetAll	permanent	tracker test reset helper: reached by internal/ratelimit/tracker_test.go (TestResetAll)
