@@ -187,17 +187,11 @@ internal/status/recovery.go:RecoveryManager.sendRecoveryPromptByIDForAgent	bd-ld
 internal/status/unified.go:UnifiedDetector.DetectAll	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/status/unified.go:UnifiedDetector.DetectAllContext	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/swarm/claude_config_home.go:ClaudeConfigProvisioner.CredentialIsolated	ntm-9n7x8	upstream f477c62c debt (upstream G1 gate red): unreachable from cmd/ntm; its credentialState helper chain is dead; wire or delete upstream
-internal/tmux/backpressure.go:CaptureBackpressureInput	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tmux/backpressure.go:Client.CaptureBackpressureInputs	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tmux/backpressure.go:captureBackpressureTracker.inputs	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tmux/backpressure.go:firstNonEmpty	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/tmux/backpressure.go:isCaptureTimeout	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tmux/client.go:Client.RespawnPaneContext	ntm-9n7x8	upstream f477c62c debt (upstream G1 gate red): kept only by RTA's reflection rule, no call path from cmd/ntm; wire or delete upstream
 internal/tmux/client.go:RespawnPaneContext	ntm-9n7x8	upstream f477c62c debt (upstream G1 gate red): unreachable from cmd/ntm; package-level respawn wrapper left uncalled; wire or delete upstream
 internal/tmux/launch_environment.go:LaunchEnvironment.GoString	ntm-9n7x8	upstream f477c62c debt (upstream G1 gate red): unreachable from cmd/ntm; redaction GoString stringer left uncalled; wire or delete upstream
 internal/tmux/launch_environment.go:LaunchEnvironment.Send	ntm-9n7x8	upstream f477c62c debt (upstream G1 gate red): unreachable from cmd/ntm; the live handoff path uses SendIfCurrent and Send is an uncalled twin; wire or delete upstream
 internal/tmux/launch_environment.go:LaunchEnvironment.String	ntm-9n7x8	upstream f477c62c debt (upstream G1 gate red): unreachable from cmd/ntm; redaction String stringer left uncalled; wire or delete upstream
-internal/tmux/pane_badge.go:Client.ReadPaneBadgeContext	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tmux/session.go:Client.PasteKeysWithDelay	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/tmux/session.go:SetPaneAgentTypeContext	ntm-9n7x8	upstream f477c62c debt (upstream G1 gate red): unreachable from cmd/ntm; package-level wrapper left uncalled (the guarded form is live); wire or delete upstream
 internal/tools/am.go:AMAdapter.ServerURL	bd-ld4j2	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
@@ -505,3 +499,11 @@ internal/ratelimit/tracker.go:RateLimitTracker.ResetAll	permanent	tracker test r
 internal/agentmail/client.go:Client.InvalidateCache	permanent	test reset hook for the availability cache: reached by internal/agentmail/client_test.go (TestInvalidateCache)
 internal/agentmail/client.go:Client.ProjectKey	permanent	test-inspection accessor for live client configuration: reached by internal/serve/server_test.go (mail-client project-key assertions) and internal/agentmail/client_test.go
 internal/agentmail/client.go:Client.SetProjectKey	permanent	test fixture for live client reconfiguration: reached by internal/serve/mail_test.go and internal/agentmail/client_test.go
+# permanent: test-helper (bd-ld4j2 batch 18)
+internal/tmux/pane_badge.go:Client.ReadPaneBadgeContext	permanent	test-inspection read-back for live badge publication: reached by internal/tmux/pane_badge_test.go and the cli badge e2e regression internal/cli/mapping_badges_e2e_test.go (cross-package, cannot move to _test.go)
+# permanent: integration-tagged coverage (bd-ld4j2 batch 18)
+internal/tmux/backpressure.go:CaptureBackpressureInput	permanent	reached by integration-tagged internal/tmux/capture_real_test.go (TestRealCaptureFeedsBackpressureSnapshot) and the in-package unit tests; the untagged gate cannot see the tagged call path
+internal/tmux/backpressure.go:Client.CaptureBackpressureInputs	permanent	reached by integration-tagged internal/tmux/capture_real_test.go after a real CapturePaneOutput; untagged gate cannot see that call path
+internal/tmux/backpressure.go:captureBackpressureTracker.inputs	permanent	hand reached by the integration-tagged capture backpressure snapshot test
+internal/tmux/backpressure.go:isCaptureTimeout	permanent	hand reached by CaptureBackpressureInput (integration-tagged coverage above)
+internal/tmux/backpressure.go:firstNonEmpty	permanent	hand reached by CaptureBackpressureInput (integration-tagged coverage above)
