@@ -8,13 +8,16 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/Dicklesworthstone/ntm/internal/programstatus"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
+	"github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
@@ -534,5 +537,74 @@ func TestWaitCommandJSONEncodingFailurePreservesWriterError(t *testing.T) {
 	assertWaitCommandFailure(t, err, false)
 	if !errors.Is(err, writeErr) {
 		t.Fatalf("wait lost the actual encoding failure: %v", err)
+	}
+}
+
+// cliFakeProgramStatusSource is the deterministic OSC 7501 emitter the
+// CLI-level test substitutes for the real tap: the transport stays fake, but
+// the wait engine, detector, overlay, and response encoding are the real
+// path (ntm-l6cuz.2).
+type cliFakeProgramStatusSource map[string]programstatus.Event
+
+func (f cliFakeProgramStatusSource) Latest(paneID string) (programstatus.Event, bool) {
+	event, ok := f[paneID]
+	return event, ok
+}
+
+// TestWaitCommandPrefersOSCReportOverScrape is the CLI acceptance for the OSC
+// wiring: a claude pane whose fake capture reads THINKING completes on the
+// emitted OSC "done" report within seconds, and the JSON response names osc
+// as the deciding source. The scrape-only control on the same capture times
+// out, so the report is what decided it.
+func TestWaitCommandPrefersOSCReportOverScrape(t *testing.T) {
+	dir := installWaitCommandTmux(t)
+	// Replace the idle claude prompt with a live spinner frame: scrape sees
+	// THINKING, so only an authoritative settle can complete the wait.
+	if err := os.WriteFile(filepath.Join(dir, "capture-%41"), []byte("✻ Running…\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Control: scrape alone never reaches idle on a working frame.
+	control, controlOut, _ := waitCommandHarness(t, "wait-project", "--until=idle", "--timeout=1s", "--json")
+	if err := control.ExecuteContext(t.Context()); err == nil {
+		t.Fatalf("scrape-only wait completed on a thinking frame: %s", controlOut.String())
+	}
+
+	// Emit the agent's own "done" report through the CLI source seam.
+	previous := programStatusSourceForSession
+	programStatusSourceForSession = func(context.Context, string) (status.ProgramStatusSource, func()) {
+		return cliFakeProgramStatusSource{
+			"%41": {PaneID: "%41", State: programstatus.StateDone, App: "pi", ObservedAt: time.Now()},
+		}, func() {}
+	}
+	t.Cleanup(func() { programStatusSourceForSession = previous })
+
+	cmd, out, diagnostics := waitCommandHarness(t, "wait-project", "--until=idle", "--timeout=3s", "--json")
+	if err := cmd.ExecuteContext(t.Context()); err != nil {
+		t.Fatalf("OSC-report wait failed: %v; out=%s; diagnostics=%s", err, out.String(), diagnostics.String())
+	}
+	response := decodeWaitCommandResponse(t, out)
+	if !response.Success {
+		t.Fatalf("wait did not complete on the OSC report: %+v", response.RobotResponse)
+	}
+	var matched *robot.WaitAgentInfo
+	for i := range response.Agents {
+		if response.Agents[i].Pane == "%41" {
+			matched = &response.Agents[i]
+		}
+	}
+	if matched == nil {
+		t.Fatalf("agents = %+v, want the OSC-decided pane %%41", response.Agents)
+	}
+	if matched.State != "WAITING" || matched.StateSource != "osc" {
+		t.Fatalf("matched agent = %+v, want %%41 WAITING/osc", matched)
+	}
+	// The scrape patterns still record the spinner the frame showed: the
+	// report, not the capture, decided the state.
+	if !slices.Contains(matched.DetectedPatterns, "claude_spinner_running") {
+		t.Fatalf("scrape evidence was dropped: %+v", matched)
+	}
+	if matched.ReportAgeSeconds < 0 || matched.ReportAgeSeconds > 5 {
+		t.Fatalf("report age = %v, want a fresh report", matched.ReportAgeSeconds)
 	}
 }

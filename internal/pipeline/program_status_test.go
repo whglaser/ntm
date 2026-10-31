@@ -120,9 +120,9 @@ func TestAdHocStageProgramStatusCaptureSkipsInjectedClients(t *testing.T) {
 	}
 
 	executor.programStatusMu.Lock()
-	streams := executor.programStatusStreams
+	tap := executor.programStatusTap
 	executor.programStatusMu.Unlock()
-	if streams != nil {
+	if tap != nil {
 		t.Fatal("injected tmux client started a real OSC capture")
 	}
 	if len(detector.resets) != 1 || detector.resets[0] != client.pane.ID {
@@ -281,8 +281,9 @@ func TestNewTurnForgetsProgramStatusButResumeKeepsIt(t *testing.T) {
 	cfg := DefaultExecutorConfig("program-status-turn")
 	executor := NewExecutor(cfg)
 	executor.SetTmuxClient(NewMockTmuxClient())
-	observer := programstatus.NewObserver()
-	executor.programStatusObserver = observer
+	tap := programstatus.NewTap(nil)
+	observer := tap.Observer()
+	executor.programStatusTap = tap
 
 	for _, tc := range []struct {
 		name      string
@@ -627,6 +628,44 @@ func TestAgentDeliveryRecordsProviderRejectionAttempts(t *testing.T) {
 		if !strings.Contains(recorded[i], want) {
 			t.Fatalf("attempt record %d = %q, want it to mention %q", i, recorded[i], want)
 		}
+	}
+	assertNotResent(t, mock)
+}
+
+// TestAgentDeliveryTerminalFailureSettlesProgramStatus pins the ntm-l6cuz.7
+// OSC half: when a step fails terminally, the pane's authoritative report is
+// forgotten so a fresh "working" with no done/clear cannot outlive the turn.
+// Retries and recorded resumes keep it instead (ntm-l6cuz.9), because they
+// observe the same turn.
+func TestAgentDeliveryTerminalFailureSettlesProgramStatus(t *testing.T) {
+	executor, mock := submittingExecutor(t, "pi-osc-settle")
+	executor.config.ProjectDir = t.TempDir()
+	mock.AddPane("", tmux.Pane{ID: "%1", Index: 1, PID: 4141, Type: tmux.AgentType("pi"), Width: 100})
+	if err := mock.SetPaneOutput("%1", piStagePane("Pi v1.3.0\nPrevious turn context that will scroll away.", "")); err != nil {
+		t.Fatal(err)
+	}
+	tap := programstatus.NewTap(nil)
+	executor.programStatusTap = tap
+	mock.SetSubmissionVerifier(func(target, _, _ string) error {
+		// The pane reports working, then the frame becomes unattributable and
+		// never emits done/clear (the failed-step lifetime).
+		tap.ObserveEvent(tmux.StreamEvent{Target: target, Lines: []string{"\x1b]7501;state=working:app=pi\x1b\\"}})
+		return mock.SetPaneOutput(target, piStagePane("Pi v1.3.0\n\n"+strings.Repeat("lane output line\n", 400)+"unattributed", ""))
+	})
+
+	workflow := singleStepWorkflow("pi-osc-settle", Step{
+		ID:      "work",
+		Pane:    PaneSpec{Index: 1},
+		Prompt:  "Run the lane.",
+		Wait:    WaitCompletion,
+		Timeout: Duration{Duration: 4 * time.Second},
+	})
+	state, err := executor.Run(context.Background(), workflow, nil, nil)
+	if err == nil || state.Status != StatusFailed {
+		t.Fatalf("unattributable turn did not fail: state=%+v err=%v", state.Status, err)
+	}
+	if _, ok := tap.Observer().Latest("%1"); ok {
+		t.Fatal("terminal failure left the pane's stale OSC report behind")
 	}
 	assertNotResent(t, mock)
 }

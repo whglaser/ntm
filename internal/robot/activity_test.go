@@ -9,6 +9,7 @@ import (
 
 	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/state"
+	"github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
@@ -2655,5 +2656,86 @@ func TestClassifyStatePluginIdleOutranksTruncatedFooterDots(t *testing.T) {
 	}
 	if activity.State != StateThinking {
 		t.Fatalf("live spinner state = %s (patterns %v), want thinking", activity.State, activity.DetectedPatterns)
+	}
+}
+
+// activityFakeProgramStatus is the OSC report seam shared by the wait and
+// activity surfaces (ntm-l6cuz.2).
+type activityFakeProgramStatus map[string]status.AgentStatus
+
+func (f activityFakeProgramStatus) DetectReport(paneID string) (status.AgentStatus, bool) {
+	report, ok := f[paneID]
+	return report, ok
+}
+
+func TestRobotStateFromProgramStatusMapping(t *testing.T) {
+	for _, tc := range []struct {
+		status status.AgentState
+		want   AgentState
+		known  bool
+	}{
+		{status.StateIdle, StateWaiting, true},
+		{status.StateWorking, StateGenerating, true},
+		{status.StateError, StateError, true},
+		{status.StateUnknown, StateUnknown, false},
+	} {
+		got, known := robotStateFromPromptStatus(tc.status)
+		if got != tc.want || known != tc.known {
+			t.Errorf("robotStateFromPromptStatus(%q) = (%q, %v), want (%q, %v)", tc.status, got, known, tc.want, tc.known)
+		}
+	}
+}
+
+func TestApplyProgramStatusOverridesAndSynthesizes(t *testing.T) {
+	scraped := &AgentActivity{
+		PaneID:           "%1",
+		AgentType:        "claude",
+		State:            StateThinking,
+		StateSource:      activityStateSourceScrape,
+		Confidence:       0.8,
+		Velocity:         12.5,
+		DetectedPatterns: []string{"claude_spinner_running"},
+		RateLimited:      true,
+	}
+	detector := activityFakeProgramStatus{
+		"%1": {PaneID: "%1", State: status.StateIdle, StateSource: status.StateSourceOSC, ReportAgeSeconds: 42},
+	}
+
+	overridden, applied := ApplyProgramStatus(detector, "%1", "claude", scraped)
+	if !applied {
+		t.Fatal("fresh OSC report did not apply")
+	}
+	if overridden.State != StateWaiting || overridden.StateSource != activityStateSourceOSC || overridden.ReportAgeSeconds != 42 || overridden.Confidence != 1.0 {
+		t.Fatalf("override = %+v, want WAITING/osc/42s/1.0", overridden)
+	}
+	// Scrape metadata is preserved: only the authoritative fields change.
+	if overridden.Velocity != 12.5 || len(overridden.DetectedPatterns) != 1 || !overridden.RateLimited {
+		t.Fatalf("scrape metadata was dropped: %+v", overridden)
+	}
+
+	// A pane the classifier could not read at all is still decided by the
+	// agent's own report.
+	synthesized, applied := ApplyProgramStatus(detector, "%1", "claude", nil)
+	if !applied || synthesized == nil {
+		t.Fatal("OSC report did not decide an unclassified pane")
+	}
+	if synthesized.State != StateWaiting || synthesized.AgentType != "claude" {
+		t.Fatalf("synthesized = %+v, want WAITING/claude", synthesized)
+	}
+
+	// No detector, no report, and unknown states leave the scrape in charge.
+	for name, tc := range map[string]struct {
+		detector ProgramStatusDetector
+		paneID   string
+	}{
+		"nil detector": {nil, "%1"},
+		"no report":    {activityFakeProgramStatus{}, "%1"},
+		"unknown":      {activityFakeProgramStatus{"%1": {PaneID: "%1", State: status.StateUnknown}}, "%1"},
+		"empty pane":   {detector, ""},
+	} {
+		got, applied := ApplyProgramStatus(tc.detector, tc.paneID, "claude", scraped)
+		if applied || got != scraped {
+			t.Errorf("%s: got (%+v, %v), want the untouched scrape", name, got, applied)
+		}
 	}
 }

@@ -57,21 +57,24 @@ func (d *OSCDetector) Detect(paneID string) (AgentStatus, error) {
 
 	if event, ok := d.freshEventAt(paneID, d.now()); ok {
 		if state, errType, known := ProgramStatusState(event); known {
+			age := reportAge(event, d.now())
 			if fallbackErr != nil {
 				// The OSC report is authoritative even when the tmux
 				// capture failed; only pane metadata is missing.
 				return AgentStatus{
-					PaneID:      paneID,
-					State:       state,
-					ErrorType:   errType,
-					StateSource: StateSourceOSC,
-					UpdatedAt:   d.now(),
+					PaneID:           paneID,
+					State:            state,
+					ErrorType:        errType,
+					StateSource:      StateSourceOSC,
+					UpdatedAt:        event.ObservedAt,
+					ReportAgeSeconds: age,
 				}, nil
 			}
 			fallbackStatus.State = state
 			fallbackStatus.ErrorType = errType
 			fallbackStatus.StateSource = StateSourceOSC
-			fallbackStatus.UpdatedAt = d.now()
+			fallbackStatus.UpdatedAt = event.ObservedAt
+			fallbackStatus.ReportAgeSeconds = age
 			return fallbackStatus, nil
 		}
 	}
@@ -81,6 +84,43 @@ func (d *OSCDetector) Detect(paneID string) (AgentStatus, error) {
 	}
 	fallbackStatus.StateSource = StateSourceScrape
 	return fallbackStatus, nil
+}
+
+// DetectReport returns the pane's authoritative OSC status when a fresh
+// report exists, without consulting the fallback detector and therefore
+// without a tmux capture. Callers that already own scrape evidence (the wait
+// and activity surfaces) use it to overlay the agent's own verdict on the
+// classification they already have.
+func (d *OSCDetector) DetectReport(paneID string) (AgentStatus, bool) {
+	if d == nil || d.source == nil || paneID == "" {
+		return AgentStatus{}, false
+	}
+	event, ok := d.freshEventAt(paneID, d.now())
+	if !ok {
+		return AgentStatus{}, false
+	}
+	state, errType, known := ProgramStatusState(event)
+	if !known {
+		return AgentStatus{}, false
+	}
+	return AgentStatus{
+		PaneID:           paneID,
+		State:            state,
+		ErrorType:        errType,
+		StateSource:      StateSourceOSC,
+		UpdatedAt:        event.ObservedAt,
+		ReportAgeSeconds: reportAge(event, d.now()),
+	}, true
+}
+
+// reportAge is the age of the deciding report, never negative (a clock that
+// steps backwards must not produce a negative age).
+func reportAge(event programstatus.Event, now time.Time) float64 {
+	age := now.Sub(event.ObservedAt)
+	if age < 0 {
+		age = 0
+	}
+	return age.Seconds()
 }
 
 // ResetPane forwards a per-step classification reset to the wrapped detector
@@ -115,7 +155,8 @@ func (d *OSCDetector) DetectAll(session string) ([]AgentStatus, error) {
 		statuses[i].State = state
 		statuses[i].ErrorType = errType
 		statuses[i].StateSource = StateSourceOSC
-		statuses[i].UpdatedAt = now
+		statuses[i].UpdatedAt = event.ObservedAt
+		statuses[i].ReportAgeSeconds = reportAge(event, now)
 	}
 	return statuses, nil
 }

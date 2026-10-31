@@ -32,6 +32,10 @@ type WaitOptions struct {
 	WaitID             string   // Optional durable handle that another CLI process can cancel
 	ProductivityWindow time.Duration
 	ConvergedStreak    int
+	// StatusDetector supplies the pane's authoritative OSC 7501 state when one
+	// exists. The CLI wires a tap-backed detector; nil keeps scrape-only
+	// waiting. It is not serialized.
+	StatusDetector ProgramStatusDetector `json:"-" yaml:"-" toml:"-"`
 }
 
 // WaitResponse is the JSON output for --robot-wait.
@@ -104,6 +108,10 @@ type WaitAgentInfo struct {
 	StateSource      string   `json:"state_source,omitempty"`      // scrape|osc
 	StateSince       string   `json:"state_since,omitempty"`       // RFC3339 timestamp
 	DetectedPatterns []string `json:"detected_patterns,omitempty"` // deciding matches
+	// ReportAgeSeconds is how old the deciding OSC 7501 report was when the
+	// state was decided; zero/absent for scrape-derived states. It makes live
+	// vs stale authority visible (ntm-l6cuz.7).
+	ReportAgeSeconds float64 `json:"report_age_seconds,omitempty"`
 }
 
 // Wait condition constants - pane-based conditions
@@ -388,8 +396,9 @@ func GetWaitContext(ctx context.Context, opts WaitOptions) (*WaitResponse, int) 
 					return response, 1
 				}
 				classifier := monitor.GetOrCreate(pane.ID)
-				if at := waitPaneAgentType(pane); at != "" && at != "unknown" && at != "user" {
-					classifier.SetAgentType(at)
+				agentType := waitPaneAgentType(pane)
+				if agentType != "" && agentType != "unknown" && agentType != "user" {
+					classifier.SetAgentType(agentType)
 				}
 				// Preserve the classifier's 20-line capture and three-second
 				// per-pane bound while also honoring this wait's context.
@@ -399,12 +408,15 @@ func GetWaitContext(ctx context.Context, opts WaitOptions) (*WaitResponse, int) 
 				if response := interruptionResponse(); response != nil {
 					return response, 1
 				}
-				if captureErr != nil {
-					unobservedPanes = append(unobservedPanes, pane.ID)
-					continue
+				var activity *AgentActivity
+				if captureErr == nil {
+					activity, _ = classifier.ClassifyWithOutput(output)
 				}
-				activity, err := classifier.ClassifyWithOutput(output)
-				if err != nil || activity == nil {
+				// The agent's own OSC 7501 report outranks the scrape, and it can
+				// decide the pane even when the capture could not be read at all
+				// (the idle-pane false-negative case).
+				activity, _ = ApplyProgramStatus(opts.StatusDetector, pane.ID, agentType, activity)
+				if activity == nil {
 					// A failed observation is not evidence that this target is
 					// ready. Keep it pending instead of shrinking the ALL set.
 					unobservedPanes = append(unobservedPanes, pane.ID)

@@ -5,7 +5,6 @@ import (
 
 	"github.com/Dicklesworthstone/ntm/internal/programstatus"
 	"github.com/Dicklesworthstone/ntm/internal/status"
-	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
 // OSC 7501 program-status capture for pipeline runs.
@@ -14,10 +13,11 @@ import (
 // while waiting for a dispatched step to settle (an idle pi pane misread
 // as working burns the step timeout). The capture is
 // lazy and per-pane: the first dispatch to a pane starts a raw pipe-pane tap
-// through tmux.StreamManager, which reads the pane's output stream — the only
-// place OSC sequences exist. Polling fallback events are rendered screen
-// captures and are ignored, so a scrape can never masquerade as an
-// authoritative status.
+// through programstatus.Tap, which reads the pane's output stream — the only
+// place OSC sequences exist. That tap is the same composition the serve hub
+// and the CLI wait/activity surfaces use (ORI). Polling fallback events are
+// rendered screen captures and are ignored, so a scrape can never masquerade
+// as an authoritative status.
 //
 // Tests and embedders that do not run a live tmux server inject a source with
 // SetProgramStatusSource; the detector preference is identical either way.
@@ -59,47 +59,53 @@ func (e *Executor) ensureProgramStatusCapture(paneID string, beginTurn bool) {
 		return
 	}
 
-	if beginTurn {
-		e.programStatusMu.Lock()
-		if e.programStatusObserver != nil {
-			e.programStatusObserver.Forget(paneID)
-		}
-		e.programStatusMu.Unlock()
+	e.programStatusMu.Lock()
+	tap := e.programStatusTap
+	if beginTurn && tap != nil {
+		tap.Forget(paneID)
 	}
+	e.programStatusMu.Unlock()
 
 	if _, live := e.tmuxClient().(realTmuxClient); !live {
 		return
 	}
 
 	e.programStatusMu.Lock()
-	needInit := e.programStatusObserver == nil
+	needInit := e.programStatusTap == nil
 	if needInit {
-		observer := programstatus.NewObserver()
-		e.programStatusObserver = observer
-		e.programStatusStreams = tmux.NewStreamManager(tmux.DefaultClient, func(event tmux.StreamEvent) {
-			if event.IsFull || event.Target == "" || len(event.Lines) == 0 {
-				return
-			}
-			for _, line := range event.Lines {
-				observer.Observe(event.Target, []byte(line))
-			}
-		}, tmux.DefaultPaneStreamerConfig())
+		e.programStatusTap = programstatus.NewTap(nil)
 	}
-	observer := e.programStatusObserver
+	tap = e.programStatusTap
 	e.programStatusMu.Unlock()
 
 	if needInit {
 		// Install the observer through the same seam tests use, so the
 		// preference path is identical in production and tests.
-		e.SetProgramStatusSource(observer)
+		e.SetProgramStatusSource(tap.Observer())
 	}
 
 	// A failed start (for example, another process owns the pane's pipe)
 	// leaves scraping as the source; the wait must not fail because its
 	// optional authority is unavailable.
+	_ = tap.Ensure(paneID)
+}
+
+// forgetProgramStatus settles a pane's authoritative report once NTM knows no
+// further observation of that turn will happen in this process: a terminal
+// step failure or a cancelled run. Retries and recorded resumes keep the
+// report because they observe the same turn (ntm-l6cuz.9); without this a
+// fresh "working" with no done/clear would outlive its failed step
+// (ntm-l6cuz.7).
+func (e *Executor) forgetProgramStatus(paneID string) {
+	if e == nil || paneID == "" {
+		return
+	}
 	e.programStatusMu.Lock()
-	_ = e.programStatusStreams.StartStream(paneID)
+	tap := e.programStatusTap
 	e.programStatusMu.Unlock()
+	if tap != nil {
+		tap.Forget(paneID)
+	}
 }
 
 // resetDetectorPaneState drops per-pane classification history so a state
@@ -127,9 +133,9 @@ func (e *Executor) stopProgramStatusCapture() {
 		return
 	}
 	e.programStatusMu.Lock()
-	streams := e.programStatusStreams
+	tap := e.programStatusTap
 	e.programStatusMu.Unlock()
-	if streams != nil {
-		streams.StopAll()
+	if tap != nil {
+		tap.StopAll()
 	}
 }

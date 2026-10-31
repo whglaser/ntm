@@ -654,12 +654,16 @@ type StateTransition struct {
 
 // AgentActivity represents the current activity state of an agent pane.
 type AgentActivity struct {
-	PaneID           string            `json:"pane_id"`
-	AgentType        string            `json:"agent_type"` // "claude", "codex", "gemini", "*"
-	State            AgentState        `json:"state"`
-	StateSource      string            `json:"state_source,omitempty"` // scrape|osc
-	Confidence       float64           `json:"confidence"`             // 0.0-1.0
-	Velocity         float64           `json:"velocity"`               // current chars/sec
+	PaneID      string     `json:"pane_id"`
+	AgentType   string     `json:"agent_type"` // "claude", "codex", "gemini", "*"
+	State       AgentState `json:"state"`
+	StateSource string     `json:"state_source,omitempty"` // scrape|osc
+	// ReportAgeSeconds is how old the deciding OSC 7501 report was when the
+	// state was decided; zero for scrape-derived states. It makes live vs
+	// stale authority visible (ntm-l6cuz.7).
+	ReportAgeSeconds float64           `json:"report_age_seconds,omitempty"`
+	Confidence       float64           `json:"confidence"` // 0.0-1.0
+	Velocity         float64           `json:"velocity"`   // current chars/sec
 	StateSince       time.Time         `json:"state_since"`
 	DetectedPatterns []string          `json:"detected_patterns,omitempty"`
 	LastOutput       time.Time         `json:"last_output,omitempty"`
@@ -677,6 +681,63 @@ type AgentActivity struct {
 // program status (ntm-l6cuz.2) overrides this with "osc" when an
 // authoritative report decides the state.
 const activityStateSourceScrape = "scrape"
+
+// activityStateSourceOSC marks a state decided by the agent's own OSC 7501
+// report rather than by pattern/velocity classification.
+const activityStateSourceOSC = "osc"
+
+// ProgramStatusDetector reports a pane's authoritative OSC 7501 state without
+// issuing a tmux capture. *status.OSCDetector implements it; the CLI wires a
+// tap-backed detector so wait and activity prefer the agent's own verdict
+// over chrome scraping. A nil detector keeps scrape-only behavior.
+type ProgramStatusDetector interface {
+	DetectReport(paneID string) (status.AgentStatus, bool)
+}
+
+// ApplyProgramStatus overrides a scrape-classified activity with the pane's
+// authoritative OSC report when one exists. It returns the possibly
+// synthesized activity (nil when neither source could decide the pane) and
+// whether the report decided the state. Scrape metadata — velocity, detected
+// patterns, rate-limit flags — is kept: only the state, its source, the
+// report age, and the confidence are replaced.
+func ApplyProgramStatus(detector ProgramStatusDetector, paneID, agentType string, activity *AgentActivity) (*AgentActivity, bool) {
+	if detector == nil || paneID == "" {
+		return activity, false
+	}
+	report, ok := detector.DetectReport(paneID)
+	if !ok {
+		return activity, false
+	}
+	mapped, known := robotStateFromPromptStatus(report.State)
+	if !known {
+		return activity, false
+	}
+	if activity == nil {
+		activity = &AgentActivity{PaneID: paneID, AgentType: agentType}
+	}
+	activity.State = mapped
+	activity.StateSource = activityStateSourceOSC
+	activity.ReportAgeSeconds = report.ReportAgeSeconds
+	activity.Confidence = 1.0
+	return activity, true
+}
+
+// robotStateFromPromptStatus maps the coarse authoritative program-status
+// state onto the robot activity states, mirroring the mapping the classifier
+// already exposes: idle -> WAITING (available), working/blocked ->
+// GENERATING (busy), error -> ERROR. Unknown leaves scrape in charge.
+func robotStateFromPromptStatus(state status.AgentState) (AgentState, bool) {
+	switch state {
+	case status.StateIdle:
+		return StateWaiting, true
+	case status.StateWorking:
+		return StateGenerating, true
+	case status.StateError:
+		return StateError, true
+	default:
+		return StateUnknown, false
+	}
+}
 
 // StateClassifier combines velocity and pattern signals to classify agent state.
 type StateClassifier struct {

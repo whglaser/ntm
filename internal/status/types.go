@@ -103,6 +103,10 @@ type AgentStatus struct {
 	TokensUsed int64 `json:"tokens_used,omitempty"`
 	// UpdatedAt is when this status was computed
 	UpdatedAt time.Time `json:"updated_at"`
+	// ReportAgeSeconds is how old the deciding OSC 7501 report was when this
+	// status was computed. Zero for scrape-derived statuses. It makes "live
+	// vs stale" visible to operators (ntm-l6cuz.7).
+	ReportAgeSeconds float64 `json:"report_age_seconds,omitempty"`
 }
 
 // ObservationFreshness distinguishes a current reading from historical or

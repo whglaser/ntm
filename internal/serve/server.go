@@ -106,16 +106,15 @@ type Server struct {
 	// Server stays side-effect-free: the store starts a retention goroutine.
 	wsEventStoreOnce sync.Once
 
-	// Pane output streaming
-	streamManager *tmux.StreamManager
-	// programStatus decodes OSC 7501 (pi program status) reports out of
-	// streamed raw pane output and keeps the latest report per pane.
-	programStatus   *programstatus.Observer
-	spawnAgents     func(context.Context, robot.SpawnOptions) (*robot.SpawnOutput, error)
-	sendAgents      func(robot.SendOptions) (*robot.SendOutput, error)
-	interruptAgents func(robot.InterruptOptions) (*robot.InterruptOutput, error)
-	waitAgents      func(context.Context, robot.WaitOptions) (*robot.WaitResponse, int)
-	resolvePane     func(context.Context, string, int) (tmux.Pane, error)
+	// Pane output streaming: one OSC 7501 tap serves both the WebSocket pane
+	// stream and the program-status endpoints (ORI; the same composition the
+	// pipeline executor and CLI wait/activity surfaces use).
+	programStatusTap *programstatus.Tap
+	spawnAgents      func(context.Context, robot.SpawnOptions) (*robot.SpawnOutput, error)
+	sendAgents       func(robot.SendOptions) (*robot.SendOutput, error)
+	interruptAgents  func(robot.InterruptOptions) (*robot.InterruptOutput, error)
+	waitAgents       func(context.Context, robot.WaitOptions) (*robot.WaitResponse, int)
+	resolvePane      func(context.Context, string, int) (tmux.Pane, error)
 	// paneInputTimeout bounds lookup, ownership waits, and canonical delivery.
 	// Zero means defaultPaneInputTimeout; tests may shorten it.
 	paneInputTimeout time.Duration
@@ -1295,22 +1294,10 @@ func New(cfg Config) *Server {
 		s.wsHub.redactionCfg = &hubCfg
 	}
 
-	// Initialize pane output streaming
-	streamCfg := tmux.DefaultPaneStreamerConfig()
-	s.programStatus = programstatus.NewObserver()
-	s.streamManager = tmux.NewStreamManager(tmux.DefaultClient, func(event tmux.StreamEvent) {
-		// Decode any OSC 7501 program-status reports in the raw stream before
-		// publishing the bytes themselves.
-		s.observePaneProgramStatus(event)
-		// Publish pane output to WebSocket subscribers
-		// Topic format: panes:session:pane_idx
-		s.wsHub.Publish(streamTopicForTarget(event.Target), "pane.output", map[string]interface{}{
-			"lines":   event.Lines,
-			"seq":     event.Seq,
-			"ts":      event.Timestamp.UTC().Format(time.RFC3339Nano),
-			"is_full": event.IsFull,
-		})
-	}, streamCfg)
+	// Initialize pane output streaming. The tap decodes OSC 7501 reports into
+	// its Observer before the handler publishes the raw bytes and the decoded
+	// reports.
+	s.programStatusTap = programstatus.NewStreamingTap(s.publishPaneStreamEvent)
 
 	s.router = s.buildRouter()
 	return s
@@ -1590,7 +1577,7 @@ func (s *Server) Start(ctx context.Context) error {
 	defer s.wsHub.Stop()
 
 	// Cleanup pane streaming on shutdown
-	defer s.streamManager.StopAll()
+	defer s.programStatusTap.StopAll()
 	// Keep output consumers alive until accepted workers have checkpointed.
 	defer func() {
 		drainCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -4392,7 +4379,7 @@ func (s *Server) handleStartPaneStreamV1(w http.ResponseWriter, r *http.Request)
 	}
 	topic := streamTopicForTarget(target)
 
-	if err := s.streamManager.StartStream(target); err != nil {
+	if err := s.programStatusTap.Ensure(target); err != nil {
 		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), nil, reqID)
 		return
 	}
@@ -4423,7 +4410,7 @@ func (s *Server) handleStopPaneStreamV1(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	s.streamManager.StopStream(target)
+	s.programStatusTap.StopStream(target)
 
 	writeSuccessResponse(w, http.StatusOK, map[string]interface{}{
 		"target":  target,
@@ -4442,35 +4429,35 @@ func streamTopicForTarget(target string) string {
 func (s *Server) handleStreamingStatsV1(w http.ResponseWriter, r *http.Request) {
 	reqID := requestIDFromContext(r.Context())
 
-	stats := s.streamManager.Stats()
-	stats["active_targets"] = s.streamManager.ListActive()
-	if s.programStatus != nil {
-		stats["program_status_panes"] = s.programStatus.Len()
+	stats := s.programStatusTap.Stats()
+	stats["active_targets"] = s.programStatusTap.ListActive()
+	if observer := s.programStatusTap.Observer(); observer != nil {
+		stats["program_status_panes"] = observer.Len()
 	}
 
 	writeSuccessResponse(w, http.StatusOK, stats, reqID)
 }
 
-// observePaneProgramStatus decodes OSC 7501 reports from one raw pipe-pane
-// stream event and publishes them on the pane's stream topic.
+// publishPaneStreamEvent fans one raw tap event out to its WebSocket and
+// program-status subscribers. It is the tap handler for the server's stream
+// capture: the tap has already decoded the OSC 7501 reports, so this method
+// never re-parses the bytes.
 //
-// Polling events (IsFull) are rendered screen captures: terminals consume
-// OSC sequences, so a scrape can never contain one. Feeding them to the
-// parser would only waste work, so they are skipped — the reported status is
-// always the agent's own report, never a scrape.
-func (s *Server) observePaneProgramStatus(event tmux.StreamEvent) {
-	if s.programStatus == nil || event.IsFull || event.Target == "" || len(event.Lines) == 0 {
-		return
+// The decoded reports are the agent's own statements, never a scrape: polling
+// events (IsFull) carry rendered screen captures that a terminal has already
+// consumed, so the tap never produces reports for them.
+func (s *Server) publishPaneStreamEvent(event tmux.StreamEvent, reports []programstatus.Event) {
+	for _, status := range reports {
+		s.publishProgramStatus(status)
 	}
-	for _, line := range event.Lines {
-		// The line's trailing newline was stripped by the streamer and is not
-		// re-added: newlines never occur inside a protocol sequence (pi
-		// strips control characters), and dropping them keeps the parser
-		// correct no matter how a future tap chunks its reads.
-		for _, status := range s.programStatus.Observe(event.Target, []byte(line)) {
-			s.publishProgramStatus(status)
-		}
-	}
+	// Publish pane output to WebSocket subscribers
+	// Topic format: panes:session:pane_idx
+	s.wsHub.Publish(streamTopicForTarget(event.Target), "pane.output", map[string]interface{}{
+		"lines":   event.Lines,
+		"seq":     event.Seq,
+		"ts":      event.Timestamp.UTC().Format(time.RFC3339Nano),
+		"is_full": event.IsFull,
+	})
 }
 
 // publishProgramStatus broadcasts one decoded report to WebSocket
@@ -4507,8 +4494,8 @@ func (s *Server) handleProgramStatusV1(w http.ResponseWriter, r *http.Request) {
 	filter := strings.TrimSpace(r.URL.Query().Get("pane"))
 
 	statuses := make([]programStatusEntry, 0)
-	if s.programStatus != nil {
-		snapshot := s.programStatus.Snapshot()
+	if observer := s.programStatusTap.Observer(); observer != nil {
+		snapshot := observer.Snapshot()
 		panes := make([]string, 0, len(snapshot))
 		for paneID := range snapshot {
 			panes = append(panes, paneID)
@@ -7566,7 +7553,7 @@ func (s *Server) Stop() {
 			st.Stop()
 		}
 	}
-	if s.streamManager != nil {
-		s.streamManager.StopAll()
+	if s.programStatusTap != nil {
+		s.programStatusTap.StopAll()
 	}
 }

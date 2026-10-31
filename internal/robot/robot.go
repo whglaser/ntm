@@ -10877,6 +10877,10 @@ type ActivityOptions struct {
 	Session    string   // Required: session name
 	Panes      []string // Optional: filter to specific pane indices
 	AgentTypes []string // Optional: filter to specific agent types (claude, codex, antigravity, grok, gemini)
+	// StatusDetector supplies the pane's authoritative OSC 7501 state when one
+	// exists. The CLI wires a tap-backed detector; nil keeps scrape-only
+	// classification. It is not serialized.
+	StatusDetector ProgramStatusDetector `json:"-" yaml:"-" toml:"-"`
 }
 
 // ActivityOutput represents the output for --robot-activity
@@ -10899,10 +10903,14 @@ type ActivityOutput struct {
 
 // AgentActivityInfo contains activity state for a single agent pane.
 type AgentActivityInfo struct {
-	Pane             string   `json:"pane"`                        // pane index as string
-	PaneIdx          int      `json:"pane_idx"`                    // pane index as int
-	AgentType        string   `json:"agent_type"`                  // claude, codex, antigravity, grok, gemini, or another supported type
-	State            string   `json:"state"`                       // GENERATING, WAITING, THINKING, ERROR, STALLED, UNKNOWN
+	Pane        string `json:"pane"`                   // pane index as string
+	PaneIdx     int    `json:"pane_idx"`               // pane index as int
+	AgentType   string `json:"agent_type"`             // claude, codex, antigravity, grok, gemini, or another supported type
+	State       string `json:"state"`                  // GENERATING, WAITING, THINKING, ERROR, STALLED, UNKNOWN
+	StateSource string `json:"state_source,omitempty"` // scrape|osc
+	// ReportAgeSeconds is how old the deciding OSC 7501 report was when the
+	// state was decided; zero/absent for scrape-derived states.
+	ReportAgeSeconds float64  `json:"report_age_seconds,omitempty"`
 	Confidence       float64  `json:"confidence"`                  // 0.0-1.0
 	Velocity         float64  `json:"velocity"`                    // chars/sec
 	StateSince       string   `json:"state_since,omitempty"`       // RFC3339 timestamp
@@ -11163,7 +11171,13 @@ func GetActivity(opts ActivityOptions) (*ActivityOutput, error) {
 				err = fmt.Errorf("current pane observation is %s", paneObservation.Current.Freshness)
 			}
 		}
-		if err != nil {
+		// The agent's own OSC 7501 report outranks the scrape, and it can decide
+		// the pane even when the capture could not be read at all.
+		activity, _ = ApplyProgramStatus(opts.StatusDetector, pane.ID, agentType, activity)
+		if activity == nil {
+			if err == nil {
+				err = fmt.Errorf("classifier returned no activity for pane %s", pane.ID)
+			}
 			// Include with unknown state on error, plus per-pane
 			// capture provenance so a watchdog can distinguish
 			// "this pane was classified UNKNOWN" from "this pane's
@@ -11187,18 +11201,29 @@ func GetActivity(opts ActivityOptions) (*ActivityOutput, error) {
 			continue
 		}
 
+		// A scrape failure no longer means an unknown state when the agent's
+		// own report decided it; the capture provenance still records that the
+		// scrape was unavailable.
+		captureProvenance, captureError := "live", ""
+		if err != nil {
+			captureProvenance, captureError = string(paneObservation.Current.Freshness), err.Error()
+		}
+
 		// Build agent info
 		info := AgentActivityInfo{
 			Pane:                  paneKey,
 			PaneIdx:               pane.Index,
 			AgentType:             activity.AgentType,
 			State:                 string(activity.State),
+			StateSource:           activity.StateSource,
+			ReportAgeSeconds:      activity.ReportAgeSeconds,
 			Confidence:            activity.Confidence,
 			Velocity:              activity.Velocity,
 			DetectedPatterns:      activity.DetectedPatterns,
 			PanePID:               pane.PID,
 			CaptureCollectedAt:    paneCapturedAt,
-			CaptureProvenance:     "live",
+			CaptureProvenance:     captureProvenance,
+			CaptureError:          captureError,
 			ObservationState:      string(paneObservation.Current.Status.State),
 			ObservationFreshness:  string(paneObservation.Current.Freshness),
 			ObservationConfidence: paneObservation.Current.Confidence,

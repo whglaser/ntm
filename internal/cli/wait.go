@@ -159,6 +159,13 @@ func runWait(ctx context.Context, w, diagnostics io.Writer, opts robot.WaitOptio
 		fmt.Fprintf(w, "%s⏳%s Waiting for '%s' until %s (timeout: %v)...\n",
 			colorize(t.Info), colorize(t.Text), opts.Session, opts.Condition, opts.Timeout)
 	}
+
+	// Prefer the agents' own OSC 7501 reports for pane states. The tap is
+	// process-local and best-effort; without it this wait is scrape-only.
+	source, stopProgramStatus := programStatusSourceForSession(ctx, opts.Session)
+	defer stopProgramStatus()
+	opts.StatusDetector = programStatusDetector(source)
+
 	response, _ := robot.GetWaitContext(ctx, opts)
 	var cause error
 	if response.ErrorCode == "CANCELED" {
@@ -188,7 +195,11 @@ func outputWaitResponse(w io.Writer, response *robot.WaitResponse, cause error) 
 		fmt.Fprintf(w, "%s✓%s Condition '%s' met after %v\n",
 			colorize(t.Success), colorize(t.Text), response.Condition, elapsed.Round(time.Millisecond))
 		for _, agent := range response.Agents {
-			fmt.Fprintf(w, "    %s: %s\n", agent.Pane, agent.State)
+			detail := agent.State
+			if agent.StateSource != "" {
+				detail += ", " + agent.StateSource
+			}
+			fmt.Fprintf(w, "    %s: %s\n", agent.Pane, detail)
 		}
 	} else {
 		fmt.Fprintf(w, "%s✗%s %s\n", colorize(t.Error), colorize(t.Text), response.Error)

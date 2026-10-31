@@ -45,6 +45,9 @@ type statusOptions struct {
 	showSummary     bool
 	watchMode       bool
 	interval        time.Duration
+	// inWatchLoop is set by runStatusWatch so each refresh tick does not start
+	// and immediately tear down its own OSC 7501 tap.
+	inWatchLoop bool
 }
 
 // SessionListInput is the kernel input for sessions.list.
@@ -1149,6 +1152,30 @@ func runStatusOnce(ctx context.Context, w io.Writer, session string, opts status
 		panes = append(panes, paneObservation.Metadata)
 		statusByPaneID[paneObservation.Pane.ID] = paneObservation.Current.Status
 	}
+	// A one-shot status overlays the panes' own OSC 7501 reports on the
+	// scrape state (ntm-l6cuz.2). The detector's fallback serves the
+	// observation already in hand, so the session is not captured twice. The
+	// watch loop skips this: a per-tick tap would churn pipe-pane streams.
+	if !opts.inWatchLoop {
+		source, stopProgramStatus := programStatusSourceForSession(ctx, session)
+		defer stopProgramStatus()
+		detector := status.NewOSCDetector(observedSessionStatuses(statusByPaneID), source, status.DefaultOSCStatusTTL)
+		if detected, detectErr := detector.DetectAll(session); detectErr == nil {
+			for _, oscStatus := range detected {
+				existing, ok := statusByPaneID[oscStatus.PaneID]
+				if !ok {
+					continue
+				}
+				existing.State = oscStatus.State
+				existing.StateSource = oscStatus.StateSource
+				existing.ReportAgeSeconds = oscStatus.ReportAgeSeconds
+				if oscStatus.ErrorType != status.ErrorNone {
+					existing.ErrorType = oscStatus.ErrorType
+				}
+				statusByPaneID[oscStatus.PaneID] = existing
+			}
+		}
+	}
 	// Selector topology must reflect the FULL session, not the filtered view:
 	// send resolves bare-N selectors against all panes, so a tag filter that
 	// hides the other windows must not collapse displayed selectors from W.P
@@ -1351,6 +1378,11 @@ func runStatusOnce(ctx context.Context, w io.Writer, session string, opts status
 		default:
 			stateColor = overlay
 			stateText = "unknown"
+		}
+		if agentStatus.StateSource == status.StateSourceOSC {
+			// The agent's own report decided this row; make the authority
+			// auditable at a glance (ntm-l6cuz.2).
+			stateText += " (osc)"
 		}
 
 		// Calculate columns based on tier
@@ -1723,6 +1755,9 @@ func runStatusWatch(parent context.Context, w io.Writer, session string, opts st
 		opts.interval = 2 * time.Second
 	}
 	opts.watchMode = false
+	// A watch tick must not start and immediately tear down its own OSC tap;
+	// the loop stays scrape-only (documented in runStatusOnce).
+	opts.inWatchLoop = true
 
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()

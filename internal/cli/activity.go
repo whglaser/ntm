@@ -115,6 +115,9 @@ type activityOptions struct {
 	// command path; carrying it explicitly keeps library/unit callers off the
 	// mutable package global.
 	watermarkStore robot.WatermarkStore
+	// statusDetector is the OSC 7501 overlay for this invocation. A nil
+	// detector keeps scrape-only classification.
+	statusDetector robot.ProgramStatusDetector
 }
 
 func runActivity(session string, opts activityOptions) error {
@@ -150,6 +153,13 @@ func runActivity(session string, opts activityOptions) error {
 		}
 		return fmt.Errorf("session '%s' not found", session)
 	}
+
+	// One best-effort OSC 7501 tap lives across watch ticks; without it the
+	// surfaces stay scrape-only (tmux pipe-pane is exclusive, so a pane owned
+	// by another process simply keeps its scrape fallback).
+	source, stopProgramStatus := programStatusSourceForSession(context.Background(), session)
+	defer stopProgramStatus()
+	opts.statusDetector = programStatusDetector(source)
 
 	// Watch mode. Under --json the watch stream is NDJSON: one compact JSON
 	// frame per refresh tick (the same envelope shape as single-shot --json),
@@ -262,10 +272,15 @@ type agentInfo struct {
 	PaneID      string
 	AgentType   string
 	State       string
-	Confidence  float64
-	Velocity    float64
-	Duration    time.Duration
-	StateSince  time.Time
+	// StateSource is "osc" when the agent's own OSC 7501 report decided the
+	// state and "scrape" when the classifier did; ReportAgeSeconds is how old
+	// that report was (zero for scrape).
+	StateSource      string
+	ReportAgeSeconds float64
+	Confidence       float64
+	Velocity         float64
+	Duration         time.Duration
+	StateSince       time.Time
 }
 
 func collectActivityData(session string, opts activityOptions) (*activityResult, error) {
@@ -307,8 +322,11 @@ func collectActivityData(session string, opts activityOptions) (*activityResult,
 			PaneHeight: pane.Height,
 		})
 
-		activity, err := classifier.Classify()
-		if err != nil {
+		activity, _ := classifier.Classify()
+		// The agent's own OSC 7501 report outranks the scrape, and can decide
+		// the pane even when the classifier could not read it.
+		activity, _ = robot.ApplyProgramStatus(opts.statusDetector, pane.ID, agentType, activity)
+		if activity == nil {
 			// Include with unknown state on error
 			result.Agents = append(result.Agents, agentInfo{
 				Pane:        pane.Index,
@@ -344,15 +362,17 @@ func collectActivityData(session string, opts activityOptions) (*activityResult,
 		}
 
 		info := agentInfo{
-			Pane:        pane.Index,
-			WindowIndex: pane.WindowIndex,
-			PaneID:      pane.ID,
-			AgentType:   agentType,
-			State:       string(activity.State),
-			Confidence:  activity.Confidence,
-			Velocity:    activity.Velocity,
-			Duration:    duration,
-			StateSince:  stateSince,
+			Pane:             pane.Index,
+			WindowIndex:      pane.WindowIndex,
+			PaneID:           pane.ID,
+			AgentType:        agentType,
+			State:            string(activity.State),
+			StateSource:      activity.StateSource,
+			ReportAgeSeconds: activity.ReportAgeSeconds,
+			Confidence:       activity.Confidence,
+			Velocity:         activity.Velocity,
+			Duration:         duration,
+			StateSince:       stateSince,
 		}
 
 		result.Agents = append(result.Agents, info)
@@ -456,15 +476,20 @@ type activityJSONAgent struct {
 	// consumers. It collides across windows; use WindowIndex+Pane to address a
 	// pane topologically, or PaneID (the tmux %id, stable for the pane's
 	// lifetime) to identify it unambiguously.
-	Pane        int     `json:"pane"`
-	WindowIndex int     `json:"window_index"`
-	PaneID      string  `json:"pane_id"`
-	AgentType   string  `json:"agent_type"`
-	State       string  `json:"state"`
-	Confidence  float64 `json:"confidence"`
-	Velocity    float64 `json:"velocity"`
-	Duration    string  `json:"duration"`
-	StateSince  string  `json:"state_since,omitempty"`
+	Pane        int    `json:"pane"`
+	WindowIndex int    `json:"window_index"`
+	PaneID      string `json:"pane_id"`
+	AgentType   string `json:"agent_type"`
+	State       string `json:"state"`
+	// StateSource is "osc" when the agent's own OSC 7501 report decided the
+	// state and "scrape" when the classifier did; ReportAgeSeconds is how old
+	// that report was (absent for scrape).
+	StateSource      string  `json:"state_source,omitempty"`
+	ReportAgeSeconds float64 `json:"report_age_seconds,omitempty"`
+	Confidence       float64 `json:"confidence"`
+	Velocity         float64 `json:"velocity"`
+	Duration         string  `json:"duration"`
+	StateSince       string  `json:"state_since,omitempty"`
 }
 
 // activityJSONEnvelope is the --json envelope for `ntm activity`. Watch mode
@@ -482,14 +507,16 @@ func buildActivityJSONEnvelope(result *activityResult) activityJSONEnvelope {
 	agents := make([]activityJSONAgent, len(result.Agents))
 	for i, a := range result.Agents {
 		agents[i] = activityJSONAgent{
-			Pane:        a.Pane,
-			WindowIndex: a.WindowIndex,
-			PaneID:      a.PaneID,
-			AgentType:   a.AgentType,
-			State:       a.State,
-			Confidence:  a.Confidence,
-			Velocity:    a.Velocity,
-			Duration:    formatActivityDuration(a.Duration),
+			Pane:             a.Pane,
+			WindowIndex:      a.WindowIndex,
+			PaneID:           a.PaneID,
+			AgentType:        a.AgentType,
+			State:            a.State,
+			StateSource:      a.StateSource,
+			ReportAgeSeconds: a.ReportAgeSeconds,
+			Confidence:       a.Confidence,
+			Velocity:         a.Velocity,
+			Duration:         formatActivityDuration(a.Duration),
 		}
 		if !a.StateSince.IsZero() {
 			agents[i].StateSince = a.StateSince.Format(time.RFC3339)
@@ -686,7 +713,13 @@ func renderActivityTUI(result *activityResult, watchMode bool) error {
 
 		// Format state with icon
 		stateIcon := stateIcon(agent.State)
-		stateStr := stateStyle(agent.State).Render(fmt.Sprintf("%s %s", stateIcon, agent.State))
+		stateLabel := agent.State
+		if agent.StateSource == "osc" {
+			// The agent's own report decided this row; make the authority
+			// auditable at a glance (ntm-l6cuz.2).
+			stateLabel += " (osc)"
+		}
+		stateStr := stateStyle(agent.State).Render(fmt.Sprintf("%s %s", stateIcon, stateLabel))
 
 		row := fmt.Sprintf("%-4d  %-6d  %-7s  %s  %-12s  %-10s  %s",
 			agent.WindowIndex,

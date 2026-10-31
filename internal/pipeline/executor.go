@@ -169,10 +169,9 @@ type Executor struct {
 	paneLocks  map[string]chan struct{}
 
 	// programStatusMu guards the OSC 7501 capture lifecycle (program_status.go).
-	programStatusMu       sync.Mutex
-	programStatusObserver *programstatus.Observer
-	programStatusStreams  *tmux.StreamManager
-	programStatusWrapped  bool
+	programStatusMu      sync.Mutex
+	programStatusTap     *programstatus.Tap
+	programStatusWrapped bool
 
 	mailClients agentMailClientCache
 
@@ -1046,6 +1045,9 @@ func (e *Executor) executeStep(ctx context.Context, step *Step, workflow *Workfl
 			if result.FinishedAt.IsZero() {
 				result.FinishedAt = time.Now()
 			}
+			// The run is giving up observation of this turn, so its OSC report
+			// must not outlive it as a phantom "working" (ntm-l6cuz.7).
+			e.forgetProgramStatus(result.PaneUsed)
 			return result
 		}
 
@@ -1123,6 +1125,10 @@ func (e *Executor) executeStep(ctx context.Context, step *Step, workflow *Workfl
 	if result.Status != StatusFailed {
 		return result
 	}
+	// Retries and recorded resumes keep the pane's report because they observe
+	// the same turn (ntm-l6cuz.9); a terminal failure will not, so settle it
+	// here instead of leaving a stale "working" behind (ntm-l6cuz.7).
+	e.forgetProgramStatus(result.PaneUsed)
 	errorMessage := "unknown error"
 	if result.Error != nil {
 		errorMessage = result.Error.Message

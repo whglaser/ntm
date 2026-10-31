@@ -4,12 +4,16 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/robot/adapters"
 	"github.com/Dicklesworthstone/ntm/internal/state"
+	"github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
@@ -872,5 +876,82 @@ func TestAgentReadyWaitCondition(t *testing.T) {
 	}
 	if !isSingleValidWaitCondition(WaitConditionAgentReady) {
 		t.Error("agent_ready must be a valid wait condition")
+	}
+}
+
+// fakeProgramStatusDetector is the OSC 7501 report seam the CLI wires in
+// production: the wait must prefer its verdict over the scrape.
+type fakeProgramStatusDetector map[string]status.AgentStatus
+
+func (f fakeProgramStatusDetector) DetectReport(paneID string) (status.AgentStatus, bool) {
+	report, ok := f[paneID]
+	return report, ok
+}
+
+// TestWaitPrefersOSCReportOverScrape pins the ntm-l6cuz.2 wait contract: a
+// pane the scrape classifier reads as THINKING completes on its own OSC 7501
+// idle report, and the response names the deciding source and report age.
+// Without the report the same frame stays pending, so the OSC half is what
+// decided it.
+func TestWaitPrefersOSCReportOverScrape(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("deterministic tmux transport requires a POSIX shell")
+	}
+	const transport = `#!/bin/sh
+set -eu
+case "$1" in
+  -V) printf 'tmux 3.6a\n' ;;
+  has-session) ;;
+  list-panes) printf '%s\n' "$NTM_OSC_WAIT_TEST_PANES" ;;
+  capture-pane) printf 'working output line\nRunning…\n' ;;
+  *) printf 'unexpected tmux command: %s %s\n' "$1" "$2" >&2; exit 97 ;;
+esac
+`
+	binary := filepath.Join(t.TempDir(), "tmux")
+	if err := os.WriteFile(binary, []byte(transport), 0o700); err != nil {
+		t.Fatalf("write tmux transport: %v", err)
+	}
+	t.Setenv("NTM_TMUX_BINARY", binary)
+	t.Setenv("NTM_OSC_WAIT_TEST_PANES", strings.Join([]string{
+		"%41", "1", "wait-project__cc_1", "claude", "120", "40", "1",
+		strconv.Itoa(os.Getpid()), "0", "cc", "", "", "0",
+	}, tmux.FieldSeparator))
+
+	wait := func(statusDetector ProgramStatusDetector) *WaitResponse {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		response, _ := GetWaitContext(ctx, WaitOptions{
+			Session:        "wait-project",
+			Condition:      WaitConditionIdle,
+			Timeout:        1200 * time.Millisecond,
+			PollInterval:   50 * time.Millisecond,
+			PaneSelectors:  []string{"%41"},
+			StatusDetector: statusDetector,
+		})
+		return response
+	}
+
+	// Scrape-only control: the frame is THINKING, so idle is never met.
+	if control := wait(nil); control.Success {
+		t.Fatalf("scrape-only wait completed on a thinking frame: %+v", control.Agents)
+	}
+
+	// The agent's own report decides the state and is reported verbatim.
+	response := wait(fakeProgramStatusDetector{
+		"%41": {PaneID: "%41", State: status.StateIdle, StateSource: status.StateSourceOSC, ReportAgeSeconds: 12},
+	})
+	if !response.Success {
+		t.Fatalf("wait did not complete on the OSC idle report: %+v", response.RobotResponse)
+	}
+	if len(response.Agents) != 1 {
+		t.Fatalf("agents = %+v, want the one matched pane", response.Agents)
+	}
+	agent := response.Agents[0]
+	if agent.Pane != "%41" || agent.State != string(StateWaiting) || agent.StateSource != "osc" {
+		t.Fatalf("matched agent = %+v, want %%41 WAITING/osc", agent)
+	}
+	if agent.ReportAgeSeconds != 12 {
+		t.Fatalf("report age = %v, want 12", agent.ReportAgeSeconds)
 	}
 }

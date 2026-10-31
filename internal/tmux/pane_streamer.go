@@ -44,6 +44,12 @@ type PaneStreamerConfig struct {
 
 	// FallbackPollLines is the number of lines to capture in polling mode (default: 50)
 	FallbackPollLines int
+
+	// DisablePollingFallback makes Start fail when pipe-pane is unavailable
+	// instead of polling rendered captures. Status capture uses this: a
+	// rendered capture can never contain an OSC sequence, so polling would
+	// only add capture load without authority.
+	DisablePollingFallback bool
 }
 
 // DefaultPaneStreamerConfig returns sensible defaults.
@@ -187,6 +193,12 @@ func (ps *PaneStreamer) Start(ctx context.Context) (err error) {
 
 	// Try pipe-pane first
 	if err := ps.startPipePaneStreaming(); err != nil {
+		if ps.config.DisablePollingFallback {
+			// Status capture: a rendered polling capture can never contain an
+			// OSC sequence, so failing here is the honest outcome and leaves
+			// the caller's scrape fallback in charge.
+			return fmt.Errorf("pipe-pane unavailable: %w", err)
+		}
 		log.Printf("pipe-pane: failed for %s, falling back to polling: %v", ps.target, err)
 		ps.useFallback.Store(true)
 		ps.wg.Add(1)

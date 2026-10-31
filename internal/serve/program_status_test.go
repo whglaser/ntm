@@ -15,23 +15,29 @@ func oscReport(pairs string) string { return "\x1b]7501;" + pairs + "\x1b\\" }
 // TestObservePaneProgramStatusReassemblesSplitLines proves the raw stream
 // capture feeds the observer with the pane target and that a report split
 // across two stream events is reassembled (the parser is incremental).
+// publishTestStreamEvent drives the same decode + publish path the tap handler
+// uses, so tests exercise the real production fan-out without a live stream.
+func publishTestStreamEvent(srv *Server, event tmux.StreamEvent) {
+	srv.publishPaneStreamEvent(event, srv.programStatusTap.ObserveEvent(event))
+}
+
 func TestObservePaneProgramStatusReassemblesSplitLines(t *testing.T) {
 	srv, _ := setupTestServer(t)
 
-	srv.observePaneProgramStatus(tmux.StreamEvent{
+	publishTestStreamEvent(srv, tmux.StreamEvent{
 		Target: "demo:0",
 		Lines:  []string{"\x1b]7501;state=work"},
 	})
-	if _, ok := srv.programStatus.Latest("demo:0"); ok {
+	if _, ok := srv.programStatusTap.Observer().Latest("demo:0"); ok {
 		t.Fatal("incomplete report stored")
 	}
 
-	srv.observePaneProgramStatus(tmux.StreamEvent{
+	publishTestStreamEvent(srv, tmux.StreamEvent{
 		Target: "demo:0",
 		Lines:  []string{"ing:app=pi:msg=" + base64.StdEncoding.EncodeToString([]byte("session-name")) + "\x1b\\"},
 	})
 
-	event, ok := srv.programStatus.Latest("demo:0")
+	event, ok := srv.programStatusTap.Observer().Latest("demo:0")
 	if !ok {
 		t.Fatal("reassembled report not stored")
 	}
@@ -46,21 +52,21 @@ func TestObservePaneProgramStatusReassemblesSplitLines(t *testing.T) {
 func TestObservePaneProgramStatusIgnoresScrapedCaptures(t *testing.T) {
 	srv, _ := setupTestServer(t)
 
-	srv.observePaneProgramStatus(tmux.StreamEvent{
+	publishTestStreamEvent(srv, tmux.StreamEvent{
 		Target: "demo:0",
 		Lines:  []string{oscReport("state=done:app=pi")},
 		IsFull: true,
 	})
-	if _, ok := srv.programStatus.Latest("demo:0"); ok {
+	if _, ok := srv.programStatusTap.Observer().Latest("demo:0"); ok {
 		t.Fatal("scraped capture was treated as an OSC status")
 	}
 
-	srv.observePaneProgramStatus(tmux.StreamEvent{
+	publishTestStreamEvent(srv, tmux.StreamEvent{
 		Target: "demo:0",
 		Lines:  []string{oscReport("state=done:app=pi")},
 		IsFull: false,
 	})
-	if event, ok := srv.programStatus.Latest("demo:0"); !ok || event.State != "done" {
+	if event, ok := srv.programStatusTap.Observer().Latest("demo:0"); !ok || event.State != "done" {
 		t.Fatalf("pipe event not stored: %+v, %v", event, ok)
 	}
 }
@@ -68,8 +74,8 @@ func TestObservePaneProgramStatusIgnoresScrapedCaptures(t *testing.T) {
 func TestHandleProgramStatusV1ReturnsStoredReports(t *testing.T) {
 	srv, _ := setupTestServer(t)
 
-	srv.observePaneProgramStatus(tmux.StreamEvent{Target: "demo:1", Lines: []string{oscReport("state=error:app=pi:msg=" + base64.StdEncoding.EncodeToString([]byte("boom")))}})
-	srv.observePaneProgramStatus(tmux.StreamEvent{Target: "demo:0", Lines: []string{oscReport("state=done:app=pi")}})
+	publishTestStreamEvent(srv, tmux.StreamEvent{Target: "demo:1", Lines: []string{oscReport("state=error:app=pi:msg=" + base64.StdEncoding.EncodeToString([]byte("boom")))}})
+	publishTestStreamEvent(srv, tmux.StreamEvent{Target: "demo:0", Lines: []string{oscReport("state=done:app=pi")}})
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/streaming/program-status", nil)
 	rec := httptest.NewRecorder()
@@ -106,7 +112,7 @@ func TestHandleProgramStatusV1ReturnsStoredReports(t *testing.T) {
 func TestHandleProgramStatusV1FiltersByPaneAndNeverNulls(t *testing.T) {
 	srv, _ := setupTestServer(t)
 
-	srv.observePaneProgramStatus(tmux.StreamEvent{Target: "demo:0", Lines: []string{oscReport("state=done:app=pi")}})
+	publishTestStreamEvent(srv, tmux.StreamEvent{Target: "demo:0", Lines: []string{oscReport("state=done:app=pi")}})
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/streaming/program-status?pane=demo:0", nil)
 	rec := httptest.NewRecorder()

@@ -9,6 +9,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/Dicklesworthstone/ntm/internal/programstatus"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/tests/testutil"
 )
@@ -25,11 +26,7 @@ func TestStreamingStatsEndpoint(t *testing.T) {
 	}
 
 	// Initialize stream manager
-	cfg := tmux.DefaultPaneStreamerConfig()
-	cfg.FIFODir = t.TempDir()
-	s.streamManager = tmux.NewStreamManager(tmux.DefaultClient, func(event tmux.StreamEvent) {
-		// No-op callback for testing
-	}, cfg)
+	s.programStatusTap = programstatus.NewStreamingTap(nil)
 
 	// Create request
 	req := httptest.NewRequest("GET", "/api/v1/streaming/stats", nil)
@@ -70,11 +67,7 @@ func TestStartStopStreamEndpointRejectsMissingPane(t *testing.T) {
 	}
 
 	// Initialize stream manager
-	cfg := tmux.DefaultPaneStreamerConfig()
-	cfg.FIFODir = t.TempDir()
-	s.streamManager = tmux.NewStreamManager(tmux.DefaultClient, func(event tmux.StreamEvent) {
-		// No-op callback for testing
-	}, cfg)
+	s.programStatusTap = programstatus.NewStreamingTap(nil)
 
 	// Create router with params
 	r := chi.NewRouter()
@@ -107,7 +100,7 @@ func TestStartStopStreamEndpointRejectsMissingPane(t *testing.T) {
 	}
 
 	// Verify streaming was not started.
-	active := s.streamManager.ListActive()
+	active := s.programStatusTap.ListActive()
 	if len(active) != 0 {
 		t.Errorf("expected active=[], got %v", active)
 	}
@@ -122,7 +115,7 @@ func TestStartStopStreamEndpointRejectsMissingPane(t *testing.T) {
 	}
 
 	// Verify streaming stopped
-	active = s.streamManager.ListActive()
+	active = s.programStatusTap.ListActive()
 	if len(active) != 0 {
 		t.Errorf("expected no active streams, got %v", active)
 	}
@@ -136,7 +129,7 @@ func TestStreamEndpointValidation(t *testing.T) {
 
 	cfg := tmux.DefaultPaneStreamerConfig()
 	cfg.FIFODir = t.TempDir()
-	s.streamManager = tmux.NewStreamManager(tmux.DefaultClient, func(event tmux.StreamEvent) {}, cfg)
+	s.programStatusTap = programstatus.NewStreamingTap(nil)
 
 	r := chi.NewRouter()
 	r.Post("/sessions/{sessionId}/panes/{paneIdx}/stream", func(w http.ResponseWriter, req *http.Request) {

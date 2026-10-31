@@ -1596,6 +1596,9 @@ Shell Integration:
 				Panes:      paneFilter,
 				AgentTypes: agentTypes,
 			}
+			source, stopProgramStatus := programStatusSourceForSession(cmd.Context(), session)
+			defer stopProgramStatus()
+			opts.StatusDetector = programStatusDetector(source)
 			if err := robot.PrintActivity(opts); err != nil {
 				recordRobotProcessExit(err)
 			}
@@ -1685,6 +1688,9 @@ Shell Integration:
 				ProductivityWindow: productivityWindow,
 				ConvergedStreak:    robotConvergedStreak,
 			}
+			source, stopProgramStatus := programStatusSourceForSession(cmd.Context(), session)
+			defer stopProgramStatus()
+			opts.StatusDetector = programStatusDetector(source)
 			exitCode := robot.PrintWaitContext(cmd.Context(), opts)
 			recordLegacyRobotExit(exitCode)
 			return

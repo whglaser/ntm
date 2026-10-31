@@ -229,3 +229,100 @@ func TestProgramStatusStateMapping(t *testing.T) {
 		}
 	}
 }
+
+// TestOSCDetectorDetectReportSkipsTheFallback pins the capture-free overlay
+// the wait/activity surfaces use: DetectReport reads the report directly and
+// never consults (or captures through) the fallback detector.
+func TestOSCDetectorDetectReportSkipsTheFallback(t *testing.T) {
+	at := time.Date(2026, 10, 31, 0, 0, 0, 0, time.UTC)
+	source := &fakeProgramStatusSource{events: map[string]programstatus.Event{
+		"%0": {PaneID: "%0", State: programstatus.StateDone, App: "pi", ObservedAt: at.Add(-90 * time.Second)},
+	}}
+	// The fallback refuses every call: if DetectReport touched it, this test
+	// would observe the error or a scrape state.
+	fallback := &fakeStatusDetector{err: errors.New("fallback must not be consulted")}
+	detector := NewOSCDetector(fallback, source, DefaultOSCStatusTTL)
+	atClock(detector, at)
+
+	report, ok := detector.DetectReport("%0")
+	if !ok {
+		t.Fatal("fresh report was not returned")
+	}
+	if report.State != StateIdle || report.StateSource != StateSourceOSC {
+		t.Fatalf("report = %+v, want idle/osc", report)
+	}
+	if report.ReportAgeSeconds != 90 {
+		t.Fatalf("report age = %v, want 90s", report.ReportAgeSeconds)
+	}
+	if !report.UpdatedAt.Equal(at.Add(-90 * time.Second)) {
+		t.Fatalf("UpdatedAt = %v, want the report's own time", report.UpdatedAt)
+	}
+}
+
+func TestOSCDetectorDetectReportHonorsTTLAndUnknownStates(t *testing.T) {
+	at := time.Date(2026, 10, 31, 0, 0, 0, 0, time.UTC)
+	source := &fakeProgramStatusSource{events: map[string]programstatus.Event{
+		"%0": {PaneID: "%0", State: programstatus.StateWorking, ObservedAt: at.Add(-2 * time.Minute)},
+		"%1": {PaneID: "%1", State: programstatus.StateClear, ObservedAt: at},
+		"%2": {PaneID: "%2", Query: true, ObservedAt: at},
+	}}
+	fallback := &fakeStatusDetector{err: errors.New("fallback must not be consulted")}
+	detector := NewOSCDetector(fallback, source, time.Minute)
+	atClock(detector, at)
+
+	if _, ok := detector.DetectReport("%0"); ok {
+		t.Fatal("expired report was returned")
+	}
+	if _, ok := detector.DetectReport("%1"); ok {
+		t.Fatal("clear report was returned as a state")
+	}
+	if _, ok := detector.DetectReport("%2"); ok {
+		t.Fatal("query was returned as a state")
+	}
+	if _, ok := detector.DetectReport(""); ok {
+		t.Fatal("empty pane was returned as a state")
+	}
+}
+
+// TestOSCDetectorReportAgeOnDetectAndDetectAll pins that the deciding report's
+// age reaches every session-wide consumer, so live vs stale is auditable
+// (ntm-l6cuz.7).
+func TestOSCDetectorReportAgeOnDetectAndDetectAll(t *testing.T) {
+	at := time.Date(2026, 10, 31, 0, 0, 0, 0, time.UTC)
+	source := &fakeProgramStatusSource{events: map[string]programstatus.Event{
+		"%0": {PaneID: "%0", State: programstatus.StateWorking, ObservedAt: at.Add(-30 * time.Second)},
+		"%1": {PaneID: "%1", State: programstatus.StateDone, ObservedAt: at.Add(-5 * time.Second)},
+	}}
+	fallback := &fakeStatusDetector{
+		statuses: map[string]AgentStatus{
+			"%0": {PaneID: "%0", State: StateIdle},
+			"%1": {PaneID: "%1", State: StateWorking},
+		},
+		all: []AgentStatus{
+			{PaneID: "%0", State: StateIdle},
+			{PaneID: "%1", State: StateWorking},
+		},
+	}
+	detector := NewOSCDetector(fallback, source, DefaultOSCStatusTTL)
+	atClock(detector, at)
+
+	got, err := detector.Detect("%0")
+	if err != nil {
+		t.Fatalf("Detect: %v", err)
+	}
+	if got.ReportAgeSeconds != 30 || got.StateSource != StateSourceOSC {
+		t.Fatalf("Detect age/source = %v/%q, want 30/osc", got.ReportAgeSeconds, got.StateSource)
+	}
+
+	all, err := detector.DetectAll("demo")
+	if err != nil {
+		t.Fatalf("DetectAll: %v", err)
+	}
+	ages := map[string]float64{}
+	for _, status := range all {
+		ages[status.PaneID] = status.ReportAgeSeconds
+	}
+	if ages["%0"] != 30 || ages["%1"] != 5 {
+		t.Fatalf("DetectAll ages = %v, want %%0=30 %%1=5", ages)
+	}
+}

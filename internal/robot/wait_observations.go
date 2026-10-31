@@ -58,6 +58,7 @@ func waitAgentEvidence(activity *AgentActivity) WaitAgentInfo {
 	info := WaitAgentInfo{
 		Pane: activity.PaneID, State: string(activity.State),
 		AgentType: activity.AgentType, StateSource: activity.StateSource,
+		ReportAgeSeconds: activity.ReportAgeSeconds,
 	}
 	if !activity.StateSince.IsZero() {
 		info.StateSince = FormatTimestamp(activity.StateSince)

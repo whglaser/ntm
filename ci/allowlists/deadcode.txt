@@ -172,7 +172,6 @@ internal/state/store.go:Store.UpdateReservation	ntm-ov057	reachable only through
 internal/state/store.go:Store.UpdateTask	ntm-ov057	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/state/store.go:Store.UpsertToolHealth	ntm-ov057	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/state/timeline.go:TimelineState.IsTerminal	ntm-ov057	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/status/osc.go:OSCDetector.DetectAll	ntm-l6cuz.2	interface-completing method added by the OSC 7501 capture; production waits call Detect per pane, and the session-wide form lands with the ntm wait/activity wiring
 internal/status/recovery.go:RecoveryManager.CanSendRecovery	ntm-ov057	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/status/recovery.go:RecoveryManager.GetLastRecoveryTime	ntm-ov057	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/status/recovery.go:RecoveryManager.GetRecoveryCount	ntm-ov057	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
@@ -185,8 +184,6 @@ internal/status/recovery.go:RecoveryManager.SetCooldown	ntm-ov057	reachable only
 internal/status/recovery.go:RecoveryManager.SetPrompt	ntm-ov057	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/status/recovery.go:RecoveryManager.recoveryPaneType	ntm-ov057	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/status/recovery.go:RecoveryManager.sendRecoveryPromptByIDForAgent	ntm-ov057	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/status/unified.go:UnifiedDetector.DetectAll	ntm-ov057	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
-internal/status/unified.go:UnifiedDetector.DetectAllContext	ntm-ov057	reachable only through RTA's reflection rule at the 2026-10-05 baseline; wire it (surface + behavioral test) or delete it
 internal/swarm/claude_config_home.go:ClaudeConfigProvisioner.CredentialIsolated	ntm-ov057	upstream f477c62c debt (upstream G1 gate red): unreachable from cmd/ntm; its credentialState helper chain is dead; wire or delete upstream
 internal/tmux/client.go:Client.RespawnPaneContext	ntm-ov057	upstream f477c62c debt (upstream G1 gate red): kept only by RTA's reflection rule, no call path from cmd/ntm; wire or delete upstream
 internal/tmux/client.go:RespawnPaneContext	ntm-ov057	upstream f477c62c debt (upstream G1 gate red): unreachable from cmd/ntm; package-level respawn wrapper left uncalled; wire or delete upstream
