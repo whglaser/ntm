@@ -430,3 +430,203 @@ func TestAgentDeliveryStableArtifactsOutrankIncompletePostWaitFrame(t *testing.T
 	}
 	assertNotResent(t, mock)
 }
+
+// providerRejectionTranscript reconstructs the live ntm-l6cuz.10 frame: the
+// provider payload arrived after a long turn had already scrolled the pre-send
+// boundary away, and the pane width split the JSON mid-token.
+func providerRejectionTranscript() string {
+	payload := `Error: 400 data: {"error":{"code":"content_filter","message":"Response content blocked by label 'Jailbreak'."}}`
+	var wrapped strings.Builder
+	for len(payload) > 24 {
+		wrapped.WriteString(payload[:24])
+		wrapped.WriteString("\n")
+		payload = payload[24:]
+	}
+	wrapped.WriteString(payload)
+	return "Pi v1.3.0\n\n" + strings.Repeat("lane output line\n", 400) + wrapped.String() + "\nIf this looks like a pi bug, /bug sends a report to the developers."
+}
+
+// TestAgentDeliverySurfacesProviderContentFilterInsteadOfBoundaryLoss is the
+// ntm-l6cuz.10 acceptance: the turn ended on the provider's content-filter
+// error, so the step must carry the provider's code/label instead of the
+// misleading boundary-loss wording, keep the pane evidence, and never re-send.
+func TestAgentDeliverySurfacesProviderContentFilterInsteadOfBoundaryLoss(t *testing.T) {
+	executor, mock := submittingExecutor(t, "pi-provider-filter")
+	executor.config.ProjectDir = t.TempDir()
+	mock.AddPane("", tmux.Pane{ID: "%1", Index: 1, PID: 4141, Type: tmux.AgentType("pi"), Width: 100})
+	if err := mock.SetPaneOutput("%1", piStagePane("Pi v1.3.0\nPrevious turn context that will scroll away.", "")); err != nil {
+		t.Fatal(err)
+	}
+	mock.SetSubmissionVerifier(func(target, _, _ string) error {
+		return mock.SetPaneOutput(target, piStagePane(providerRejectionTranscript(), ""))
+	})
+
+	workflow := singleStepWorkflow("pi-provider-filter", Step{
+		ID:      "intake",
+		Pane:    PaneSpec{Index: 1},
+		Prompt:  "Run the lane.",
+		Wait:    WaitCompletion,
+		Timeout: Duration{Duration: 10 * time.Second},
+	})
+	state, err := executor.Run(context.Background(), workflow, nil, nil)
+	if err == nil || state.Status != StatusFailed {
+		t.Fatalf("provider rejection did not fail the step: state=%+v err=%v", state.Status, err)
+	}
+	got := state.Steps["intake"]
+	if got.Attempts != 1 {
+		t.Fatalf("attempts = %d, want 1 — the default fail policy must not blind-retry a provider rejection", got.Attempts)
+	}
+	if got.Error == nil || got.Error.Type != "provider_rejected" {
+		t.Fatalf("step error = %+v, want provider_rejected", got.Error)
+	}
+	if !strings.Contains(got.Error.Message, "content_filter") || !strings.Contains(got.Error.Message, "Jailbreak") {
+		t.Fatalf("provider code/label lost from the step error: %q", got.Error.Message)
+	}
+	if strings.Contains(got.Error.Message, "boundary is no longer visible") {
+		t.Fatalf("provider rejection still reported as boundary loss: %q", got.Error.Message)
+	}
+	if got.Error.AgentState != string(status.StateIdle) {
+		t.Fatalf("agent state at rejection = %q, want idle", got.Error.AgentState)
+	}
+	if !strings.Contains(got.Error.PaneOutput, "Error: 400 data:") || !strings.Contains(got.Error.PaneOutput, "Jailbreak") {
+		t.Fatalf("provider payload missing from the step's pane evidence: %q", got.Error.PaneOutput)
+	}
+	if strings.Contains(got.Output, "content_filter") || strings.Contains(got.Output, "Jailbreak") {
+		t.Fatalf("error frame was attributed as the step's answer: %q", got.Output)
+	}
+	assertNotResent(t, mock)
+}
+
+// TestAgentDeliveryProviderRejectionInFreshFrameIsNotAnAnswer pins the case
+// the ordinary attribution rules would accept: the boundary is still visible,
+// so the error block lands in the fresh delta after the prompt echo and looks
+// like a completed response. The provider verdict must win over completion.
+func TestAgentDeliveryProviderRejectionInFreshFrameIsNotAnAnswer(t *testing.T) {
+	executor, mock := submittingExecutor(t, "pi-provider-fresh")
+	executor.config.ProjectDir = t.TempDir()
+	mock.AddPane("", tmux.Pane{ID: "%1", Index: 1, PID: 4141, Type: tmux.AgentType("pi"), Width: 100})
+	if err := mock.SetPaneOutput("%1", piStagePane("Pi v1.3.0\nPrevious turn context.", "")); err != nil {
+		t.Fatal(err)
+	}
+	mock.SetSubmissionVerifier(func(target, _, _ string) error {
+		return mock.SetPaneOutput(target, piStagePane("Pi v1.3.0\nPrevious turn context.\n\nRun the lane.\n\n"+providerRejectionTranscript(), ""))
+	})
+
+	workflow := singleStepWorkflow("pi-provider-fresh", Step{
+		ID:      "intake",
+		Pane:    PaneSpec{Index: 1},
+		Prompt:  "Run the lane.",
+		Wait:    WaitCompletion,
+		Timeout: Duration{Duration: 10 * time.Second},
+	})
+	state, err := executor.Run(context.Background(), workflow, nil, nil)
+	if err == nil || state.Status != StatusFailed {
+		t.Fatalf("fresh-frame provider rejection did not fail the step: state=%+v err=%v", state.Status, err)
+	}
+	got := state.Steps["intake"]
+	if got.Error == nil || got.Error.Type != "provider_rejected" {
+		t.Fatalf("step error = %+v, want provider_rejected", got.Error)
+	}
+	if strings.Contains(got.Output, "content_filter") || strings.Contains(got.Output, "Jailbreak") {
+		t.Fatalf("error frame was attributed as the step's answer: %q", got.Output)
+	}
+	assertNotResent(t, mock)
+}
+
+// TestAgentDeliveryProviderRejectionWithStableArtifactsStillCompletes pins the
+// ntm-l6cuz.10 exception: when every declared deliverable is already on disk,
+// the artifact-stability fallback outranks the error frame instead of failing a
+// step whose output exists (ntm-l6cuz.11 semantics preserved).
+func TestAgentDeliveryProviderRejectionWithStableArtifactsStillCompletes(t *testing.T) {
+	executor, mock := submittingExecutor(t, "pi-provider-artifacts")
+	executor.config.ProjectDir = t.TempDir()
+	executor.config.OutputStabilityWindow = 1500 * time.Millisecond
+	mock.AddPane("", tmux.Pane{ID: "%1", Index: 1, PID: 4141, Type: tmux.AgentType("pi"), Width: 100})
+	if err := mock.SetPaneOutput("%1", piStagePane("Pi v1.3.0\nPrevious turn context that will scroll away.", "")); err != nil {
+		t.Fatal(err)
+	}
+	artifact := filepath.Join(executor.config.ProjectDir, "lane-note.md")
+	mock.SetSubmissionVerifier(func(target, _, _ string) error {
+		if err := os.WriteFile(artifact, []byte("lane note complete\n"), 0o600); err != nil {
+			return err
+		}
+		return mock.SetPaneOutput(target, piStagePane(providerRejectionTranscript(), ""))
+	})
+
+	workflow := singleStepWorkflow("pi-provider-artifacts", Step{
+		ID:      "intake",
+		Pane:    PaneSpec{Index: 1},
+		Prompt:  "Run the lane.",
+		Wait:    WaitCompletion,
+		Timeout: Duration{Duration: 10 * time.Second},
+		Outputs: []OutputDecl{{Name: "lane-note", Path: artifact}},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	state, err := executor.Run(ctx, workflow, nil, nil)
+	if err != nil || state.Status != StatusCompleted {
+		t.Fatalf("declared deliverable did not outrank the provider rejection: state=%+v err=%v", state.Status, err)
+	}
+	if _, err := os.Stat(artifact); err != nil {
+		t.Fatalf("artifact disappeared: %v", err)
+	}
+	assertNotResent(t, mock)
+}
+
+// TestAgentDeliveryRecordsProviderRejectionAttempts pins the retry half of the
+// contract: when the workflow policy retries, every rejected attempt is kept in
+// the run state (not only the last one), the final step carries the provider
+// verdict, and retries still never re-send the delivered prompt.
+func TestAgentDeliveryRecordsProviderRejectionAttempts(t *testing.T) {
+	executor, mock := submittingExecutor(t, "pi-provider-retry")
+	executor.config.ProjectDir = t.TempDir()
+	mock.AddPane("", tmux.Pane{ID: "%1", Index: 1, PID: 4141, Type: tmux.AgentType("pi"), Width: 100})
+	if err := mock.SetPaneOutput("%1", piStagePane("Pi v1.3.0\nPrevious turn context that will scroll away.", "")); err != nil {
+		t.Fatal(err)
+	}
+	mock.SetSubmissionVerifier(func(target, _, _ string) error {
+		return mock.SetPaneOutput(target, piStagePane(providerRejectionTranscript(), ""))
+	})
+
+	workflow := singleStepWorkflow("pi-provider-retry", Step{
+		ID:           "intake",
+		Pane:         PaneSpec{Index: 1},
+		Prompt:       "Run the lane.",
+		Wait:         WaitCompletion,
+		Timeout:      Duration{Duration: 5 * time.Second},
+		OnError:      ErrorActionRetry,
+		RetryCount:   2,
+		RetryDelay:   Duration{Duration: 10 * time.Millisecond},
+		RetryBackoff: "none",
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	state, err := executor.Run(ctx, workflow, nil, nil)
+	if err == nil || state.Status != StatusFailed {
+		t.Fatalf("retried provider rejection did not fail the run: state=%+v err=%v", state.Status, err)
+	}
+	got := state.Steps["intake"]
+	if got.Attempts != 3 {
+		t.Fatalf("attempts = %d, want 3", got.Attempts)
+	}
+	if got.Error == nil || got.Error.Type != "provider_rejected" {
+		t.Fatalf("final step error = %+v, want provider_rejected", got.Error)
+	}
+	var recorded []string
+	for _, execErr := range state.Errors {
+		if execErr.Type == "provider_rejected" {
+			recorded = append(recorded, execErr.Message)
+		}
+	}
+	if len(recorded) != 2 {
+		t.Fatalf("recorded provider attempts = %d (%v), want 2", len(recorded), recorded)
+	}
+	for i, want := range []string{"attempt 1/3", "attempt 2/3"} {
+		if !strings.Contains(recorded[i], want) {
+			t.Fatalf("attempt record %d = %q, want it to mention %q", i, recorded[i], want)
+		}
+	}
+	assertNotResent(t, mock)
+}

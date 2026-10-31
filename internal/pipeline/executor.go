@@ -1087,6 +1087,19 @@ func (e *Executor) executeStep(ctx context.Context, step *Step, workflow *Workfl
 		}
 
 		if attempt < maxAttempts {
+			// Keep each rejected attempt in the run state. A deterministic
+			// provider filter failure looks identical across retries, and
+			// without this the operator only sees the last attempt's error.
+			if stepResult.Error != nil && stepResult.Error.Type == "provider_rejected" {
+				e.stateMu.Lock()
+				e.state.Errors = append(e.state.Errors, ExecutionError{
+					StepID:    step.ID,
+					Type:      "provider_rejected",
+					Message:   fmt.Sprintf("attempt %d/%d: %s", attempt, maxAttempts, stepResult.Error.Message),
+					Timestamp: time.Now(),
+				})
+				e.stateMu.Unlock()
+			}
 			// Wait before retry
 			delay := e.calculateRetryDelay(retryDelay, attempt, step.RetryBackoff)
 			e.emitProgress("step_retry", step.ID,
@@ -1998,12 +2011,16 @@ func (e *Executor) executeAgentDelivery(ctx context.Context, step *Step, workflo
 		if typ == "not_dispatched" {
 			hint = "restore the live agent composer and retry or resume normally; no prompt was sent"
 		}
+		if typ == "provider_rejected" {
+			hint = "the provider rejected the turn; an unchanged prompt will be rejected again, so adjust the prompt or the model/deployment filter policy before an intentional restart"
+		}
 		result.Error = stepRuntimeError(step, kind, typ, err.Error(), hint, err.Error())
 		// A failed send or an expired wait leaves its evidence in the pane:
 		// what the agent last printed and whether it reads idle or busy. Keep
 		// it with the error so status and the API can show why after the pane
-		// has moved on.
-		if typ == "send" || typ == "timeout" {
+		// has moved on. A provider rejection is the same: the pane holds the
+		// provider's payload and the state source that proved the turn ended.
+		if typ == "send" || typ == "timeout" || typ == "provider_rejected" {
 			result.Error.PaneOutput = e.captureErrorContext(result.PaneUsed, 50)
 			result.Error.AgentState, result.Error.AgentStateSource = e.detectAgentState(result.PaneUsed)
 		}
@@ -2194,12 +2211,18 @@ func (e *Executor) executeAgentDelivery(ctx context.Context, step *Step, workflo
 		}
 		next, ready, err := e.observeAgentDeliveryTurn(record.PaneID, record, current)
 		if err != nil {
-			if errors.Is(err, errAgentDeliveryBoundaryLost) && opts.Artifacts != nil && opts.Artifacts.allPresent() {
-				// The pane frame is no longer attributable, but every declared
-				// deliverable exists on disk: park instead of failing, and let
-				// the stability window (or the step deadline) decide. A missing
-				// output still fails closed exactly as before.
-				return false, nil
+			if opts.Artifacts != nil && opts.Artifacts.allPresent() {
+				// The pane frame is no longer attributable (or reports a provider
+				// rejection), but every declared deliverable exists on disk:
+				// park instead of failing, and let the stability window (or the
+				// step deadline) decide. A missing output still fails closed
+				// exactly as before.
+				if errors.Is(err, errAgentDeliveryBoundaryLost) {
+					return false, nil
+				}
+				if _, rejected := status.ProviderRejectionIn(err); rejected {
+					return false, nil
+				}
 			}
 			return false, err
 		}
@@ -2249,6 +2272,20 @@ func (e *Executor) executeAgentDelivery(ctx context.Context, step *Step, workflo
 					if _, captureErr := collect(); captureErr != nil {
 						err = errors.Join(err, captureErr)
 					}
+				}
+				// A provider/API rejection is a terminal verdict about the turn,
+				// not a boundary uncertainty: surface the provider's own reason
+				// instead of the boundary-loss wording (ntm-l6cuz.10). The retry
+				// policy still decides whether another attempt follows.
+				if rejection, rejected := status.ProviderRejectionIn(err); rejected {
+					slog.Warn("pipeline.agent_delivery.provider_rejected",
+						"pane_id", paneID,
+						"agent_type", record.AgentType,
+						"provider_code", rejection.Code,
+						"provider_label", rejection.Label,
+						"reason", "provider rejected the turn; failing the step with the provider verdict instead of boundary loss",
+					)
+					return fail("provider_rejected", rejection)
 				}
 				return fail("timeout", fmt.Errorf("waiting for the original agent delivery: %w", err))
 			}
@@ -2461,6 +2498,22 @@ func observeAgentDelivery(record AgentDeliveryState, current string) (AgentDeliv
 func (e *Executor) observeAgentDeliveryTurn(paneID string, record AgentDeliveryState, current string) (AgentDeliveryState, bool, error) {
 	next, ready, err := observeAgentDelivery(record, current)
 	if err == nil {
+		// A provider rejection in this turn's fresh output is a terminal
+		// verdict, never an answer (ntm-l6cuz.10). Only text this turn
+		// produced is scanned: a stale error block from an earlier attempt
+		// stays in the pre-send frame and must not fail a healthy turn.
+		if rejection, rejected := status.DetectProviderRejection(agentDeliveryTurnText(record, current)); rejected {
+			// Debug, not warn: an artifact park can re-classify the same frame
+			// every poll; the terminal failure logs once where the step ends.
+			slog.Debug("pipeline.agent_delivery.provider_rejected",
+				"pane_id", paneID,
+				"agent_type", record.AgentType,
+				"provider_code", rejection.Code,
+				"provider_label", rejection.Label,
+				"reason", "provider rejected the turn; attributing the error frame as an answer would fabricate a completion",
+			)
+			return next, false, rejection
+		}
 		if !ready && next.recoveredTurn && current == next.BeforeOutput {
 			// A turn already attributed to this exact frame stays complete:
 			// the frame has not changed since the attribution, so there is no
@@ -2495,7 +2548,18 @@ func (e *Executor) observeAgentDeliveryTurn(paneID string, record AgentDeliveryS
 			)
 			return next, false, nil
 		}
+		// The boundary is gone and the pane is not working. A provider
+		// rejection on screen is the terminal reason the turn ended; without
+		// one the receipt still fails closed exactly as before.
+		if rejection, rejected := status.DetectProviderRejection(current); rejected {
+			return next, false, e.deliveryProviderRejected(paneID, record, st, rejection)
+		}
 		return next, false, err
+	}
+	// A fresh OSC settle recovers the current frame as the turn's output, but
+	// a provider rejection is not an answer: classify it before attributing.
+	if rejection, rejected := status.DetectProviderRejection(current); rejected {
+		return next, false, e.deliveryProviderRejected(paneID, record, st, rejection)
 	}
 	output := next.Output
 	if output == "" {
@@ -2518,6 +2582,41 @@ func (e *Executor) observeAgentDeliveryTurn(paneID string, record AgentDeliveryS
 		"reason", "authoritative program status settled the turn after the pre-send boundary scrolled away",
 	)
 	return next, true, nil
+}
+
+// agentDeliveryTurnText returns the captured text this turn produced: the
+// delta after the durable pre-send boundary when attribution still works, or
+// the transcript after the current prompt echo when a repaint replaced the
+// frame. Empty means nothing can be attributed to this turn; the caller then
+// decides from pane state instead of scanning stale scrollback.
+func agentDeliveryTurnText(record AgentDeliveryState, current string) string {
+	if delta, err := agentDeliveryNewOutput(record.BeforeOutput, current); err == nil {
+		return delta
+	}
+	if strings.EqualFold(strings.TrimSpace(record.AgentType), "pi") {
+		piEcho := status.PromptEchoFingerprint{Hash: record.PiPromptEchoHash, Length: record.PiPromptEchoLength}
+		if _, end, anchored := status.UniqueAgentEchoSpan(current, record.PromptEchoHash, record.PromptEchoLength, piEcho); anchored {
+			return strings.TrimSpace(current[end:])
+		}
+	}
+	return ""
+}
+
+// deliveryProviderRejected records and returns a provider verdict discovered
+// during an unattributable wait poll, so the run log carries the pane state
+// that made the classification possible.
+func (e *Executor) deliveryProviderRejected(paneID string, record AgentDeliveryState, st status.AgentStatus, rejection status.ProviderRejection) error {
+	// Debug, not warn: the classification repeats on every wait poll and the
+	// terminal failure logs once, where the step actually ends.
+	slog.Debug("pipeline.agent_delivery.provider_rejected",
+		"pane_id", paneID,
+		"agent_type", record.AgentType,
+		"provider_code", rejection.Code,
+		"provider_label", rejection.Label,
+		"state_source", string(st.StateSource),
+		"reason", "provider rejected the turn while the pre-send boundary was unattributable",
+	)
+	return rejection
 }
 
 // agentDeliveryPaneStatus returns the detector's current reading for a pane
