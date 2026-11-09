@@ -6829,3 +6829,419 @@ func TestOmpRobotStateDialogsAndContext(t *testing.T) {
 		t.Error("a selector overlay hides the composer; no gauge reading expected")
 	}
 }
+
+func TestGetSnapshotPreservesCollectedTranscriptContext(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fixture tmux uses a POSIX shell")
+	}
+	dir := t.TempDir()
+	t.Chdir(dir)
+	configPath := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(configPath, []byte("[alerts]\nenabled = false\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("NTM_CONFIG", configPath)
+	mail := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(mail.Close)
+	t.Setenv("AGENT_MAIL_URL", mail.URL)
+
+	// The collection phase reads three empty panes. Only attributed
+	// transcripts can supply their usage; the snapshot phase forbids capture.
+	tmuxPath := filepath.Join(dir, "tmux")
+	script := `#!/bin/sh
+if [ "$NTM_TEST_PROJECTION_ONLY" = 1 ]; then
+  printf '%s\n' "$1" >> "$NTM_TEST_PROJECTION_CALLS"
+fi
+case "$1" in
+  list-sessions)
+    printf '%s\n' 'projected_NTM_SEP_1_NTM_SEP_1_NTM_SEP_2026-01-01T00:00:00Z'
+    ;;
+  list-panes)
+    if [ "$2" = -a ]; then
+      printf '%s\n' \
+        'projected_NTM_SEP_%1_NTM_SEP_1_NTM_SEP_claude_NTM_SEP_claude_NTM_SEP_100_NTM_SEP_30_NTM_SEP_1_NTM_SEP_0_NTM_SEP_0_NTM_SEP_claude' \
+        'projected_NTM_SEP_%2_NTM_SEP_2_NTM_SEP_claude_NTM_SEP_claude_NTM_SEP_100_NTM_SEP_30_NTM_SEP_0_NTM_SEP_0_NTM_SEP_0_NTM_SEP_claude' \
+        'projected_NTM_SEP_%3_NTM_SEP_3_NTM_SEP_claude_NTM_SEP_claude_NTM_SEP_100_NTM_SEP_30_NTM_SEP_0_NTM_SEP_0_NTM_SEP_0_NTM_SEP_claude'
+    fi
+    ;;
+  display-message)
+    printf '%s\n' "$4"
+    ;;
+  capture-pane)
+    if [ "$NTM_TEST_PROJECTION_ONLY" = 1 ]; then
+      exit 9
+    fi
+    ;;
+esac
+`
+	if err := os.WriteFile(tmuxPath, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("NTM_TMUX_BINARY", tmuxPath)
+	t.Setenv("PATH", dir)
+	callsPath := filepath.Join(dir, "snapshot-tmux-calls")
+	t.Setenv("NTM_TEST_PROJECTION_CALLS", callsPath)
+	prevClient := tmux.DefaultClient
+	tmux.DefaultClient = tmux.NewClient("")
+	t.Cleanup(func() { tmux.DefaultClient = prevClient })
+
+	prevProcess, prevCwd, prevPath := transcriptUsageForProcess, transcriptUsageForCwd, paneCurrentPath
+	t.Cleanup(func() {
+		transcriptUsageForProcess, transcriptUsageForCwd, paneCurrentPath = prevProcess, prevCwd, prevPath
+	})
+	paneCurrentPath = func(id string) (string, bool) { return id, true }
+	transcriptUsageForProcess = func(string, int) (*ntmctx.TranscriptUsage, bool) {
+		return nil, false
+	}
+	transcriptUsageForCwd = func(_ string, cwd string) (*ntmctx.TranscriptUsage, bool) {
+		switch cwd {
+		case "%1":
+			return &ntmctx.TranscriptUsage{Tokens: 120000, ContextWindow: 200000}, true
+		case "%2":
+			return &ntmctx.TranscriptUsage{Tokens: 0, ContextWindow: 200000}, true
+		default:
+			return nil, false
+		}
+	}
+	collected, err := collectNormalizedTmuxProjectionContext(context.Background(), dir, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(collected.Sessions) != 1 || len(collected.Agents) != 3 {
+		t.Fatalf("collected projection = %+v, want one session and three agents", collected)
+	}
+	store := newProjectionTestStore(t)
+	if err := persistNormalizedProjection(store, &adapters.AggregatedSignals{CollectedAt: collected.CollectedAt}, collected, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	previousStore := currentProjectionStore()
+	SetProjectionStore(store)
+	t.Cleanup(func() { SetProjectionStore(previousStore) })
+
+	// A public snapshot must read the persisted measurements, even when
+	// neither live capture nor transcript attribution is available.
+	t.Setenv("NTM_TEST_PROJECTION_ONLY", "1")
+	transcriptUsageForProcess = func(string, int) (*ntmctx.TranscriptUsage, bool) {
+		t.Error("projection-backed snapshot attempted process transcript lookup")
+		return nil, false
+	}
+	transcriptUsageForCwd = func(string, string) (*ntmctx.TranscriptUsage, bool) {
+		t.Error("projection-backed snapshot attempted cwd transcript lookup")
+		return nil, false
+	}
+	stubRobotWork(t, func(context.Context, *state.Store, adapters.WorkCoordinationAdapterConfig, bool) (*adapters.WorkSection, error) {
+		return nil, errors.New("work unavailable in context fixture")
+	})
+	cfg := config.Default()
+	cfg.Alerts.Enabled = false
+	snapshot, err := GetSnapshot(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snapshot.Success || len(snapshot.Sessions) != 1 || len(snapshot.Sessions[0].Agents) != 3 {
+		t.Fatalf("public snapshot did not serve the persisted projection: %+v", snapshot)
+	}
+	encoded, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire struct {
+		Sessions []struct {
+			Agents []map[string]json.RawMessage `json:"agents"`
+		} `json:"sessions"`
+	}
+	if err := json.Unmarshal(encoded, &wire); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range wire.Sessions[0].Agents {
+		var pane string
+		if err := json.Unmarshal(row["pane"], &pane); err != nil {
+			t.Fatal(err)
+		}
+		value, present := row["context_percent"]
+		switch pane {
+		case "%1", "%2":
+			want := 60.0
+			if pane == "%2" {
+				want = 0
+			}
+			var got float64
+			if !present || string(value) == "null" {
+				t.Fatalf("pane %s lost known context %v: %s", pane, want, encoded)
+			}
+			if err := json.Unmarshal(value, &got); err != nil || math.Abs(got-want) > 0.000001 {
+				t.Fatalf("pane %s context = %s, want %v (error %v)", pane, value, want, err)
+			}
+		case "%3":
+			if present {
+				t.Fatalf("unknown context became a measured value: %s", encoded)
+			}
+		default:
+			t.Fatalf("unexpected projected pane %q", pane)
+		}
+	}
+	calls, err := os.ReadFile(callsPath)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(calls), "capture-pane") {
+		t.Fatalf("snapshot fell back to live capture: %s", calls)
+	}
+}
+
+func TestResolvePaneTranscriptsDoesNotAttributeRemoteProcesses(t *testing.T) {
+	prevClient := tmux.DefaultClient
+	prevProcess, prevCwd, prevPath := transcriptUsageForProcess, transcriptUsageForCwd, paneCurrentPath
+	t.Cleanup(func() {
+		tmux.DefaultClient = prevClient
+		transcriptUsageForProcess, transcriptUsageForCwd, paneCurrentPath = prevProcess, prevCwd, prevPath
+	})
+	tmux.DefaultClient = tmux.NewClient("remote.example")
+	paneCurrentPath = func(string) (string, bool) {
+		t.Fatal("remote transcript attribution consulted a pane path")
+		return "", false
+	}
+	transcriptUsageForProcess = func(string, int) (*ntmctx.TranscriptUsage, bool) {
+		t.Fatal("remote PID was resolved through local process transcripts")
+		return nil, false
+	}
+	transcriptUsageForCwd = func(string, string) (*ntmctx.TranscriptUsage, bool) {
+		t.Fatal("remote cwd was resolved through local transcripts")
+		return nil, false
+	}
+	got := ResolvePaneTranscripts([]tmux.Pane{{ID: "%1", PID: 123, Type: tmux.AgentClaude}})
+	if len(got) != 0 {
+		t.Fatalf("remote panes received local context: %+v", got)
+	}
+}
+
+func TestResolvePaneTranscriptsStopsAfterCancellation(t *testing.T) {
+	prevClient := tmux.DefaultClient
+	tmux.DefaultClient = tmux.NewClient("")
+	t.Cleanup(func() { tmux.DefaultClient = prevClient })
+	panes := []tmux.Pane{
+		{ID: "%1", Type: tmux.AgentClaude},
+		{ID: "%2", Type: tmux.AgentClaude},
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	calls := 0
+	got := resolvePaneTranscripts(ctx, panes,
+		func(string) (string, bool) {
+			calls++
+			cancel()
+			return "/project", true
+		},
+		func(string, int) (*ntmctx.TranscriptUsage, bool) {
+			t.Fatal("process lookup ran after cancellation")
+			return nil, false
+		},
+		func(string, string) (*ntmctx.TranscriptUsage, bool) {
+			t.Fatal("cwd lookup ran after cancellation")
+			return nil, false
+		},
+	)
+	if calls != 1 || len(got) != 0 {
+		t.Fatalf("canceled attribution continued: path calls=%d result=%+v", calls, got)
+	}
+	if got, err := resolvePaneTranscriptsContext(ctx, panes); !errors.Is(err, context.Canceled) || len(got) != 0 {
+		t.Fatalf("context resolver lost cancellation: result=%+v err=%v", got, err)
+	}
+}
+
+func TestGetSnapshotDeltaPreservesCanonicalEventPayloads(t *testing.T) {
+	store := newProjectionTestStore(t)
+	previous := currentProjectionStore()
+	SetProjectionStore(store)
+	t.Cleanup(func() { SetProjectionStore(previous) })
+	now := time.Now().UTC()
+	expires := now.Add(time.Hour)
+	stateCursor, err := store.AppendAttentionEvent(&state.StoredAttentionEvent{
+		Ts: now.Add(-30 * time.Second), SessionName: "delta-proj", Pane: "2.0",
+		Category: string(EventCategoryAgent), EventType: string(EventTypeAgentStateChange),
+		Source: "activity_detector", Actionability: state.Actionability("interesting"),
+		Severity: state.Severity("info"), Summary: "agent became idle", ExpiresAt: &expires,
+		Details:     `{"old_state":"working","new_state":"idle","pane_id":"%14","queued_messages":0,"cursor":"payload-local","source_health":{"available":true,"capture_age_ms":0},"title_disclosure":{"disclosure_state":"redacted","preview":"[REDACTED]"}}`,
+		NextActions: `[{"action":"robot-tail","args":"--robot-tail=delta-proj --panes=2.0 --lines=50","reason":"Inspect completed work"},{"action":"robot-retired-command","args":"--robot-retired-command","reason":"Obsolete stored action"}]`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	feed := NewAttentionFeed(AttentionFeedConfig{
+		JournalSize: 16, RetentionPeriod: time.Hour, HeartbeatInterval: 0,
+	}, WithAttentionStore(store))
+	t.Cleanup(feed.Stop)
+	pressure := feed.Append(NewContextPressureAttentionEvent("delta-proj", tmux.Pane{
+		ID: "%14", Index: 0, WindowIndex: 2, Type: tmux.AgentClaude,
+	}, 96.5, 75))
+	rotation := feed.PublishActuation(ActuationRecord{
+		Stage: ActuationStageOutcome, Action: "context_rotation", Session: "delta-proj",
+		Targets: []string{"%14"}, Successful: []string{"%14"}, Result: "completed",
+		RequestID: "rotation-123", ReasonCode: "context_rotation_auto_confirm",
+	})
+
+	output, err := GetSnapshotDelta(now.Add(-time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !output.Success || len(output.Changes) != 3 {
+		t.Fatalf("delta = %+v, want all three durable changes", output)
+	}
+	detailsAt := func(index int) map[string]any {
+		t.Helper()
+		details, ok := output.Changes[index].Data["details"].(map[string]any)
+		if !ok {
+			t.Fatalf("change %d lost structured details: %+v", index, output.Changes[index])
+		}
+		return details
+	}
+	stateChange := output.Changes[0]
+	if stateChange.Session != "delta-proj" || stateChange.Pane != "2.0" || stateChange.Type != string(EventTypeAgentStateChange) {
+		t.Fatalf("stored scope changed: %+v", stateChange)
+	}
+	if stateChange.Data["cursor"] != stateCursor || stateChange.Data["summary"] != "agent became idle" {
+		t.Fatalf("payload fields replaced event metadata: %+v", stateChange.Data)
+	}
+	stateDetails := detailsAt(0)
+	if stateDetails["old_state"] != "working" || stateDetails["new_state"] != "idle" ||
+		stateDetails["queued_messages"] != float64(0) || stateDetails["cursor"] != "payload-local" {
+		t.Fatalf("state transition evidence lost: %+v", stateDetails)
+	}
+	health, ok := stateDetails["source_health"].(map[string]any)
+	if !ok || health["available"] != true || health["capture_age_ms"] != float64(0) {
+		t.Fatalf("nested provenance lost: %+v", stateDetails)
+	}
+	disclosure, ok := stateDetails["title_disclosure"].(map[string]any)
+	if !ok || disclosure["disclosure_state"] != "redacted" || disclosure["preview"] != "[REDACTED]" {
+		t.Fatalf("upstream disclosure metadata changed: %+v", stateDetails)
+	}
+	actions, ok := stateChange.Data["next_actions"].([]NextAction)
+	if !ok || len(actions) != 1 || actions[0].Action != "robot-tail" || actions[0].Args != "--robot-tail=delta-proj --panes=2.0 --lines=50" {
+		t.Fatalf("replayed actions did not use canonical validation: %+v", stateChange.Data["next_actions"])
+	}
+	contextDetails := detailsAt(1)
+	if contextDetails["usage_percent"] != 96.5 || contextDetails["threshold_percent"] != float64(75) ||
+		contextDetails["pane_id"] != "%14" || contextDetails["signal"] != attentionSignalContextHot {
+		t.Fatalf("context pressure evidence lost: %+v", contextDetails)
+	}
+	contextChange := output.Changes[1]
+	if contextChange.Data["cursor"] != pressure.Cursor || contextChange.Data["actionability"] != string(ActionabilityActionRequired) {
+		t.Fatalf("context pressure metadata changed: %+v", contextChange)
+	}
+	contextActions, ok := contextChange.Data["next_actions"].([]NextAction)
+	if !ok || len(contextActions) != 1 || contextActions[0].Action != "robot-context" {
+		t.Fatalf("context pressure lost its follow-up: %+v", contextChange.Data)
+	}
+	rotationDetails := detailsAt(2)
+	successful, ok := rotationDetails["successful"].([]any)
+	if !ok || len(successful) != 1 || successful[0] != "%14" || rotationDetails["result"] != "completed" || rotationDetails["request_id"] != "rotation-123" {
+		t.Fatalf("rotation outcome evidence lost: %+v", rotationDetails)
+	}
+	if output.Changes[2].Data["cursor"] != rotation.Cursor || output.Changes[2].Data["reason_code"] != "context_rotation_auto_confirm" {
+		t.Fatalf("rotation metadata changed: %+v", output.Changes[2])
+	}
+	encoded, err := json.Marshal(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"usage_percent":96.5`) || !strings.Contains(string(encoded), `"next_actions":[`) {
+		t.Fatalf("public delta JSON omitted the evidence/actions: %s", encoded)
+	}
+}
+
+func TestGetSnapshotDeltaHandlesLegacyPayloadsAndReplayBounds(t *testing.T) {
+	store := newProjectionTestStore(t)
+	previous := currentProjectionStore()
+	SetProjectionStore(store)
+	t.Cleanup(func() { SetProjectionStore(previous) })
+	now := time.Now().UTC()
+	expires := now.Add(time.Hour)
+	expired := now.Add(-10 * time.Second)
+	fixtures := []struct {
+		name, details, actions string
+		at                     time.Time
+		expires                *time.Time
+	}{
+		{
+			name: "malformed-details", details: `{"usage_percent":`,
+			actions: `[{"action":"robot-status","args":"--robot-status","reason":"Inspect current state"}]`,
+			at:      now.Add(-30 * time.Second), expires: &expires,
+		},
+		{
+			name: "malformed-actions", details: `{"usage_percent":0,"compacted":true}`, actions: `[`,
+			at: now.Add(-30 * time.Second), expires: &expires,
+		},
+		{
+			name: "obsolete-actions", details: `{}`,
+			actions: `[{"action":"robot-retired-command","args":"--robot-retired-command"},{"action":"","args":"--robot-status"}]`,
+			at:      now.Add(-30 * time.Second), expires: &expires,
+		},
+		{
+			name: "non-object-details", details: `["legacy text"]`, actions: `[]`,
+			at: now.Add(-30 * time.Second), expires: &expires,
+		},
+		{
+			name: "before-window", details: `{"must_not_replay":true}`,
+			at: now.Add(-2 * time.Hour), expires: &expires,
+		},
+		{
+			name: "expired", details: `{"must_not_replay":true}`,
+			at: now.Add(-30 * time.Second), expires: &expired,
+		},
+		{
+			name: "future", details: `{"must_not_replay":true}`,
+			at: now.Add(2 * time.Hour), expires: &expires,
+		},
+	}
+	for _, fixture := range fixtures {
+		_, err := store.AppendAttentionEvent(&state.StoredAttentionEvent{
+			Ts: fixture.at, SessionName: fixture.name, Pane: "3.0",
+			Category: string(EventCategoryAgent), EventType: string(EventTypeAgentStateChange),
+			Source: "legacy", Actionability: state.Actionability("interesting"), Severity: state.Severity("info"),
+			Summary: fixture.name, Details: fixture.details, NextActions: fixture.actions, ExpiresAt: fixture.expires,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	output, err := GetSnapshotDelta(now.Add(-time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !output.Success || len(output.Changes) != 4 {
+		t.Fatalf("delta = %+v, want four replayable events", output)
+	}
+	for _, change := range output.Changes {
+		if change.Pane != "3.0" || change.Type != string(EventTypeAgentStateChange) || change.Data["summary"] != change.Session {
+			t.Fatalf("legacy metadata or scope changed: %+v", change)
+		}
+		switch change.Session {
+		case "malformed-details":
+			if _, exists := change.Data["details"]; exists {
+				t.Fatalf("malformed details were exposed: %+v", change)
+			}
+			actions, ok := change.Data["next_actions"].([]NextAction)
+			if !ok || len(actions) != 1 || actions[0].Action != "robot-status" {
+				t.Fatalf("malformed details discarded valid actions: %+v", change)
+			}
+		case "malformed-actions":
+			details, ok := change.Data["details"].(map[string]any)
+			if !ok || details["usage_percent"] != float64(0) || details["compacted"] != true {
+				t.Fatalf("malformed actions discarded measured-zero context: %+v", change)
+			}
+			if _, exists := change.Data["next_actions"]; exists {
+				t.Fatalf("malformed actions were exposed: %+v", change)
+			}
+		case "obsolete-actions", "non-object-details":
+			if _, exists := change.Data["details"]; exists {
+				t.Fatalf("empty or non-object details were exposed: %+v", change)
+			}
+			if _, exists := change.Data["next_actions"]; exists {
+				t.Fatalf("obsolete or empty actions were exposed: %+v", change)
+			}
+		default:
+			t.Fatalf("time or retention filter admitted %q", change.Session)
+		}
+	}
+}

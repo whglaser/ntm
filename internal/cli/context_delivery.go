@@ -47,10 +47,11 @@ func uniformContextRequests(panes []tmux.Pane, content string) []contextInjectio
 	return requests
 }
 
-// sendContextToPane uses the provider's multiline and submit protocol rather
-// than raw send-keys, which can submit each line as a separate agent prompt.
+// sendContextToPane preserves the pane identity observed before preparation.
+// The existing guarded protocol checks every chunk or paste and the final
+// Enter, including when the pane changes during the submission delay.
 func sendContextToPane(ctx context.Context, pane tmux.Pane, content string) error {
-	return tmux.DefaultClient.SendKeysForAgentContext(ctx, pane.ID, content, true, pane.Type)
+	return tmux.DefaultClient.SendKeysForAgentIfCurrentContext(ctx, pane.ID, content, true, pane.Type, pane.PID, false)
 }
 
 // dispatchContextRequests validates the ENTIRE batch before the first write.
@@ -224,6 +225,9 @@ func runContextInjection(ctx context.Context, opts contextInjectOptions, deps co
 				return result, fmt.Errorf("--files contains an empty path")
 			}
 		}
+	}
+	if deps.remote && !hasPack {
+		return result, ntmctx.ErrRemoteContextPreparation
 	}
 	if deps.resolve == nil || deps.panes == nil {
 		return result, fmt.Errorf("context injection session dependencies are required")

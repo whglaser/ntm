@@ -139,6 +139,97 @@ steps:
 	}
 }
 
+func TestParseSelectorOutputBudget(t *testing.T) {
+	for _, tc := range []struct {
+		format  string
+		content string
+	}{
+		{"yaml", `
+schema_version: "2.0"
+name: selector-budget
+settings:
+  limits:
+    max_command_stdout_bytes: 8
+    max_selector_output_bytes_total: 24
+steps:
+  - id: work
+    command: "true"
+`},
+		{"toml", `
+schema_version = "2.0"
+name = "selector-budget"
+[settings.limits]
+max_command_stdout_bytes = 8
+max_selector_output_bytes_total = 24
+[[steps]]
+id = "work"
+command = "true"
+`},
+	} {
+		t.Run(tc.format, func(t *testing.T) {
+			workflow, err := ParseString(tc.content, tc.format)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if validation := Validate(workflow); !validation.Valid {
+				t.Fatalf("valid selector budget rejected: %+v", validation)
+			}
+			limits := workflow.Settings.Limits.EffectiveLimits()
+			if limits.MaxCommandStdoutBytes != 8 || limits.MaxSelectorOutputBytesTotal != 24 {
+				t.Fatalf("source cap and aggregate budget did not survive parsing: %+v", limits)
+			}
+		})
+	}
+}
+
+func TestParseStepAdmissionLimitsRemainRuntimePolicy(t *testing.T) {
+	for _, tc := range []struct {
+		format  string
+		content string
+	}{
+		{"yaml", `
+schema_version: "2.0"
+name: admission-limits
+settings:
+  limits:
+    max_step_count_total: 1
+    max_materialized_step_nodes: 1
+steps:
+  - id: first
+    command: "true"
+  - id: second
+    command: "true"
+`},
+		{"toml", `
+schema_version = "2.0"
+name = "admission-limits"
+[settings.limits]
+max_step_count_total = 1
+max_materialized_step_nodes = 1
+[[steps]]
+id = "first"
+command = "true"
+[[steps]]
+id = "second"
+command = "true"
+`},
+	} {
+		t.Run(tc.format, func(t *testing.T) {
+			workflow, err := ParseString(tc.content, tc.format)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if validation := Validate(workflow); !validation.Valid {
+				t.Fatalf("parsing must allow a frozen workflow to receive a higher attempt limit: %+v", validation)
+			}
+			limits := workflow.Settings.Limits.EffectiveLimits()
+			if limits.MaxStepCountTotal != 1 || limits.MaxMaterializedStepNodes != 1 {
+				t.Fatalf("admission limits did not survive parsing: %+v", limits)
+			}
+		})
+	}
+}
+
 // bd-oqv4c: YAML with a foreach body step that uses loop_control as its
 // only kind (plus a when guard) must parse and validate. Earlier validation
 // rejected it with "step must have prompt, prompt_file, command, ...".

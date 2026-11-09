@@ -675,6 +675,11 @@ type AgentActivity struct {
 
 	// RateLimited indicates the agent has hit provider rate limits.
 	RateLimited bool `json:"rate_limited,omitempty"`
+
+	// Composer work is independent of output activity: a waiting agent can
+	// still hold an unsent draft or an already queued follow-up.
+	UnsubmittedInput bool `json:"unsubmitted_input,omitempty"`
+	QueuedMessages   bool `json:"queued_messages,omitempty"`
 }
 
 // activityStateSourceScrape marks classifier-derived activity. OSC 7501
@@ -915,6 +920,7 @@ func (sc *StateClassifier) classifyInternal(sample *VelocitySample) (*AgentActiv
 	// `DetectedPatterns` deliberately keeps the unfiltered view because it
 	// is an observability surface, not a state predicate.
 	rateLimited := isRateLimitPatternMatch(effectiveMatches)
+	composer := tmux.InspectComposer(visibleContent, tmux.AgentType(sc.agentType))
 
 	// Build result
 	activity := &AgentActivity{
@@ -929,6 +935,8 @@ func (sc *StateClassifier) classifyInternal(sample *VelocitySample) (*AgentActiv
 		StateHistory:     sc.getHistoryCopy(),
 		LastOutput:       sc.velocityTracker.LastOutputTime(),
 		RateLimited:      rateLimited,
+		UnsubmittedInput: composer.HoldsText,
+		QueuedMessages:   composer.QueuedMessages,
 	}
 
 	return activity, nil
@@ -1439,6 +1447,13 @@ func (sc *StateClassifier) SetAgentType(agentType string) {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 	sc.agentType = agentType
+}
+
+func (sc *StateClassifier) setPaneDimensions(width, height int) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	sc.paneWidth = width
+	sc.paneHeight = height
 }
 
 // ActivityMonitor manages state classifiers for multiple panes.

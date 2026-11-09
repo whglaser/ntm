@@ -1885,7 +1885,7 @@ func TestResumeFinalizationAdoptsCompletedSuccessChildBeforeRootCheckpoint(t *te
 		t.Fatalf("main fixture failed: %+v", mainResult)
 	}
 	executor.state.Steps[mainResult.StepID] = mainResult
-	tailResult := executor.executeStep(context.Background(), &workflow.PostPipelineSteps[0], workflow)
+	tailResult := executor.executeStep(finalizationContext(context.Background()), &workflow.PostPipelineSteps[0], workflow)
 	if tailResult.Status != StatusCompleted || calls != 1 {
 		t.Fatalf("tail fixture did not complete once: %+v calls=%d", tailResult, calls)
 	}
@@ -1975,6 +1975,9 @@ func TestResumeFinalizationClearsReopenedNamedOutputs(t *testing.T) {
 			cfg := resumeFinalizationConfig(t.TempDir())
 			cfg.ResumeOptions.Reset = reset
 			producer := Step{ID: "producer", Command: "printf '%s' '${vars.previous | empty}' > observed; printf new", OutputVar: "previous"}
+			if !reset {
+				producer.Command = "if [ ! -f allow-producer ]; then printf old; exit 7; fi; " + producer.Command
+			}
 			post, priorID := producer, producer.ID
 			if reset {
 				post = Step{ID: "tail", Command: "printf parent", OnSuccess: []Step{producer}}
@@ -1984,14 +1987,35 @@ func TestResumeFinalizationClearsReopenedNamedOutputs(t *testing.T) {
 				SchemaVersion: SchemaVersion, Name: "reopened-post-output", Settings: DefaultWorkflowSettings(),
 				Steps: []Step{{ID: "main", Command: "printf main"}}, PostPipelineSteps: []Step{post},
 			}
-			previous := resumeFinalizationCompletedStep(priorID, "old")
-			if !reset {
-				previous.Status = StatusFailed
+			completed := map[string]StepResult{"main": resumeFinalizationCompletedStep("main", "done")}
+			if reset {
+				completed[priorID] = resumeFinalizationCompletedStep(priorID, "old")
 			}
-			prior := resumeFinalizationSavedState(t, cfg.ProjectDir, workflow, map[string]StepResult{
-				"main": resumeFinalizationCompletedStep("main", "done"), priorID: previous,
-			})
+			prior := resumeFinalizationSavedState(t, cfg.ProjectDir, workflow, completed)
+			if !reset {
+				// Ordinary resume may reopen a proven-settled failure. Generate
+				// that evidence through the command waiter; a bare failed legacy
+				// result cannot establish that its process group stopped.
+				executor := NewExecutor(cfg)
+				executor.state, executor.graph = prior, NewDependencyGraph(workflow)
+				previous := executor.executeStep(finalizationContext(context.Background()), &workflow.PostPipelineSteps[0], workflow)
+				receipt := prior.CommandExecutions[priorID]
+				if previous.Status != StatusFailed || previous.Output != "old" || receipt.Status != commandExecutionSettled || receipt.SettledAt.IsZero() {
+					t.Fatalf("post fixture did not produce a settled failure: result=%+v receipt=%+v", previous, receipt)
+				}
+				prior.Steps[priorID] = previous
+				if err := os.WriteFile(filepath.Join(cfg.ProjectDir, "allow-producer"), nil, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
 			prior.Variables["previous"] = "stale"
+			if err := SaveState(cfg.ProjectDir, prior); err != nil {
+				t.Fatal(err)
+			}
+			prior, err := LoadState(cfg.ProjectDir, prior.RunID)
+			if err != nil {
+				t.Fatal(err)
+			}
 			state, err := NewExecutor(cfg).Resume(context.Background(), workflow, prior, nil)
 			if err != nil || state.Status != StatusCompleted {
 				t.Fatalf("Resume() = %v, %v; want completed", state, err)
@@ -2374,5 +2398,215 @@ func TestPostPipelineStepsDispatchesMO09HandbackTemplate(t *testing.T) {
 	wantContent := "MO-09 handback to 9: methodology run squad-run-2026-05-07 complete."
 	if !strings.Contains(history[0].Content, wantContent) {
 		t.Fatalf("handback paste = %q, want substring %q", history[0].Content, wantContent)
+	}
+}
+
+func TestOnFailureActionScopesCommandSettlement(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		scope      string
+		status     string
+		background bool
+		scheduler  ExecutionStatus
+		rerun      bool
+		malformed  bool
+		handled    bool
+	}{
+		{name: "direct_running", scope: "direct", status: commandExecutionRunning},
+		{name: "direct_background_ack", scope: "direct", status: commandExecutionRunning, background: true, scheduler: StatusCompleted},
+		{name: "owned_foreground_running", scope: "parallel", status: commandExecutionRunning},
+		{name: "owned_foreground_unresolved", scope: "parallel", status: commandExecutionUnresolved, scheduler: StatusFailed},
+		{name: "owned_foreach_unresolved", scope: "foreach", status: commandExecutionUnresolved, scheduler: StatusFailed},
+		{name: "background_started_without_ack", scope: "parallel", status: commandExecutionRunning, background: true, handled: true},
+		{name: "background_launch_ack", scope: "parallel", status: commandExecutionRunning, background: true, scheduler: StatusCompleted, handled: true},
+		{name: "background_starting_is_not_live_proof", scope: "parallel", status: commandExecutionStarting, background: true},
+		{name: "background_returned_failed", scope: "parallel", status: commandExecutionRunning, background: true, scheduler: StatusFailed},
+		{name: "background_returned_cancelled", scope: "parallel", status: commandExecutionRunning, background: true, scheduler: StatusCancelled},
+		{name: "background_returned_skipped", scope: "parallel", status: commandExecutionRunning, background: true, scheduler: StatusSkipped},
+		{name: "background_ack_requires_rerun", scope: "parallel", status: commandExecutionRunning, background: true, scheduler: StatusCompleted, rerun: true},
+		{name: "background_returned_unresolved", scope: "parallel", status: commandExecutionUnresolved, background: true, scheduler: StatusCompleted},
+		{name: "settled_native_failure", scope: "parallel", status: commandExecutionSettled, scheduler: StatusFailed, handled: true},
+		{name: "invalid_settlement", scope: "parallel", status: commandExecutionSettled, malformed: true},
+		{name: "invalid_background_running", scope: "parallel", status: commandExecutionRunning, background: true, scheduler: StatusCompleted, malformed: true},
+		{name: "unrelated_similar_prefix", scope: "unrelated", status: commandExecutionUnresolved, scheduler: StatusFailed, handled: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			executor := newBranchTestExecutor()
+			child := Step{ID: "child", Command: "exit 7"}
+			if tc.background {
+				child.Wait = WaitNone
+			}
+			parent := Step{ID: "group", Parallel: ParallelSpec{Steps: []Step{child}},
+				OnFailure: OnFailureSpec{Action: "use_verified_fallback"}}
+			id := "group_child"
+			switch tc.scope {
+			case "direct":
+				parent.Command, parent.Wait, parent.Parallel = child.Command, child.Wait, ParallelSpec{}
+				id = parent.ID
+			case "foreach":
+				parent.Parallel = ParallelSpec{}
+				parent.Foreach = &ForeachConfig{Items: "[\"one\"]", Steps: []Step{child}}
+				id = "group_iter0_child"
+			case "unrelated":
+				id = "group_child_shadow"
+			}
+			definition := child
+			if tc.scope == "direct" {
+				definition = parent
+			}
+			definition.ID = id
+			digest, err := commandDefinitionHash(&definition)
+			if err != nil {
+				t.Fatal(err)
+			}
+			started, finished := time.Now().Add(-time.Second), time.Now()
+			record := CommandExecutionState{
+				Version: commandExecutionVersion, StepID: id, StepHash: digest, StartedAt: started,
+				Status: tc.status, Background: tc.background, ProcessID: 123,
+			}
+			if tc.status == commandExecutionStarting {
+				record.ProcessID = 0
+			}
+			if tc.status == commandExecutionUnresolved || tc.status == commandExecutionSettled {
+				record.Result = StepResult{
+					StepID: id, AgentType: "command", Status: StatusFailed,
+					StartedAt: started, FinishedAt: finished,
+					Error: &StepError{Type: "command", Message: "recorded source failure"},
+				}
+				if tc.status == commandExecutionSettled {
+					record.SettledAt = finished
+				}
+			}
+			if tc.malformed {
+				if tc.status == commandExecutionSettled {
+					record.SettledAt = time.Time{}
+				} else {
+					record.ProcessID = 0
+				}
+			} else if err := validateCommandExecution(id, record); err != nil {
+				t.Fatalf("invalid fixture receipt: %v", err)
+			}
+			executor.state.CommandExecutions = map[string]CommandExecutionState{id: record}
+			if tc.scheduler != "" {
+				executor.state.Steps[id] = StepResult{StepID: id, Status: tc.scheduler, RerunOnResume: tc.rerun}
+			}
+			failed := StepResult{StepID: parent.ID, Status: StatusFailed,
+				Error: &StepError{Type: "command", Message: "original failure", Details: "retain the original cause"}}
+			got := executor.executeOnFailureAction(&parent, failed)
+			if tc.handled {
+				if got.Status != StatusSkipped || executor.state.Variables["runtime.group_failure_action"] != "use_verified_fallback" {
+					t.Fatalf("known failure policy was disabled by another outcome: %+v", got)
+				}
+			} else {
+				if !reflect.DeepEqual(got, failed) {
+					t.Fatalf("unknown source was handled or lost its cause: %+v", got)
+				}
+				if _, exists := executor.state.Variables["runtime.group_failure_action"]; exists {
+					t.Fatal("unknown source published a failure action")
+				}
+			}
+			if !reflect.DeepEqual(record, executor.state.CommandExecutions[id]) {
+				t.Fatal("failure policy rewrote the receipt it inspected")
+			}
+		})
+	}
+}
+
+func TestCommandSettlementUsesCurrentBackgroundAcknowledgement(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*CommandExecutionState, *StepResult)
+		want   bool
+	}{
+		{name: "current acknowledgement replaces stale failure", want: false},
+		{name: "current failure", mutate: func(_ *CommandExecutionState, result *StepResult) { result.Status = StatusFailed }, want: true},
+		{name: "current diagnostic", mutate: func(_ *CommandExecutionState, result *StepResult) {
+			result.Error = &StepError{Type: "execution_unknown", Message: "returned uncertainty"}
+		}, want: true},
+		{name: "rerunnable acknowledgement", mutate: func(_ *CommandExecutionState, result *StepResult) { result.RerunOnResume = true }, want: true},
+		{name: "different result identity", mutate: func(_ *CommandExecutionState, result *StepResult) { result.StepID = "other" }, want: true},
+		{name: "launch intent", mutate: func(record *CommandExecutionState, _ *StepResult) { record.Status = commandExecutionStarting }, want: true},
+		{name: "foreground launch", mutate: func(record *CommandExecutionState, _ *StepResult) { record.Background = false }, want: true},
+		{name: "invalid receipt", mutate: func(record *CommandExecutionState, _ *StepResult) { record.Version++ }, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			step := Step{ID: "sidecar", Command: "serve", Wait: WaitNone}
+			record := CommandExecutionState{Version: commandExecutionVersion, StepID: step.ID, StepHash: strings.Repeat("a", 64),
+				Status: commandExecutionRunning, ProcessID: 321, Background: true, StartedAt: time.Now()}
+			if err := validateCommandExecution(step.ID, record); err != nil {
+				t.Fatal(err)
+			}
+			current := StepResult{StepID: step.ID, Status: StatusCompleted}
+			if tc.mutate != nil {
+				tc.mutate(&record, &current)
+			}
+			saved := StepResult{StepID: step.ID, Status: StatusFailed, Error: &StepError{Type: "old_attempt", Message: "prior failure"}}
+			e := NewExecutor(DefaultExecutorConfig("background-acknowledgement"))
+			e.state = &ExecutionState{CommandExecutions: map[string]CommandExecutionState{step.ID: record}, Steps: map[string]StepResult{step.ID: saved}}
+			original := current
+			if got := e.hasUnresolvedCommandExecutionForOutcome(&step, &current); got != tc.want {
+				t.Fatalf("current outcome has unsettled process = %t, want %t", got, tc.want)
+			}
+			if !e.hasUnresolvedCommandExecution(&step) {
+				t.Fatal("failure-policy inspection accepted an unfinished direct command")
+			}
+			if !reflect.DeepEqual(current, original) || !reflect.DeepEqual(e.state.Steps[step.ID], saved) ||
+				!reflect.DeepEqual(e.state.CommandExecutions[step.ID], record) {
+				t.Fatal("settlement inspection changed receipt or scheduler evidence")
+			}
+		})
+	}
+
+	t.Run("acknowledgement does not hide owned uncertainty", func(t *testing.T) {
+		step := Step{ID: "sidecar", Command: "serve", Wait: WaitNone, OnSuccess: []Step{{ID: "child", Command: "work"}}}
+		record := CommandExecutionState{Version: commandExecutionVersion, StepID: step.ID, StepHash: strings.Repeat("a", 64),
+			Status: commandExecutionRunning, ProcessID: 321, Background: true, StartedAt: time.Now()}
+		childID := onSuccessChildStepID(step.ID, "child", 1)
+		child := record
+		child.StepID, child.Background = childID, false
+		e := NewExecutor(DefaultExecutorConfig("owned-uncertainty"))
+		e.state = &ExecutionState{CommandExecutions: map[string]CommandExecutionState{step.ID: record, childID: child}}
+		current := StepResult{StepID: step.ID, Status: StatusCompleted}
+		if !e.hasUnresolvedCommandExecutionForOutcome(&step, &current) {
+			t.Fatal("healthy launch acknowledgement hid an unresolved owned child")
+		}
+	})
+}
+
+func TestSuccessHookFailurePreservesSettlementAndCapacityClassification(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		err        error
+		want       string
+		wantStatus ExecutionStatus
+	}{
+		{"uncertain process", errStepProcessUnsettled, "execution_unknown", StatusFailed},
+		{"wrapped uncertainty", errors.Join(errors.New("hook stopped"), errStepProcessUnsettled), "execution_unknown", StatusFailed},
+		{"runtime capacity", ErrStepCountLimit, "step_limit", StatusFailed},
+		{"materialized capacity", ErrMaterializedStepLimit, "step_limit", StatusFailed},
+		{"propagated capacity", &stepAdmissionPropagationError{message: "child capacity"}, "step_limit", StatusFailed},
+		{"capacity precedence", errors.Join(errStepProcessUnsettled, ErrStepCountLimit), "step_limit", StatusFailed},
+		{"cancellation", context.Canceled, "cancelled", StatusCancelled},
+		{"deadline", context.DeadlineExceeded, "timeout", StatusCancelled},
+		{"cancelled uncertain process", errors.Join(context.Canceled, errStepProcessUnsettled), "execution_unknown", StatusFailed},
+		{"cancelled capacity", errors.Join(context.Canceled, ErrStepCountLimit), "step_limit", StatusFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			prior := StepResult{StepID: "parent", Status: StatusCompleted, StartedAt: time.Now(), Attempts: 2, Output: "native output",
+				Error: &StepError{Type: "child", Message: "prior diagnostic"}}
+			result := successHookExecutionFailure(prior, tc.err)
+			if result.Status != tc.wantStatus || result.Error == nil || result.Error.Type != tc.want ||
+				result.Error.Message != tc.err.Error() || result.FinishedAt.IsZero() || result.Attempts != prior.Attempts ||
+				result.Output != prior.Output || !result.StartedAt.Equal(prior.StartedAt) {
+				t.Fatalf("hook failure lost classification or native result: %+v", result)
+			}
+			if len(result.Error.Aggregated) != 1 || !reflect.DeepEqual(result.Error.Aggregated[0], *prior.Error) {
+				t.Fatalf("hook failure lost the earlier diagnostic: %+v", result.Error)
+			}
+			result.Error.Aggregated[0].Message = "changed copy"
+			if prior.Status != StatusCompleted || prior.Error.Message != "prior diagnostic" {
+				t.Fatal("failure mapper changed its successful input result")
+			}
+		})
 	}
 }

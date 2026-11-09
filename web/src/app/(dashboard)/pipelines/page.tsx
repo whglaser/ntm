@@ -9,6 +9,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { apiRequestSignal, getAuthHeaders, getBaseUrl } from "@/lib/api/client";
+import PipelineRecoveryPanel from "@/components/pipelines/PipelineRecoveryPanel";
 
 interface ApiEnvelope {
   success: boolean;
@@ -54,7 +55,7 @@ interface StepExecution {
 
 interface PipelineDetail extends PipelineSummary {
   current_step?: string;
-  steps?: StepExecution[];
+  steps?: Record<string, StepExecution>;
   duration_ms?: number;
   error?: string;
 }
@@ -74,6 +75,7 @@ interface TemplatesResponse extends ApiEnvelope {
 
 type Notice = { type: "success" | "error"; message: string };
 type StatusFilter = "all" | "running" | "completed" | "failed" | "cancelled";
+const PIPELINE_STARTUP_TIMEOUT_MS = 30_000;
 
 async function apiFetch<T>(path: string, options: RequestInit = {}): Promise<T> {
   const baseUrl = getBaseUrl();
@@ -262,6 +264,20 @@ export default function PipelinesPage() {
   }, [pipelinesList, selectedRunId]);
 
   const pipelineDetail = detailQuery.data;
+  const pipelineSteps = useMemo(() => {
+    const startedAt = (step: StepExecution) => {
+      const timestamp = Date.parse(step.started_at ?? "");
+      return Number.isFinite(timestamp) ? timestamp : Number.POSITIVE_INFINITY;
+    };
+    return Object.values(pipelineDetail?.steps ?? {}).sort(
+      (left, right) => startedAt(left) - startedAt(right) || left.id.localeCompare(right.id)
+    );
+  }, [pipelineDetail?.steps]);
+
+  const handleRecoveryAccepted = useCallback((runId: string) => {
+    void queryClient.invalidateQueries({ queryKey: ["pipelines"], exact: true });
+    void queryClient.invalidateQueries({ queryKey: ["pipelines", runId], exact: true });
+  }, [queryClient]);
 
   const handleRun = useCallback(async () => {
     if (!runForm.workflowFile || !runForm.session) {
@@ -276,6 +292,7 @@ export default function PipelinesPage() {
       }
       await apiFetch<ApiEnvelope>("/api/v1/pipelines/run", {
         method: "POST",
+        signal: runForm.background ? apiRequestSignal(PIPELINE_STARTUP_TIMEOUT_MS) : undefined,
         body: JSON.stringify({
           workflow_file: runForm.workflowFile,
           session: runForm.session,
@@ -305,7 +322,7 @@ export default function PipelinesPage() {
         method: "POST",
       });
       queryClient.invalidateQueries({ queryKey: ["pipelines"] });
-      setStatusNotice({ type: "success", message: "Pipeline cancelled." });
+      setStatusNotice({ type: "success", message: "Cancellation requested." });
     } catch (error) {
       setStatusNotice({ type: "error", message: getErrorMessage(error) });
     } finally {
@@ -323,10 +340,11 @@ export default function PipelinesPage() {
       }
       await apiFetch<ApiEnvelope>(`/api/v1/pipelines/${selectedRunId}/resume`, {
         method: "POST",
-        body: JSON.stringify({ session: selectedPipeline.session }),
+        signal: apiRequestSignal(PIPELINE_STARTUP_TIMEOUT_MS),
+        body: JSON.stringify({ background: true }),
       });
       queryClient.invalidateQueries({ queryKey: ["pipelines"] });
-      setStatusNotice({ type: "success", message: "Pipeline resumed." });
+      setStatusNotice({ type: "success", message: "Pipeline resume started." });
     } catch (error) {
       setStatusNotice({ type: "error", message: getErrorMessage(error) });
     } finally {
@@ -612,13 +630,13 @@ export default function PipelinesPage() {
               </div>
 
               {/* Steps */}
-              {pipelineDetail?.steps && pipelineDetail.steps.length > 0 && (
+              {pipelineSteps.length > 0 && (
                 <div className="rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 p-4 space-y-3">
                   <div className="text-sm font-semibold text-gray-900 dark:text-white">
                     Steps
                   </div>
                   <div className="space-y-2">
-                    {pipelineDetail.steps.map((step, idx) => (
+                    {pipelineSteps.map((step, idx) => (
                       <div
                         key={step.id}
                         className={`rounded-md border-l-4 p-3 ${stepStatusColor(
@@ -656,6 +674,14 @@ export default function PipelinesPage() {
                     ))}
                   </div>
                 </div>
+              )}
+
+              {(selectedPipeline.status === "failed" || selectedPipeline.status === "cancelled") && (
+                <PipelineRecoveryPanel
+                  runId={selectedPipeline.run_id}
+                  request={apiFetch}
+                  onAccepted={handleRecoveryAccepted}
+                />
               )}
             </div>
           )}

@@ -46,11 +46,47 @@ A failed cancellation write still signals the worker, but returns HTTP 503 with
 `cancellation_requested: true` in the error details instead of claiming durable
 success. A completed/failed/cancelled row cannot be cancelled again (HTTP 409).
 
+On persistent servers, the worker saves its final receipt before GET/list can
+report completion. If that save fails after the engine returns, the job reports
+`failed` and retains the complete observed result, with `result.observed_status`,
+`result.outcome_unknown: true`, and `result._journal_error`. The engine may already
+have completed its work: inspect the retained run, session, or pane identities
+before deciding whether to retry. An existing cancellation keeps `cancelled` and
+its original reason while retaining the worker's final evidence.
+
+The last durable job checkpoint remains available for restart recovery. An
+independent durable `operation_id` receipt remains authoritative, so repeating
+that operation ID returns its recorded outcome without running the engine again.
+Late progress callbacks cannot replace a terminal receipt after worker ownership
+is released.
+
 Shutdown closes admission permanently, cancels the service-owned contexts, and
 waits for receipt preparation and finalization as well as active execution. A
 shutdown deadline is respected even when a checkpoint holds the store mutex.
 The existing journal owner/worker fences remain responsible for preventing a new
 process from recovering work that is still alive.
+
+## Startup history and recovery
+
+Startup retains the newest 1,000 job receipts for GET/list. Recovery reads the
+directory in bounded batches and limits retained result payloads while reading,
+so a server with years of journal history does not first load every historical
+result into memory. The retention order matches ordinary job-store eviction:
+older creation times are discarded from the in-memory view first, with smaller
+job IDs discarded first when creation times tie.
+
+The retention window does not limit safety checks. Every stored job receipt is
+validated and every worker fence is checked before any interrupted receipt is
+changed. Corrupt or oversized evidence and live worker fences block startup even
+when they belong to jobs outside the retained window. Recovery updates every
+interrupted receipt on disk, including older ones, and verifies the completed
+recovery before publishing history. A cancelled job keeps its cancellation reason
+while unfinished progress becomes an explicit unknown outcome.
+
+Retention does not delete journal files, expire durable `operation_id` receipts,
+or replay work. Older receipts remain in the state database's `.jobs` directory
+for inspection even when their jobs are no longer exposed by GET/list. Repeating
+recovery preserves already-recorded outcomes and interruption evidence.
 
 ## Session-aware execution
 

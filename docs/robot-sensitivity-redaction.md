@@ -6,6 +6,302 @@ This document defines sensitivity classification, redaction, and disclosure-cont
 
 Robot mode surfaces expose richer operational data than interactive output. This creates risk: pane output, mail content, command arguments, and diagnostic evidence may contain secrets, credentials, PII, or internal addresses. This contract ensures robot payloads remain safe by default while preserving agent ergonomics.
 
+## REST Request Integrity
+
+`ntm serve` treats request admission separately from output redaction. When REST
+redaction is enabled, `redact` and `block` both reject JSON requests with detected
+secrets before handlers or idempotency replay run. Accepted request bytes remain
+unchanged. No route receives a credential or instruction replaced by a redaction
+placeholder, even when such a replacement would preserve JSON syntax.
+
+This policy applies to every `/api/v1` request body, regardless of `Content-Type`,
+because the API handlers decode JSON even when the header is missing or mislabeled.
+Declared `application/json` bodies elsewhere are also checked. Empty bodies remain
+available to routes with optional input. Nonempty malformed JSON without detected
+secrets is rejected with `400 BAD_REQUEST`; an unreadable body is also rejected
+without forwarding its partial contents. Bodies above 10 MiB return `413 REQUEST_TOO_LARGE`, including
+chunked bodies and bodies whose first 10 MiB happen to form valid JSON.
+
+| Configuration | Detected secret in a JSON request |
+|---------------|----------------------------------|
+| Enabled `redact` | Reject with `422 SECRETS_DETECTED` |
+| Enabled `block` | Reject with `422 SECRETS_DETECTED` |
+| `warn`, `off`, or disabled REST redaction | No secret-based rejection or substitution by this middleware |
+| Explicitly allowlisted match or disabled category | Original bytes pass if no other findings require rejection |
+
+The CLI enables REST redaction for `redact` and `block`; its default `warn` mode
+does not enable this middleware. Existing allowlists and category settings still
+govern detection. Allowlisting is an explicit operator policy choice and also
+affects output handling; removing a real credential from a request is preferable
+to broadening the allowlist merely to get a request accepted.
+
+Secret rejections use the normal API error envelope. `details.findings_count`
+reports the total, and `details.findings` contains up to 100 objects with only
+`category`, `start`, and `end`. Locations are zero-based byte offsets in the
+original body, with an exclusive `end`. `findings_truncated: true` indicates that
+more locations were omitted. The error and hint explain the refusal. Diagnostics
+never include raw matches, credential hashes, arbitrary field names, body excerpts,
+or decoder error text. Logs retain the request summary and category counts.
+
+JSON admission examines the strings that a handler can decode, including
+property names and JSON documents embedded inside strings. Another layer of
+escaping cannot hide a detected credential from this inspection. Configured
+extra patterns are checked against both the raw input and decoded strings on
+JSON API surfaces, including anchored patterns on complete string values.
+Existing raw, intermediate, and logical match allowlists remain effective, and
+disabled categories keep their existing field semantics. This uses the same
+scanner and maps findings back through the original escape sequences; it never
+decodes the whole request into a map or reserializes accepted input. Duplicate
+properties, exact number spellings, and whitespace remain intact. Generic text
+and log callers retain their existing scanning contract.
+
+Policy update and supplied-content validation also inspect the typed policy
+after YAML decoding. YAML escapes and `!!binary` scalars can reveal credentials
+that are absent from the outer JSON strings. This check runs before policy
+validation can quote a decoded value and before path resolution, directory
+creation, or storage. A refusal reports `source: "policy"`, `findings_count`, and
+category counts, with no offsets that could be mistaken for original request
+locations. Accepted YAML is saved exactly as submitted, including comments,
+quoting, and formatting; the inspection copy is never written to disk. Enforcing
+modes use a static syntax/schema diagnostic if YAML decoding fails, because
+decoder errors can contain sensitive scalar or field-name fragments. Existing
+off/warn and explicit allowlist behavior still applies.
+
+### Inspection limits
+
+Enforcing REST policies use a bounded scanner. If it cannot finish inspecting
+the complete input, request admission returns `422 REDACTION_INSPECTION_LIMIT`
+with a static `source` of `body`, `path`, `query`, or `policy`. The outer JSON and
+URL checks run before handlers and idempotency replay; decoded-policy checks run
+before validation diagnostics or side effects. Request values remain unchanged.
+The diagnostic does not
+claim that a secret was found and does not include partial findings or excerpts.
+A corrected request can use the same idempotency key.
+
+| Resource | Default inspection limit |
+|----------|--------------------------|
+| Each input | 100 MiB; the HTTP request-body limit remains 10 MiB |
+| Each result and generated finding data | 100 MiB of size accounting |
+| Raw match candidates | 16,384 per scanner operation |
+| JSON structural tokens and records | 65,536 per scanner operation |
+| Cumulative inspection work | 1 GiB of charged subject bytes, including fixed per-read accounting |
+| Decoded JSON-string nesting | 32 layers |
+| Configured patterns, category names, and disabled-category entries | 256 entries and 64 KiB of text |
+
+Candidates are charged before rejection filters or allowlists run. Decoded
+representations, normalization, mapping, and repeated allowlist subjects consume
+the same work budget. Token and candidate limits are enforced before allocating
+unbounded regex result lists or JSON record/key collections. Generated findings
+and replacement expansion are checked before materializing the result. These
+are deterministic resource bounds, not a wall-clock deadline or a limit on all
+memory used by the HTTP handler.
+
+URL path/query inspection shares one scanner across repeated values, and archive
+inspection shares one scanner across names, headers, entries, and decoded gzip
+members. Configured regexes are prepared once for the operation. Exhaustion
+remains sticky; later small pieces cannot turn it into a completed clean scan.
+Archive exhaustion returns the existing `422 CHECKPOINT_INSPECTION_LIMIT` before
+import publication/overwrite or export delivery. Explicit allowlists do not
+authorize content that was never completely inspected.
+
+Output inspection preserves the distinction between admission and a completed
+operation. An incomplete initial or residual response scan uses the existing
+`RESPONSE_REDACTION_FAILED` envelope and keeps the handler's status. Event streams
+withhold the affected frame through their existing stop/reset paths. Unverified
+request IDs receive independent generated IDs; unsafe or unverified cached
+identity headers and checkpoint references are withheld. Logs use safe fallback
+fields and may report `inspection_limited: true` without source contents.
+
+Enforcing policies also bound non-streaming response capture to the scanner's
+100 MiB input ceiling, before appending each write. Missing or late content-type
+headers cannot bypass this bound. Overflow releases the captured buffer and
+withholds the entire representation, including its prefix, through the same
+`RESPONSE_REDACTION_FAILED` envelope. Later writes and flushes cannot restore
+forwarding. The handler still finishes with its original status, allowing
+idempotency bookkeeping to retain the completed result or its existing bounded
+inspection receipt. The replacement has JSON headers rather than the original
+archive encoding, disposition, range, or content validators. Accepted checkpoint
+archives remain within the capture budget, and independently protected SSE
+frames can continue streaming after their initial buffer is released. This
+bounds middleware-owned capture, not allocations made inside a handler or its
+JSON encoder before writing. Off/warn behavior remains unchanged.
+
+The bounded APIs and reusable `redaction.Scanner` share the same detection engine
+as the existing text/JSON APIs. Their explicit `LimitExceeded` result also sets
+`Blocked`, with empty `Findings` and `Output`; an empty finding slice alone never
+establishes successful inspection. Existing unbounded callers and REST off/warn
+behavior retain their semantics. Within the budget, priority, allowlisting,
+disabled categories, decoded JSON handling, and original byte offsets remain
+unchanged. Overlap detection uses indexed interval coverage; differential tests
+compare its complete results with the former implementation.
+
+### Why requests are rejected
+
+The handlers require exact input for several different reasons:
+
+| Handler surface | Integrity requirement |
+|-----------------|-----------------------|
+| `PUT /api/v1/policy/` | Saves the submitted policy text to disk |
+| `POST /api/v1/approvals/request` | Persists actions, resources, and reasons; also logs the action |
+| Agent `/send` and pane `/input` | Dispatch the submitted instruction or text |
+| Jobs and pipelines | Execute work and persist inputs or decisions |
+| Pipeline `/recover` | Records an operator's exact acceptance reason |
+| Safety and validation routes | Must evaluate the caller's actual input |
+
+Substituting placeholders on selected routes would change what is stored,
+executed, or validated. Passing original detected secrets through while redacting
+only responses would also permit them into existing handler logs and persistence.
+Uniform rejection avoids both problems and applies to future API handlers too.
+A refused request leaves the idempotency key available for a corrected submission.
+
+Idempotency replay also verifies the entire request body within the same 10 MiB
+limit. Reusing a key with different bytes anywhere in the accepted body returns
+`422 IDEMPOTENT_REPLAY`; an equal prefix is insufficient. Unreadable, oversized,
+or canceled bodies cannot dispatch a handler or retrieve a cached success. A
+successful read restores the exact submitted bytes, and refused reads do not
+reserve the key or replace an existing cached result. These replay-integrity
+checks also apply when redaction is disabled.
+
+A terminal result also remains protected when its response is too large to
+cache. Above the 1 MiB response limit, a successful result or an explicitly
+retained post-publication error keeps a bounded inspection receipt. The original
+request still receives its full response and original status. A same-key retry
+returns `409 IDEMPOTENCY_RESULT_UNAVAILABLE`, with `original_status`,
+`response_unavailable: true`, `inspection_required: true`, and `retry_safe: false`;
+it does not run the handler again. Different request bytes still return
+`422 IDEMPOTENT_REPLAY`. Ordinary validation failures remain retryable. Flight
+acquisition checks for a completed result while holding its lock, so a completion
+between a cache miss and acquisition cannot create a second executor. These
+guarantees use the existing bounded in-memory cache: expiry, eviction, and server
+restart still require inspecting affected state before retrying a mutation.
+
+### Request metadata and diagnostics
+
+Enabled `redact` and `block` also inspect URL paths and query values before
+handlers or idempotency replay. These values can name stored resources, select
+actions, or enter handler logs. Detected secrets return `422 SECRETS_DETECTED`,
+with `details.source` set to `path` or `query`; no submitted value is replaced.
+Inspection includes decoded query keys paired with every repeated value, generic
+credential fields, and JSON embedded in query strings. Invalid query encoding
+returns `400 BAD_REQUEST` without exposing parser text. Accepted paths, query
+ordering, escaping, duplicate values, and request bodies remain unchanged.
+
+The complete supplied `X-Request-Id` is checked before sanitization or truncation.
+If sensitive, it receives a new independent identifier used consistently in
+response headers, errors, logs, and audit records. It is never replaced with a
+credential-derived placeholder. An idempotent replay also checks cached
+correlation and `Location` headers against the current request policy, withholding
+unsafe identities instead of exposing a value cached under an older policy or
+substituting a different identity. A sensitive `Origin` is refused with `403`
+before CORS can reflect it, even if its host would otherwise be allowed.
+Authentication still receives the exact supplied authentication headers.
+
+Request, authentication, permission-denial, panic, and redaction-summary logs
+protect their diagnostic copies. Audit records protect the same observations
+before JSONL or SQLite persistence, including User-Agent, principal, resource
+identifiers, and handler-provided details. Status, action, duration, correlation,
+and non-sensitive context remain useful; ambiguous custom-pattern replacements
+withhold the affected diagnostic field. The operational request and identity
+used for authorization are not rewritten. A request pins one policy for
+correlation, admission, and diagnostics; streaming frames retain their separate
+current-policy checks. Off/warn, disabled REST redaction, explicit allowlists,
+and disabled categories retain their documented behavior.
+
+### Response integrity
+
+Response redaction remains separate: JSON output in both `redact` and `block`
+modes keeps its structure and safe neighboring fields. A response is processed
+after its handler runs, so output filtering preserves the handler's HTTP status.
+If a custom pattern crosses a JSON boundary that cannot be safely rewritten, the
+server withholds the response body and returns a valid JSON object with
+`response_unavailable: true` and `error_code: "RESPONSE_REDACTION_FAILED"`.
+Its hint explains that the handler has already run and may have completed the
+operation; inspect the operation's state before retrying. This is not a request
+rejection and does not imply a rollback. The original body and pattern details
+are never included in that diagnostic. Responses without findings retain their
+exact bytes, including large integers, whitespace, and duplicate object keys.
+Flushing a JSON response does not bypass protection: buffering continues until
+the complete document can be checked, even when a credential spans writes.
+
+The existing pipeline recovery response
+exception preserves the exact 64-character lowercase hexadecimal `receipt_token`
+only on `/api/v1/pipelines/<id>/recover`. Clients submit it under the request's
+`receipt` field; there is no new request-redaction exception. A sensitive recovery
+reason is rejected before the journal changes, and a corrected reason can still
+use the same receipt.
+
+### Streaming output
+
+Enabled `redact` and `block` policies also protect server event payloads in
+WebSocket live delivery, persisted replay, attention subscriptions, and both SSE
+routes (`/events` and `/api/v1/attention/stream`). Each complete JSON payload is
+serialized and checked before disclosure. This retains credential field-name
+context and covers typed maps, structs, arrays, and raw JSON without rounding
+large numeric cursors through floating-point values. The shared source event is
+not rewritten. WebSocket persistence and live delivery use the same serialized
+payload; historical replay is checked against the current policy even if the
+original record was stored while redaction was disabled. Complete existing
+redaction markers remain stable when replayed.
+
+Routing metadata is refused if it contains detected secrets rather than being
+replaced with a different topic or event type. Unsafe WebSocket events trigger
+a reset or a failed attention subscription requiring resynchronization. Delivery
+cannot silently continue past an event withheld by redaction. SSE checks each
+complete frame, including replay and heartbeat diagnostics, using the current
+configuration. It closes the stream on an unsafe frame or a frame above 10 MiB
+without emitting a partial or truncated event. Diagnostic logs contain static
+failure reasons and finding counts, never source payloads or marshaler errors.
+
+### Checkpoint archives
+
+Checkpoint import and export require an additional check because JSON scanning
+cannot see credentials inside base64 or compressed archive entries. With enabled
+`redact` or `block`, imports inspect the decoded archive before checkpoint creation
+or overwrite. Exports inspect the completed archive before either a binary
+download or an inline base64 response. Accepted exports use the exact inspected
+snapshot. An unsafe inline JSON envelope is refused too, so response redaction
+cannot silently replace part of the base64 archive.
+
+Recovery commands and Git patches must retain their intended values. Detected
+secrets therefore cause `422 CHECKPOINT_SENSITIVE_CONTENT`, with a static message
+and no credential contents or artifact names. The server does not rewrite those
+values. Rejected imports leave existing checkpoints untouched, and rejected
+exports leave source recovery data intact. The existing `redact_secrets` export
+option still explicitly sanitizes scrollback; the resulting archive must pass
+inspection of its remaining contents as well.
+
+Inspection covers selected entries, archive names and metadata, and decoded gzip
+scrollback, including headers and payloads across concatenated gzip members.
+Checksums and trailers must complete successfully. Limits are 64 MiB for the
+encoded snapshot, 100 MiB per expanded entry, 1 GiB for aggregate expanded data,
+and 4,096 entries or gzip members. Tar expansion also includes internal extension
+headers, and post-archive zero padding is limited to 1 MiB. Exceeding a limit
+returns `422 CHECKPOINT_INSPECTION_LIMIT`. An unreadable or malformed import
+returns `400 BAD_REQUEST`; an export that cannot be inspected returns
+`500 INTERNAL_ERROR`. The ordinary 10 MiB HTTP request limit still applies to
+the complete import JSON body, including its base64 field.
+
+Allowlists and enabled detection categories continue to govern these checks.
+`warn`, `off`, and disabled REST redaction retain their existing behavior.
+
+An import error after publication is different from an admission refusal. If the
+complete checkpoint was observed at its destination but finalization failed, the
+API returns `500 CHECKPOINT_IMPORT_FINALIZATION_FAILED` with
+`publication_state: "published"`. A publication attempt whose outcome cannot be
+confirmed returns `500 CHECKPOINT_IMPORT_PUBLICATION_UNCERTAIN` with
+`publication_state: "unknown"`. Both report `inspection_required: true`,
+`finalization_complete: false`, and `retry_safe: false`. Neither establishes that
+the previous checkpoint is unchanged. A published checkpoint reference is exact
+or explicitly withheld if it contains sensitive content; paths, commands, and
+underlying error text are never included in these diagnostics.
+
+These terminal error receipts are retained for same-key idempotency replay, so a
+retry does not repeat an import while its receipt remains cached. A different
+body with that key still conflicts. Ordinary pre-publication validation errors
+remain retryable. Retention uses the existing bounded in-memory cache, so expiry,
+eviction, and server restart do not provide a durable retry guarantee. Inspect
+the destination checkpoint and retained recovery evidence before importing again.
+
 ## Disclosure States
 
 Every disclosable field has a disclosure state:

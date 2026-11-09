@@ -571,6 +571,9 @@ func (g *DependencyGraph) validatePhaseOwnership(state *ExecutionState) []Depend
 		for id := range state.CommandExecutions {
 			ids[id] = true
 		}
+		for id := range state.CommandEvaluations {
+			ids[id] = true
+		}
 		for id := range state.AgentDeliveries {
 			ids[id] = true
 		}
@@ -587,6 +590,9 @@ func (g *DependencyGraph) validatePhaseOwnership(state *ExecutionState) []Depend
 			ids[id] = true
 		}
 		for id := range state.ParallelState {
+			ids[id] = true
+		}
+		for id := range state.SuccessHooks {
 			ids[id] = true
 		}
 	}
@@ -631,6 +637,9 @@ func (g *DependencyGraph) validatePhaseOwnership(state *ExecutionState) []Depend
 func resolveScopedRuntimeChildren(parentID, runtimeID string, parent *Step) (*Step, string, bool) {
 	if decision, canonicalID, ok := branchDecisionRuntimeStep(parentID, runtimeID, parent); ok {
 		return decision, canonicalID, true
+	}
+	if recovery, ok := onFailureRuntimeStep(parentID, runtimeID, parent); ok {
+		return recovery, runtimeID, true
 	}
 	for i := range parent.OnSuccess {
 		child := &parent.OnSuccess[i]

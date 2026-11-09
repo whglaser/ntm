@@ -660,14 +660,17 @@ func newPipelineCancelCmd() *cobra.Command {
 // newPipelineResumeCmd creates the "pipeline resume" subcommand
 func newPipelineResumeCmd() *cobra.Command {
 	var (
-		session        string
-		background     bool
-		mode           string
-		keepState      bool
-		maxResumeAge   string
-		onRosterChange string
-		stepID         string
-		iteration      int
+		session                     string
+		background                  bool
+		mode                        string
+		keepState                   bool
+		maxResumeAge                string
+		onRosterChange              string
+		stepID                      string
+		iteration                   int
+		maxSelectorOutputBytesTotal int64
+		maxStepCountTotal           int
+		maxMaterializedStepNodes    int
 	)
 
 	cmd := &cobra.Command{
@@ -691,6 +694,13 @@ After inspection and stopping any surviving command processes,
 --mode=force-iter deliberately repeats the selected iteration and later ones.
 These explicit restart choices may repeat side effects.
 
+If retained selector output exhausts its aggregate budget, raise
+--max-selector-output-bytes-total for this resume attempt. Existing selector
+outcomes stay intact; the saved workflow's limits remain unchanged.
+Use --max-step-count-total to raise distinct runtime-step admission capacity,
+or --max-materialized-step-nodes to raise transient planning capacity. These
+overrides also apply only to this attempt and do not authorize replay.
+
 Examples:
   # Resume a specific pipeline
   ntm pipeline resume run-20241230-123456-abcd --session myproject
@@ -701,13 +711,25 @@ Examples:
   # Resume will pick up from the last incomplete step`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if maxSelectorOutputBytesTotal < 0 {
+				return fmt.Errorf("--max-selector-output-bytes-total must be zero or positive")
+			}
+			if maxStepCountTotal < 0 {
+				return fmt.Errorf("--max-step-count-total must be zero or positive")
+			}
+			if maxMaterializedStepNodes < 0 {
+				return fmt.Errorf("--max-materialized-step-nodes must be zero or positive")
+			}
 			runID := args[0]
 			resumeOpts := pipeline.ResumeOptions{
-				Mode:           pipeline.ResumeMode(mode),
-				KeepState:      keepState,
-				OnRosterChange: pipeline.ResumeRosterChangePolicy(onRosterChange),
-				StepID:         stepID,
-				Iteration:      iteration,
+				Mode:                        pipeline.ResumeMode(mode),
+				KeepState:                   keepState,
+				OnRosterChange:              pipeline.ResumeRosterChangePolicy(onRosterChange),
+				StepID:                      stepID,
+				Iteration:                   iteration,
+				MaxSelectorOutputBytesTotal: maxSelectorOutputBytesTotal,
+				MaxStepCountTotal:           maxStepCountTotal,
+				MaxMaterializedStepNodes:    maxMaterializedStepNodes,
 			}
 			// normalizeResumeOptions derives KeepState from Reset (bd-uyjdn), so a
 			// KeepState:false set here alone was silently flipped back to true and
@@ -975,6 +997,9 @@ Examples:
 	cmd.Flags().StringVar(&mode, "mode", string(pipeline.ResumeModeContinue), "Resume mode: continue, restart-failed, force-iter")
 	cmd.Flags().BoolVar(&keepState, "keep-state", true, "Preserve completed step outputs while resuming")
 	cmd.Flags().StringVar(&maxResumeAge, "max-resume-age", "", "Refuse to resume state older than this duration (for example 7d, 24h)")
+	cmd.Flags().Int64Var(&maxSelectorOutputBytesTotal, "max-selector-output-bytes-total", 0, "Override the selector output budget in bytes for this resume attempt (0 uses the saved workflow)")
+	cmd.Flags().IntVar(&maxStepCountTotal, "max-step-count-total", 0, "Override distinct runtime-step admission capacity for this resume attempt (0 uses the saved workflow)")
+	cmd.Flags().IntVar(&maxMaterializedStepNodes, "max-materialized-step-nodes", 0, "Override transient step-planning capacity for this resume attempt (0 uses the saved workflow)")
 	cmd.Flags().StringVar(&onRosterChange, "on-roster-change", string(pipeline.ResumeRosterAbort), "Roster-change policy: abort or proceed")
 	cmd.Flags().StringVar(&stepID, "step-id", "", "Step ID used with --mode=force-iter")
 	cmd.Flags().IntVar(&iteration, "iteration", 0, "Iteration index used with --mode=force-iter")
@@ -987,12 +1012,12 @@ Examples:
 func newPipelineRecoverCmd() *cobra.Command {
 	var stepID, receipt, reason, outputFile string
 	var artifacts []string
-	var acceptDelivery, acceptCommand, adoptOrphan, stopOrphan bool
+	var acceptDelivery, acceptCommand, acceptSelector, adoptOrphan, stopOrphan bool
 	var exitCode int
 	cmd := &cobra.Command{
 		Use:   "recover <run-id>",
-		Short: "Inspect and reconcile interrupted pipeline deliveries and commands",
-		Long: `Inspect durable delivery and command receipts after a pipeline interruption.
+		Short: "Inspect and reconcile interrupted pipeline deliveries, commands, and selectors",
+		Long: `Inspect durable delivery, command, and selector receipts after a pipeline interruption.
 
 With no flags, shows delivery identities and receipt tokens without changing the
 run. After verifying that the original agent received its prompt, use
@@ -1039,6 +1064,21 @@ inspection cannot see with one or more --artifact paths (for example a run
 whose frozen workflow predates output declarations). Neither action resends
 the prompt or restarts the step.
 
+For an interrupted shell branch, external foreach source, or bead query, use
+--accept-selector after independently verifying that the original selector AND
+all its descendants have finished. Supply its exact --step-id and --receipt,
+a non-empty --reason, an explicit --exit-code (0 to 255), and --output-file
+containing its complete stdout. Selector stdout is retained byte-for-byte,
+including non-UTF-8 data, and is subject to the saved capture limits.
+Acceptance records an operator-observed outcome without launching the source,
+choosing a branch, admitting items, or replacing already-consumed results.
+Ordinary resume checks the original selector definition and expanded invocation
+before using successful output. A nonzero accepted exit code follows normal
+failure handling without rerunning the source. A receipt without the original
+invocation identity, an already-admitted source, or a completed enclosing scope
+cannot be accepted. The accepted outcome is immutable; intentional reevaluation
+still requires an explicit replay scope.
+
 Run from the project containing the saved pipeline state.
 
 Examples:
@@ -1050,6 +1090,10 @@ Examples:
     --receipt <token-from-inspection> --accept-command --exit-code 0 \
     --output-file migration-output.txt \
     --reason "Verified the migration and all child processes finished successfully"
+  ntm pipeline recover run-20241230-123456-abcd --step-id choose \
+    --receipt <token-from-inspection> --accept-selector --exit-code 0 \
+    --output-file selector-stdout.bin \
+    --reason "Verified the original source and all descendants finished"
   ntm pipeline resume run-20241230-123456-abcd --mode=continue`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -1066,26 +1110,24 @@ Examples:
 					"success": false, "run_id": runID, "error": err.Error(), "error_code": code,
 				}, err)
 			}
-			if acceptDelivery && acceptCommand {
-				return fail(errors.New("--accept-delivery and --accept-command are mutually exclusive"))
-			}
 			decisions := 0
-			for _, selected := range []bool{acceptDelivery, acceptCommand, adoptOrphan, stopOrphan} {
+			for _, selected := range []bool{acceptDelivery, acceptCommand, acceptSelector, adoptOrphan, stopOrphan} {
 				if selected {
 					decisions++
 				}
 			}
 			if decisions > 1 {
-				return fail(errors.New("--accept-delivery, --accept-command, --adopt-orphan, and --stop-orphan are mutually exclusive"))
+				return fail(errors.New("--accept-delivery, --accept-command, --accept-selector, --adopt-orphan, and --stop-orphan are mutually exclusive"))
 			}
+			acceptOutcome := acceptCommand || acceptSelector
 			commandFields := cmd.Flags().Changed("exit-code") || cmd.Flags().Changed("output-file")
 			if decisions == 0 && (cmd.Flags().Changed("step-id") || cmd.Flags().Changed("receipt") || cmd.Flags().Changed("reason") || commandFields) {
-				return fail(errors.New("recovery decision fields require --accept-delivery, --accept-command, --adopt-orphan, or --stop-orphan"))
+				return fail(errors.New("recovery decision fields require --accept-delivery, --accept-command, --accept-selector, --adopt-orphan, or --stop-orphan"))
 			}
-			if !acceptCommand && commandFields {
-				return fail(errors.New("--exit-code and --output-file require --accept-command"))
+			if !acceptOutcome && commandFields {
+				return fail(errors.New("--exit-code and --output-file require --accept-command or --accept-selector"))
 			}
-			if (acceptDelivery || acceptCommand) && (strings.TrimSpace(stepID) == "" || strings.TrimSpace(receipt) == "" || strings.TrimSpace(reason) == "") {
+			if (acceptDelivery || acceptOutcome) && (strings.TrimSpace(stepID) == "" || strings.TrimSpace(receipt) == "" || strings.TrimSpace(reason) == "") {
 				return fail(errors.New("acceptance requires --step-id, --receipt, and a non-empty --reason"))
 			}
 			if (adoptOrphan || stopOrphan) && (strings.TrimSpace(stepID) == "" || strings.TrimSpace(reason) == "") {
@@ -1094,14 +1136,14 @@ Examples:
 			if len(artifacts) > 0 && !adoptOrphan {
 				return fail(errors.New("--artifact requires --adopt-orphan"))
 			}
-			if acceptCommand && (!cmd.Flags().Changed("exit-code") || !cmd.Flags().Changed("output-file") || strings.TrimSpace(outputFile) == "" || exitCode < 0 || exitCode > 255) {
-				return fail(errors.New("--accept-command requires an explicit --exit-code from 0 to 255 and --output-file"))
+			if acceptOutcome && (!cmd.Flags().Changed("exit-code") || !cmd.Flags().Changed("output-file") || strings.TrimSpace(outputFile) == "" || exitCode < 0 || exitCode > 255) {
+				return fail(errors.New("--accept-command or --accept-selector requires an explicit --exit-code from 0 to 255 and --output-file"))
 			}
 			projectDir, err := resolvePipelineProjectDirForSession(cmd.Context(), "")
 			if err != nil {
 				return fail(err)
 			}
-			if acceptCommand {
+			if acceptOutcome {
 				if err := cmd.Context().Err(); err != nil {
 					return fail(err)
 				}
@@ -1136,6 +1178,27 @@ Examples:
 				}
 				if err := cmd.Context().Err(); err != nil {
 					return fail(err)
+				}
+				if acceptSelector {
+					result, err := pipeline.AcceptCommandEvaluationContext(cmd.Context(), projectDir, runID, stepID, receipt, reason, exitCode, captured)
+					if err != nil {
+						return fail(err)
+					}
+					if jsonOutput {
+						return json.NewEncoder(cmd.OutOrStdout()).Encode(map[string]interface{}{
+							"success": true, "run_id": result.RunID, "workflow": result.WorkflowID,
+							"session": result.Session, "selector": result.Selector, "replayed": result.Replayed,
+							"resume_command": []string{"ntm", "pipeline", "resume", result.RunID, "--mode=continue"},
+						})
+					}
+					verb := "Accepted"
+					if result.Replayed {
+						verb = "Previously accepted"
+					}
+					fmt.Fprintf(cmd.OutOrStdout(), "%s selector result for step %s in run %s.\n", verb,
+						pipeline.SanitizeDescriptionForTerminal(result.Selector.StepID), pipeline.SanitizeDescriptionForTerminal(result.RunID))
+					fmt.Fprintln(cmd.OutOrStdout(), "Resume this run with 'ntm pipeline resume' to interpret the recorded outcome and continue.")
+					return nil
 				}
 				result, err := pipeline.AcceptCommandExecutionContext(cmd.Context(), projectDir, runID, stepID, receipt, reason, exitCode, string(captured))
 				if err != nil {
@@ -1219,11 +1282,16 @@ Examples:
 			if err != nil {
 				return fail(err)
 			}
+			selectors, err := pipeline.InspectCommandEvaluationRecovery(cmd.Context(), projectDir, runID)
+			if err != nil {
+				return fail(err)
+			}
 			if jsonOutput {
 				return json.NewEncoder(cmd.OutOrStdout()).Encode(map[string]interface{}{
 					"success": true, "run_id": inspection.RunID, "workflow": inspection.WorkflowID,
 					"session": inspection.Session, "deliveries": inspection.Deliveries, "commands": commands.Commands,
 					"orphaned_turns": orphans.Turns,
+					"selectors":      selectors.Selectors,
 				})
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "Pipeline %s (%s)\n", pipeline.SanitizeDescriptionForTerminal(inspection.RunID), pipeline.SanitizeDescriptionForTerminal(inspection.Session))
@@ -1287,6 +1355,26 @@ Examples:
 				}
 				fmt.Fprintln(cmd.OutOrStdout(), "\nAdopt post-failure artifacts with --adopt-orphan, or interrupt a generating turn with --stop-orphan, plus --step-id and --reason. Neither action resends the prompt or restarts the step.")
 			}
+			for _, selector := range selectors.Selectors {
+				fmt.Fprintf(cmd.OutOrStdout(), "\nSelector step: %s  Status: %s\n  Recorded PID: %d\n  Receipt: %s\n  Can accept: %t\n",
+					pipeline.SanitizeDescriptionForTerminal(selector.StepID), pipeline.SanitizeDescriptionForTerminal(selector.Status),
+					selector.ProcessID, selector.ReceiptToken, selector.CanAccept)
+				if selector.RefusalReason != "" {
+					fmt.Fprintf(cmd.OutOrStdout(), "  Recovery unavailable: %s\n", pipeline.SanitizeDescriptionForTerminal(selector.RefusalReason))
+				}
+				if selector.ResolutionAction != "" {
+					fmt.Fprintf(cmd.OutOrStdout(), "  Decision: %s at %s\n  Reason: %s\n",
+						pipeline.SanitizeDescriptionForTerminal(selector.ResolutionAction), selector.ResolvedAt.Format(time.RFC3339),
+						pipeline.SanitizeDescriptionForTerminal(selector.ResolutionReason))
+					if selector.ExitCode != nil {
+						fmt.Fprintf(cmd.OutOrStdout(), "  Exit code: %d  Stdout bytes: %d\n  Stdout SHA-256: %s\n",
+							*selector.ExitCode, selector.OutputBytes, selector.OutputHash)
+					}
+				}
+			}
+			if len(selectors.Selectors) > 0 {
+				fmt.Fprintln(cmd.OutOrStdout(), "\nTo accept an interrupted selector, verify the original source and all descendants have finished, then supply --accept-selector, --step-id, --receipt, --reason, --exit-code, and --output-file containing complete stdout. Acceptance never evaluates the source.")
+			}
 			return nil
 		},
 	}
@@ -1294,12 +1382,13 @@ Examples:
 	cmd.Flags().StringVar(&receipt, "receipt", "", "Exact receipt token from recovery inspection")
 	cmd.Flags().BoolVar(&acceptDelivery, "accept-delivery", false, "Record that the original agent received the uncertain delivery")
 	cmd.Flags().BoolVar(&acceptCommand, "accept-command", false, "Attest that the original command and all descendants finished, and record their observed result")
-	cmd.Flags().IntVar(&exitCode, "exit-code", 0, "Observed command exit code (0 to 255); explicitly required with --accept-command")
-	cmd.Flags().StringVar(&outputFile, "output-file", "", "Regular file containing complete captured command output; explicitly required with --accept-command")
+	cmd.Flags().BoolVar(&acceptSelector, "accept-selector", false, "Attest that the original selector and all descendants finished, and record their observed result")
+	cmd.Flags().IntVar(&exitCode, "exit-code", 0, "Observed command exit code (0 to 255); explicitly required with --accept-command or --accept-selector")
+	cmd.Flags().StringVar(&outputFile, "output-file", "", "Regular file containing complete captured command or selector output; explicitly required with --accept-command or --accept-selector")
 	cmd.Flags().BoolVar(&adoptOrphan, "adopt-orphan", false, "Record post-failure artifact provenance for a failed or cancelled step's orphaned turn")
 	cmd.Flags().StringArrayVar(&artifacts, "artifact", nil, "Existing regular file to record as adopted post-failure provenance (repeatable; requires --adopt-orphan)")
 	cmd.Flags().BoolVar(&stopOrphan, "stop-orphan", false, "Interrupt a verified pane whose turn is still generating after its step failed or was cancelled")
-	cmd.Flags().StringVar(&reason, "reason", "", "Observation confirming the original delivery, completed command outcome, or orphaned-turn decision")
+	cmd.Flags().StringVar(&reason, "reason", "", "Observation confirming the original delivery, command or selector outcome, or orphaned-turn decision")
 	return cmd
 }
 
@@ -1310,17 +1399,20 @@ func newPipelineCleanupCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "cleanup",
-		Short: "Clean up old pipeline state files",
-		Long: `Remove pipeline state files older than the specified duration.
+		Short: "Clean up old, settled pipeline state files",
+		Long: `Remove old pipeline state files only when execution has safely settled.
 
 State files are stored in .ntm/pipelines/ and can accumulate over time.
-Use this command to clean up old files and free disk space.
+Cleanup checks ownership and saved execution receipts before removing a file.
+Live runs, unresolved receipts, and states that cannot be safely inspected are
+retained for recovery. The dry run performs the same checks and lists the result
+for each saved run without removing files.
 
 Examples:
-  # Remove state files older than 7 days
+  # Remove eligible state files older than 7 days
   ntm pipeline cleanup --older 7d
 
-  # Remove state files older than 30 days
+  # Remove eligible state files older than 30 days
   ntm pipeline cleanup --older 30d
 
   # Dry run - show what would be deleted
@@ -1342,28 +1434,19 @@ Examples:
 				return err
 			}
 
-			if dryRun {
-				if jsonOutput {
-					result := map[string]interface{}{
-						"success":    true,
-						"dry_run":    true,
-						"older_than": olderThan,
-						"duration":   duration.String(),
-					}
-					return json.NewEncoder(os.Stdout).Encode(result)
-				}
-				fmt.Printf("Dry run: would clean up state files older than %s\n", duration)
-				return nil
-			}
-
-			// Perform cleanup
-			deleted, err := pipeline.CleanupStates(projectDir, duration)
+			report, err := pipeline.CleanupStates(cmd.Context(), projectDir, duration, dryRun)
 			if err != nil {
 				if jsonOutput {
 					result := map[string]interface{}{
 						"success":    false,
 						"error":      err.Error(),
 						"error_code": "CLEANUP_FAILED",
+					}
+					if report != nil {
+						result["deleted"] = report.Deleted
+						result["eligible"] = report.Eligible
+						result["retained"] = report.Retained
+						result["entries"] = report.Entries
 					}
 					return emitJSONFailureEnvelopeWithCause(result, err)
 				}
@@ -1373,7 +1456,11 @@ Examples:
 			if jsonOutput {
 				result := map[string]interface{}{
 					"success":     true,
-					"deleted":     deleted,
+					"dry_run":     dryRun,
+					"deleted":     report.Deleted,
+					"eligible":    report.Eligible,
+					"retained":    report.Retained,
+					"entries":     report.Entries,
 					"older_than":  olderThan,
 					"duration":    duration.String(),
 					"project_dir": projectDir,
@@ -1381,17 +1468,24 @@ Examples:
 				return json.NewEncoder(os.Stdout).Encode(result)
 			}
 
-			if deleted == 0 {
-				fmt.Println("No state files to clean up.")
+			if dryRun {
+				fmt.Printf("Dry run: %d state file(s) eligible for cleanup; %d retained.\n", report.Eligible, report.Retained)
+			} else if report.Deleted == 0 {
+				fmt.Printf("No eligible state files to clean up; %d retained.\n", report.Retained)
 			} else {
-				output.SuccessCheck(fmt.Sprintf("Cleaned up %d state file(s) older than %s", deleted, duration))
+				output.SuccessCheck(fmt.Sprintf("Cleaned up %d state file(s) older than %s; %d retained", report.Deleted, duration, report.Retained))
+			}
+			for _, entry := range report.Entries {
+				if dryRun || entry.Action == "retained" {
+					fmt.Printf("  %s: %s (%s)\n", entry.RunID, entry.Action, entry.Reason)
+				}
 			}
 
 			return nil
 		},
 	}
 
-	cmd.Flags().StringVar(&olderThan, "older", "", "Remove files older than duration (e.g., 7d, 30d)")
+	cmd.Flags().StringVar(&olderThan, "older", "", "Remove eligible files older than duration (e.g., 7d, 30d)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show what would be deleted without deleting")
 
 	return cmd

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -174,6 +175,295 @@ func TestCommandResumeRejectsUnknownEvidenceBeforeExplicitReset(t *testing.T) {
 	}
 	if data, err := os.ReadFile(filepath.Join(e.config.ProjectDir, "effects")); err != nil || string(data) != "once" {
 		t.Fatalf("rejected reset repeated work: %q %v", data, err)
+	}
+}
+
+func TestCommandUnresolvedReceiptRequiresFailureEvidence(t *testing.T) {
+	started := time.Now().Add(-time.Second)
+	record := CommandExecutionState{
+		Version: commandExecutionVersion, StepID: "work", StepHash: strings.Repeat("a", 64),
+		Status: commandExecutionUnresolved, ProcessID: 123, StartedAt: started,
+		Result: StepResult{
+			StepID: "work", AgentType: "command", Status: StatusFailed,
+			StartedAt: started, FinishedAt: time.Now(), Output: "partial output",
+			Error: &StepError{Type: "execution_unknown", Message: "group observation failed", Details: "injected census failure"},
+		},
+	}
+	for _, status := range []ExecutionStatus{StatusFailed, StatusCancelled} {
+		candidate := cloneCommandExecution(record)
+		candidate.Result.Status = status
+		if err := validateCommandExecution(candidate.StepID, candidate); err != nil {
+			t.Fatalf("valid %s cleanup evidence rejected: %v", status, err)
+		}
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*CommandExecutionState)
+	}{
+		{"success", func(r *CommandExecutionState) { r.Result.Status = StatusCompleted }},
+		{"still running", func(r *CommandExecutionState) { r.Result.Status = StatusRunning }},
+		{"settlement claim", func(r *CommandExecutionState) { r.SettledAt = time.Now() }},
+		{"missing process", func(r *CommandExecutionState) { r.ProcessID = 0 }},
+		{"missing failure", func(r *CommandExecutionState) { r.Result.Error = nil }},
+		{"empty failure", func(r *CommandExecutionState) { r.Result.Error.Message = "" }},
+		{"missing finish", func(r *CommandExecutionState) { r.Result.FinishedAt = time.Time{} }},
+		{"reversed lifetime", func(r *CommandExecutionState) { r.Result.FinishedAt = started.Add(-time.Second) }},
+		{"different launch", func(r *CommandExecutionState) { r.Result.StartedAt = started.Add(time.Millisecond) }},
+		{"different step", func(r *CommandExecutionState) { r.Result.StepID = "other" }},
+		{"different executor", func(r *CommandExecutionState) { r.Result.AgentType = "agent" }},
+		{"replay permission", func(r *CommandExecutionState) { r.Result.RerunOnResume = true }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			candidate := cloneCommandExecution(record)
+			tc.mutate(&candidate)
+			if err := validateCommandExecution(candidate.StepID, candidate); err == nil {
+				t.Fatalf("accepted inconsistent unresolved cleanup evidence: %+v", candidate)
+			}
+		})
+	}
+}
+
+func TestCommandUnresolvedReceiptBlocksReplayAndSupportsOperatorRecovery(t *testing.T) {
+	for _, status := range []ExecutionStatus{StatusFailed, StatusCancelled} {
+		t.Run(string(status), func(t *testing.T) {
+			cfg, workflow, prior, output := commandOperatorRecoveryFixture(t, 0, "direct")
+			running := commandOperatorRecoveryEntry(t, cfg)
+			record := prior.CommandExecutions[running.StepID]
+			// The fixture really ran the original command once and joined it.
+			// Model an ended supervisor that could not prove its cleanup; its
+			// partial result must never become a substitute for that proof.
+			record.Status = commandExecutionUnresolved
+			record.Result = StepResult{
+				StepID: record.StepID, AgentType: "command", Status: status,
+				StartedAt: record.StartedAt, FinishedAt: time.Now(), Output: output[:5],
+				Error: &StepError{Type: "execution_unknown", Message: "command group could not be observed", Details: "injected final census failure"},
+			}
+			prior.Status = status
+			prior.CommandExecutions[record.StepID] = record
+			prior.Steps[record.StepID] = record.Result
+			delete(prior.InFlightSteps, record.StepID)
+			if err := SaveState(cfg.ProjectDir, prior); err != nil {
+				t.Fatal(err)
+			}
+			saved, err := LoadState(cfg.ProjectDir, cfg.RunID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			durable := saved.CommandExecutions[record.StepID]
+			if durable.Status != commandExecutionUnresolved || !durable.SettledAt.IsZero() ||
+				durable.Result.Status != status || durable.Result.Output != output[:5] ||
+				durable.Result.Error == nil || durable.Result.Error.Details != "injected final census failure" {
+				t.Fatalf("lost unresolved command evidence across checkpoint round trip: %+v", durable)
+			}
+			before := commandOperatorRecoveryBytes(t, cfg)
+			if _, err := NewExecutor(cfg).Resume(context.Background(), workflow, saved, nil); err == nil || !strings.Contains(err.Error(), "unresolved launch") {
+				t.Fatalf("ordinary resume accepted an unresolved terminal receipt: %v", err)
+			}
+			if !bytes.Equal(before, commandOperatorRecoveryBytes(t, cfg)) {
+				t.Fatal("rejected resume rewrote unresolved cleanup evidence")
+			}
+			retry := NewExecutor(cfg)
+			retry.state, retry.graph = saved, NewDependencyGraph(workflow)
+			result := retry.executeStep(context.Background(), &workflow.Steps[0], workflow)
+			if result.Attempts != 1 || result.Status != StatusFailed || result.Error == nil || result.Error.Type != "execution_unknown" {
+				t.Fatalf("automatic retry accepted an unresolved terminal receipt: %+v", result)
+			}
+			entry := commandOperatorRecoveryEntry(t, cfg)
+			if entry.Status != commandExecutionUnresolved || !entry.CanAccept || entry.ReceiptToken != running.ReceiptToken {
+				t.Fatalf("ended supervision changed the command identity or hid recovery: %+v", entry)
+			}
+			accepted, err := AcceptCommandExecutionContext(context.Background(), cfg.ProjectDir, cfg.RunID,
+				entry.StepID, entry.ReceiptToken, "Verified the original group ended and recovered its complete output", 0, output)
+			if err != nil || accepted.Replayed || accepted.Command.Status != commandExecutionSettled {
+				t.Fatalf("explicit recovery of unresolved supervision failed: %+v %v", accepted, err)
+			}
+			resolved, err := LoadState(cfg.ProjectDir, cfg.RunID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(cfg.ProjectDir, "resume-allowed"), []byte("allow"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			final, err := NewExecutor(cfg).Resume(context.Background(), workflow, resolved, nil)
+			if err != nil || final.Status != StatusCompleted || final.Steps[entry.StepID].Output != strings.TrimSpace(output) {
+				t.Fatalf("resume did not use the explicitly accepted complete outcome: %+v %v", final, err)
+			}
+			if data, err := os.ReadFile(filepath.Join(cfg.ProjectDir, "effects")); err != nil || string(data) != "once\n" {
+				t.Fatalf("receipt reconciliation replayed original work: %q %v", data, err)
+			}
+			if data, err := os.ReadFile(filepath.Join(cfg.ProjectDir, "dependent")); err != nil || string(data) != "42" {
+				t.Fatalf("dependent consumed partial unresolved output: %q %v", data, err)
+			}
+		})
+	}
+}
+
+func TestLegacyFailedCommandResumeCannotReplayLiveEffects(t *testing.T) {
+	for _, status := range []ExecutionStatus{StatusFailed, StatusCancelled} {
+		t.Run(string(status), func(t *testing.T) {
+			cfg := DefaultExecutorConfig("legacy-command")
+			cfg.ProjectDir, cfg.RunID = t.TempDir(), "run-legacy-command"
+			step := Step{ID: "work", Command: `printf 'once\n' >> effects
+if [ -f replay-allowed ]; then printf replayed > replayed; exit 0; fi
+printf ready > ready
+read proceed
+printf finished > original-finished
+`}
+			workflow := &Workflow{SchemaVersion: SchemaVersion, Name: "legacy-command", Settings: DefaultWorkflowSettings(), Steps: []Step{step}}
+			frozen, path, err := SnapshotWorkflow(context.Background(), cfg.ProjectDir, workflow)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg.WorkflowFile = path
+			input, release, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = input.Close(); _ = release.Close() })
+			original := exec.Command("/bin/sh", "-c", step.Command)
+			original.Dir, original.Stdin = cfg.ProjectDir, input
+			configureCommandProcessGroup(original)
+			started := time.Now()
+			if err := original.Start(); err != nil {
+				t.Fatal(err)
+			}
+			waited := false
+			t.Cleanup(func() {
+				_ = release.Close()
+				_ = original.Process.Kill()
+				if !waited {
+					_ = original.Wait()
+				}
+			})
+			awaitCommandCancellationFile(t, filepath.Join(cfg.ProjectDir, "ready"), "ready")
+			// Older waiters could return a failed/cancelled scheduler result
+			// without stopping their command group. Keep the original work
+			// alive after its real side effect while saving that legacy shape.
+			finished := time.Now()
+			prior := &ExecutionState{
+				RunID: cfg.RunID, WorkflowID: workflow.Name, WorkflowFile: path, Session: cfg.Session,
+				Status: status, StartedAt: started, FinishedAt: finished, LastCheckpointAt: finished,
+				Steps: map[string]StepResult{step.ID: {
+					StepID: step.ID, AgentType: "command", Status: status, StartedAt: started, FinishedAt: finished,
+					Error: &StepError{Type: "command", Message: "legacy process observation failed"},
+				}},
+				Variables: map[string]interface{}{},
+			}
+			if err := SaveState(cfg.ProjectDir, prior); err != nil {
+				t.Fatal(err)
+			}
+			before := commandOperatorRecoveryBytes(t, cfg)
+			prior, err = LoadState(cfg.ProjectDir, cfg.RunID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// If preflight admits a replay, it finishes immediately instead
+			// of blocking on the fixture's independently owned input pipe.
+			if err := os.WriteFile(filepath.Join(cfg.ProjectDir, "replay-allowed"), []byte("allow"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := NewExecutor(cfg).Resume(context.Background(), frozen, prior, nil); err == nil || !strings.Contains(err.Error(), "unresolved launch") {
+				t.Fatalf("legacy terminal failure authorized replay of live work: %v", err)
+			}
+			if !bytes.Equal(before, commandOperatorRecoveryBytes(t, cfg)) {
+				t.Fatal("refused legacy resume rewrote the original checkpoint")
+			}
+			if data, err := os.ReadFile(filepath.Join(cfg.ProjectDir, "effects")); err != nil || string(data) != "once\n" {
+				t.Fatalf("ordinary resume duplicated the original side effect: %q %v", data, err)
+			}
+			if _, err := os.Stat(filepath.Join(cfg.ProjectDir, "replayed")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("ordinary resume dispatched another command: %v", err)
+			}
+			if _, err := release.WriteString("finish\n"); err != nil {
+				t.Fatal(err)
+			}
+			waited = true
+			if err := original.Wait(); err != nil {
+				t.Fatalf("refused recovery damaged the original healthy process: %v", err)
+			}
+			awaitCommandCancellationFile(t, filepath.Join(cfg.ProjectDir, "original-finished"), "finished")
+			// The old group has now actually ended. An operator's explicit
+			// restart remains the authorization to repeat its prior effect.
+			prior, err = LoadState(cfg.ProjectDir, cfg.RunID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			final, err := NewExecutor(cfg).ResumeWithOptions(context.Background(), frozen, prior, ResumeOptions{Mode: ResumeModeRestartFailed}, nil)
+			if err != nil || final == nil || final.Status != StatusCompleted {
+				t.Fatalf("explicit legacy restart failed after stopping the original work: %+v %v", final, err)
+			}
+			if data, err := os.ReadFile(filepath.Join(cfg.ProjectDir, "effects")); err != nil || string(data) != "once\nonce\n" {
+				t.Fatalf("explicit restart did not repeat work exactly once: %q %v", data, err)
+			}
+		})
+	}
+}
+
+func TestCommandSettledTerminalFailureStillAllowsOrdinaryResume(t *testing.T) {
+	for _, status := range []ExecutionStatus{StatusFailed, StatusCancelled} {
+		t.Run(string(status), func(t *testing.T) {
+			e := newCommandTestExecutor(t)
+			e.config.RunID = e.state.RunID
+			e.state.Session = e.config.Session
+			command := "printf 'once\\n' >> effects; if [ -f allow ]; then printf complete; exit 0; fi; exit 7"
+			if status == StatusCancelled {
+				command = "printf 'once\\n' >> effects; if [ -f allow ]; then printf complete; exit 0; fi; printf ready > ready; exec sleep 30"
+			}
+			step := Step{ID: "work", Command: command}
+			workflow := &Workflow{SchemaVersion: SchemaVersion, Name: e.state.WorkflowID, Settings: DefaultWorkflowSettings(), Steps: []Step{step}}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			done := make(chan StepResult, 1)
+			go func() { done <- e.executeCommand(ctx, &step, workflow) }()
+			if status == StatusCancelled {
+				awaitCommandCancellationFile(t, filepath.Join(e.config.ProjectDir, "ready"), "ready")
+				cancel()
+			}
+			var first StepResult
+			select {
+			case first = <-done:
+			case <-time.After(10 * time.Second):
+				t.Fatal("original command did not finish its owned cleanup")
+			}
+			if first.Status != status {
+				t.Fatalf("fixture did not reach its terminal outcome: %+v", first)
+			}
+			e.state.Status, e.state.Steps[step.ID] = status, first
+			if err := e.persistState(); err != nil {
+				t.Fatal(err)
+			}
+			prior, err := LoadState(e.config.ProjectDir, e.config.RunID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			receipt := prior.CommandExecutions[step.ID]
+			if receipt.Status != commandExecutionSettled || receipt.Result.Status != status || receipt.SettledAt.IsZero() {
+				t.Fatalf("fixture lacks real settlement evidence: %+v", receipt)
+			}
+			if err := os.WriteFile(filepath.Join(e.config.ProjectDir, "allow"), []byte("allow"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			final, err := NewExecutor(e.config).Resume(context.Background(), workflow, prior, nil)
+			if err != nil || final == nil || final.Status != StatusCompleted || final.Steps[step.ID].Output != "complete" {
+				t.Fatalf("proven-settled failure lost ordinary retry behavior: %+v %v", final, err)
+			}
+			if data, err := os.ReadFile(filepath.Join(e.config.ProjectDir, "effects")); err != nil || string(data) != "once\nonce\n" {
+				t.Fatalf("settled failure was not retried exactly once: %q %v", data, err)
+			}
+		})
+	}
+}
+
+func TestLegacyBackgroundRerunMarkerRequiresSettlementEvidence(t *testing.T) {
+	e := newCommandTestExecutor(t)
+	step := Step{ID: "sidecar", Command: "sleep 30", Wait: WaitNone}
+	workflow := &Workflow{Name: e.state.WorkflowID, Steps: []Step{step}}
+	e.state.Steps[step.ID] = StepResult{StepID: step.ID, AgentType: "command", Status: StatusCompleted, RerunOnResume: true}
+	if err := e.applyResumeOptions(workflow, ResumeOptions{}); err == nil || !strings.Contains(err.Error(), "unresolved launch") {
+		t.Fatalf("legacy background rerun marker substituted for settlement: %v", err)
+	}
+	if err := e.applyResumeOptions(workflow, ResumeOptions{Mode: ResumeModeRestartFailed}); err != nil {
+		t.Fatalf("explicit legacy sidecar replay was refused: %v", err)
 	}
 }
 
@@ -400,7 +690,7 @@ func TestCommandCleanupResetPreservesMainNamespaceCollision(t *testing.T) {
 // to model losing the final settlement write, without fabricating launch data or
 // leaving an orphan process. Direct execution also permits testing an actual
 // nonzero result without the original scheduler consuming its retry budget.
-func commandOperatorRecoveryFixture(t *testing.T, exitCode int, layout string) (ExecutorConfig, *Workflow, *ExecutionState, string) {
+func commandOperatorRecoveryFixture(t *testing.T, exitCode int, layout string, configure ...func(*Workflow)) (ExecutorConfig, *Workflow, *ExecutionState, string) {
 	t.Helper()
 	e := newCommandTestExecutor(t)
 	e.config.RunID = e.state.RunID
@@ -435,6 +725,9 @@ func commandOperatorRecoveryFixture(t *testing.T, exitCode int, layout string) (
 	}
 	if layout != "post" {
 		workflow.Steps = append(workflow.Steps, consumer)
+	}
+	for _, update := range configure {
+		update(workflow)
 	}
 	frozen, path, err := SnapshotWorkflow(context.Background(), e.config.ProjectDir, workflow)
 	if err != nil {
@@ -520,7 +813,7 @@ func commandOperatorRecoveryBytes(t *testing.T, cfg ExecutorConfig) []byte {
 }
 
 func TestCommandOperatorRecoveryPublishesOnlyOnResume(t *testing.T) {
-	for _, layout := range []string{"direct", "foreach", "parallel", "branch"} {
+	for _, layout := range []string{"direct", "foreach", "parallel", "branch", "post"} {
 		t.Run(layout, func(t *testing.T) {
 			cfg, workflow, prior, output := commandOperatorRecoveryFixture(t, 0, layout)
 			before := commandOperatorRecoveryBytes(t, cfg)
@@ -573,8 +866,10 @@ func TestCommandOperatorRecoveryPublishesOnlyOnResume(t *testing.T) {
 					t.Fatalf("named output missing: %#v", final.Variables)
 				}
 			}
-			if data, err := os.ReadFile(filepath.Join(cfg.ProjectDir, "dependent")); err != nil || string(data) != want {
-				t.Fatalf("dependent did not receive recovered output: %q %v", data, err)
+			if layout != "post" {
+				if data, err := os.ReadFile(filepath.Join(cfg.ProjectDir, "dependent")); err != nil || string(data) != want {
+					t.Fatalf("dependent did not receive recovered output: %q %v", data, err)
+				}
 			}
 			if data, err := os.ReadFile(filepath.Join(cfg.ProjectDir, "effects")); err != nil || string(data) != "once\n" {
 				t.Fatalf("resume repeated original command side effects: %q %v", data, err)
@@ -618,14 +913,11 @@ func TestCommandOperatorRecoveryAcceptedFailureDoesNotRetry(t *testing.T) {
 }
 
 func TestCommandOperatorRecoveryRefusalsPreserveCheckpoint(t *testing.T) {
-	for _, scenario := range []string{"stale receipt", "live owner", "background", "terminal step", "completed container", "completed iteration", "post-pipeline", "missing workflow", "output limit", "changed reason", "changed output", "changed exit", "canceled context"} {
+	for _, scenario := range []string{"stale receipt", "live owner", "background", "terminal step", "completed container", "completed iteration", "missing workflow", "output limit", "changed reason", "changed output", "changed exit", "canceled context"} {
 		t.Run(scenario, func(t *testing.T) {
 			layout := "direct"
 			if scenario == "completed container" || scenario == "completed iteration" {
 				layout = "foreach"
-			}
-			if scenario == "post-pipeline" {
-				layout = "post"
 			}
 			cfg, _, prior, output := commandOperatorRecoveryFixture(t, 0, layout)
 			entry := commandOperatorRecoveryEntry(t, cfg)
@@ -700,7 +992,7 @@ func TestCommandOperatorRecoveryRefusalsPreserveCheckpoint(t *testing.T) {
 				ctx = canceled
 			}
 			switch scenario {
-			case "background", "terminal step", "completed container", "completed iteration", "post-pipeline", "missing workflow":
+			case "background", "terminal step", "completed container", "completed iteration", "missing workflow":
 				if entry.CanAccept || entry.RefusalReason == "" {
 					t.Fatalf("unsupported receipt advertised acceptance: %+v", entry)
 				}
@@ -782,6 +1074,225 @@ func TestCommandOperatorRecoveryRejectsCorruptResolutionBeforeReset(t *testing.T
 			}
 			if data, err := os.ReadFile(filepath.Join(cfg.ProjectDir, "effects")); err != nil || string(data) != "once\n" {
 				t.Fatalf("corrupt recovery repeated command: %q %v", data, err)
+			}
+		})
+	}
+}
+
+func TestControlledPipelineHandledProcessFailuresRemainCompleted(t *testing.T) {
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skip("requires /bin/sh")
+	}
+	root := t.TempDir()
+	workflow := &Workflow{SchemaVersion: SchemaVersion, Name: "handled-process-failures", Settings: DefaultWorkflowSettings(), Steps: []Step{
+		{ID: "command", Command: "printf 'once\\n' >> command-effects; exit 7", OnError: ErrorActionContinue},
+		{ID: "selector", Branch: "$(printf 'once\\n' >> selector-effects; exit 7)", OnError: ErrorActionContinue,
+			Branches: map[string]interface{}{"unused": []Step{{ID: "body", Command: "printf unexpected > body-effects"}}}},
+		{ID: "independent", Command: "printf 'once\\n' >> independent-effects; printf continued"},
+	}}
+	cfg := DefaultExecutorConfig(workflow.Name)
+	cfg.ProjectDir, cfg.RunID = root, "run-handled-process-failures"
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	final, err := RunControlledPipeline(ctx, workflow, nil, cfg, nil)
+	if err != nil || final == nil || final.Status != StatusCompleted || final.Steps["independent"].Output != "continued" {
+		t.Fatalf("handled settled process failures prevented completion: %+v %v", final, err)
+	}
+	prior, err := LoadState(root, cfg.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := prior.CommandExecutions["command"]
+	if record.Status != commandExecutionSettled || record.Result.Status != StatusFailed ||
+		record.Result.Error == nil || record.Result.Error.Type != "exit" || !strings.Contains(record.Result.Error.Details, "exit_code=7") {
+		t.Fatalf("handled command failure lost its settled exit outcome: %+v", record)
+	}
+	if prior.Steps["selector"].Status != StatusFailed || len(prior.CommandEvaluations) != 0 {
+		t.Fatalf("known failed selector retained uncertain launch evidence: %+v", prior)
+	}
+	for _, name := range []string{"command-effects", "selector-effects", "independent-effects"} {
+		if data, err := os.ReadFile(filepath.Join(root, name)); err != nil || string(data) != "once\n" {
+			t.Fatalf("handled process failure interrupted or repeated %s: %q %v", name, data, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(root, "body-effects")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed selector dispatched a branch body: %v", err)
+	}
+	// A handled, proven-settled failure is legitimate completion. Recovery
+	// must not replace its known outcome or reclassify the completed run.
+	before := commandOperatorRecoveryBytes(t, cfg)
+	token, err := commandExecutionReceiptToken(prior, record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := AcceptCommandExecutionContext(ctx, root, cfg.RunID, "command", token, "Verified the known command outcome", 7, ""); err == nil {
+		t.Fatal("recovery accepted a command that already had a native settled outcome")
+	}
+	if _, err := AcceptCommandEvaluationContext(ctx, root, cfg.RunID, "selector", strings.Repeat("a", 64), "Verified the known selector outcome", 7, nil); err == nil {
+		t.Fatal("recovery replaced a known failed selector without an unfinished receipt")
+	}
+	if !bytes.Equal(before, commandOperatorRecoveryBytes(t, cfg)) {
+		t.Fatal("refused recovery reclassified legitimate handled completion")
+	}
+}
+
+func TestCommandOperatorRecoveryReopensPrematureCompletion(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		unresolved bool
+		status     ExecutionStatus
+		exitCode   int
+	}{
+		{"running_failed_success", false, StatusFailed, 0},
+		{"running_cancelled_failure", false, StatusCancelled, 7},
+		{"unresolved_failed_failure", true, StatusFailed, 7},
+		{"unresolved_cancelled_success", true, StatusCancelled, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, workflow, prior, output := commandOperatorRecoveryFixture(t, tc.exitCode, "direct")
+			original := commandOperatorRecoveryEntry(t, cfg)
+			finished := time.Now().UTC()
+			result := StepResult{StepID: "produce", AgentType: "command", Status: tc.status,
+				StartedAt: prior.CommandExecutions["produce"].StartedAt, FinishedAt: finished,
+				Error: &StepError{Type: "execution_unknown", Message: "original process settlement was not observed"}}
+			if tc.unresolved {
+				record := prior.CommandExecutions["produce"]
+				record.Status, record.Result = commandExecutionUnresolved, result
+				prior.CommandExecutions["produce"] = record
+			}
+			// The real original command has ended. Reproduce the contradictory
+			// checkpoint older finalizers could publish after a handled failure.
+			prior.Status, prior.FinishedAt, prior.UpdatedAt = StatusCompleted, finished, finished
+			prior.Steps["produce"] = result
+			prior.Steps["consume"] = StepResult{StepID: "consume", Status: StatusSkipped, SkipKind: SkipKindFailedDependency}
+			delete(prior.InFlightSteps, "produce")
+			prior.Variables["retained"] = "unrelated value"
+			if err := SaveState(cfg.ProjectDir, prior); err != nil {
+				t.Fatal(err)
+			}
+			before := commandOperatorRecoveryBytes(t, cfg)
+			entry := commandOperatorRecoveryEntry(t, cfg)
+			if !entry.CanAccept || entry.ReceiptToken != original.ReceiptToken || !bytes.Equal(before, commandOperatorRecoveryBytes(t, cfg)) {
+				t.Fatalf("false workflow completion hid or changed its unfinished command: %+v", entry)
+			}
+			const reason = "Verified the original command and descendants ended and recovered its complete outcome"
+			accepted, err := AcceptCommandExecutionContext(context.Background(), cfg.ProjectDir, cfg.RunID,
+				entry.StepID, entry.ReceiptToken, reason, tc.exitCode, output)
+			if err != nil || accepted.Replayed || accepted.Command.ReceiptToken != entry.ReceiptToken {
+				t.Fatalf("recover falsely completed command: %+v %v", accepted, err)
+			}
+			saved, err := LoadState(cfg.ProjectDir, cfg.RunID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if saved.Status != StatusFailed || !saved.FinishedAt.Equal(finished) ||
+				!saved.UpdatedAt.Equal(accepted.Command.ResolvedAt) || !saved.LastCheckpointAt.Equal(prior.LastCheckpointAt) ||
+				saved.Steps["produce"].Status != tc.status || saved.Steps["consume"].Status != StatusSkipped ||
+				saved.Variables["retained"] != "unrelated value" || saved.Variables["produced"] != nil {
+				t.Fatalf("acceptance changed scheduler evidence or did not repair terminal status: %+v", saved)
+			}
+			if len(saved.Errors) != len(prior.Errors)+1 {
+				t.Fatalf("status repair did not add one audit diagnostic: %+v", saved.Errors)
+			}
+			diagnostic := saved.Errors[len(saved.Errors)-1]
+			if diagnostic.Type != "recovery" || diagnostic.StepID != entry.StepID || !diagnostic.Fatal ||
+				!diagnostic.Timestamp.Equal(accepted.Command.ResolvedAt) || !strings.Contains(diagnostic.Message, "unsettled") || !strings.Contains(diagnostic.Message, "resume") {
+				t.Fatalf("status repair lost its reason: %+v", diagnostic)
+			}
+			if _, err := os.Stat(filepath.Join(cfg.ProjectDir, "dependent")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("acceptance dispatched dependent work: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(cfg.ProjectDir, "resume-allowed"), []byte("allow"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			resumeCtx, resumeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer resumeCancel()
+			final, err := NewExecutor(cfg).Resume(resumeCtx, workflow, saved, nil)
+			if tc.exitCode == 0 {
+				if err != nil || final.Status != StatusCompleted {
+					t.Fatalf("verified command could not resume after status repair: %+v %v", final, err)
+				}
+				if data, err := os.ReadFile(filepath.Join(cfg.ProjectDir, "dependent")); err != nil || string(data) != "42" {
+					t.Fatalf("accepted command output was not published normally: %q %v", data, err)
+				}
+			} else if err == nil || final.Status != StatusFailed || final.Steps["produce"].Error == nil || final.Steps["produce"].Error.Type != "exit" {
+				t.Fatalf("accepted unsuccessful command lost its failure: %+v %v", final, err)
+			}
+			if data, err := os.ReadFile(filepath.Join(cfg.ProjectDir, "effects")); err != nil || string(data) != "once\n" {
+				t.Fatalf("recovery repeated original effects: %q %v", data, err)
+			}
+			before = commandOperatorRecoveryBytes(t, cfg)
+			again, err := AcceptCommandExecutionContext(context.Background(), cfg.ProjectDir, cfg.RunID,
+				entry.StepID, entry.ReceiptToken, reason, tc.exitCode, output)
+			if err != nil || !again.Replayed || !bytes.Equal(before, commandOperatorRecoveryBytes(t, cfg)) {
+				t.Fatalf("repeating acceptance reopened a finished outcome: %+v %v", again, err)
+			}
+		})
+	}
+}
+
+func TestCommandOperatorRecoveryPrematureCompletionRetainsOtherUncertainty(t *testing.T) {
+	cfg, workflow, prior, output := commandOperatorRecoveryFixture(t, 0, "direct")
+	entry := commandOperatorRecoveryEntry(t, cfg)
+	prior.Status = StatusCompleted
+	prior.Steps[entry.StepID] = StepResult{StepID: entry.StepID, Status: StatusFailed}
+	delete(prior.InFlightSteps, entry.StepID)
+	// An intent checkpoint is ambiguous even when it has no recorded PID.
+	// Accepting the producer must not erase another command's replay fence.
+	hash, err := commandDefinitionHash(&workflow.Steps[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := CommandExecutionState{Version: commandExecutionVersion, StepID: "consume", StepHash: hash,
+		Status: commandExecutionStarting, StartedAt: time.Now().UTC()}
+	prior.CommandExecutions[other.StepID] = other
+	prior.Steps[other.StepID] = StepResult{StepID: other.StepID, Status: StatusFailed}
+	if err := SaveState(cfg.ProjectDir, prior); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := AcceptCommandExecutionContext(context.Background(), cfg.ProjectDir, cfg.RunID,
+		entry.StepID, entry.ReceiptToken, "Verified only the original producer group ended", 0, output); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := LoadState(cfg.ProjectDir, cfg.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, _ := json.Marshal(other)
+	got, _ := json.Marshal(saved.CommandExecutions[other.StepID])
+	if saved.Status != StatusFailed || !bytes.Equal(want, got) {
+		t.Fatalf("acceptance changed unrelated launch evidence: %+v", saved)
+	}
+	before := commandOperatorRecoveryBytes(t, cfg)
+	if _, err := NewExecutor(cfg).Resume(context.Background(), workflow, saved, nil); err == nil || !strings.Contains(err.Error(), `command step "consume" has an unresolved launch`) {
+		t.Fatalf("one acceptance bypassed a second uncertain launch: %v", err)
+	}
+	if !bytes.Equal(before, commandOperatorRecoveryBytes(t, cfg)) {
+		t.Fatal("refused resume changed another command's unresolved checkpoint")
+	}
+}
+
+func TestCommandOperatorRecoveryPrematureCompletionRefusalsPreserveState(t *testing.T) {
+	for _, status := range []ExecutionStatus{StatusCompleted, StatusSkipped, StatusPending, StatusRunning, ""} {
+		t.Run(string(status), func(t *testing.T) {
+			cfg, _, prior, output := commandOperatorRecoveryFixture(t, 0, "direct")
+			entry := commandOperatorRecoveryEntry(t, cfg)
+			prior.Status = StatusCompleted
+			prior.Steps[entry.StepID] = StepResult{StepID: entry.StepID, Status: status}
+			if err := SaveState(cfg.ProjectDir, prior); err != nil {
+				t.Fatal(err)
+			}
+			before := commandOperatorRecoveryBytes(t, cfg)
+			entry = commandOperatorRecoveryEntry(t, cfg)
+			if entry.CanAccept {
+				t.Fatalf("completed workflow without an unsuccessful source advertised recovery: %+v", entry)
+			}
+			if _, err := AcceptCommandExecutionContext(context.Background(), cfg.ProjectDir, cfg.RunID,
+				entry.StepID, entry.ReceiptToken, "Verified the original command ended", 0, output); err == nil {
+				t.Fatal("acceptance replaced potentially consumed output")
+			}
+			if !bytes.Equal(before, commandOperatorRecoveryBytes(t, cfg)) {
+				t.Fatal("refused recovery changed workflow status or command evidence")
 			}
 		})
 	}

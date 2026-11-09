@@ -12,6 +12,8 @@ import (
 
 const (
 	testAgentCatCommandTemplate = `{{if .Model}}: {{shellQuote .Model}} >/dev/null && {{end}}/bin/cat`
+	// Claude sends also require a visible composer before delivery.
+	testAgentClaudeCommandTemplate = `{{if .Model}}: {{shellQuote .Model}} >/dev/null && {{end}}printf '\342\235\257 \n' && /bin/cat`
 	// Codex panes must show the composer marker ("›") before the delivery
 	// readiness probe lets a prompt through, so the codex fake prints it first.
 	testAgentCodexCommandTemplate  = `{{if .Model}}: {{shellQuote .Model}} >/dev/null && {{end}}printf '\342\200\272 \n' && /bin/cat`
@@ -39,6 +41,14 @@ func newTmuxIntegrationTestConfig(projectsBase string) *config.Config {
 func TestMain(m *testing.M) {
 	if os.Getenv("NTM_PI_PANE_FIXTURE") == "1" && filepath.Base(os.Args[0]) == "pi" {
 		os.Exit(runPiPaneFixture())
+	}
+	if len(os.Args) == 7 && os.Args[1] == "-test.run=^TestPipelineBackgroundResumeWorker$" &&
+		os.Args[2] == "--" && os.Args[3] == "__pipeline-worker" && os.Args[4] == "--" {
+		// This exact worker invocation inherits the parent's isolated test
+		// environment. Replacing its git config and tmux directories changes
+		// the effective selector invocation, correctly preventing reuse of
+		// the parent's durable output receipt. The parent owns cleanup.
+		os.Exit(m.Run())
 	}
 	cleanupTmux, err := testutil.IsolateTmuxTestProcess()
 	if err != nil {

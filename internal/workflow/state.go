@@ -30,18 +30,67 @@ type WorkflowState struct {
 	// ResumeVersion distinguishes execution checkpoints with a write-ahead
 	// delivery journal from older observational snapshots. Missing evidence
 	// must never be interpreted as permission to resend a stage.
-	ResumeVersion int             `json:"resume_version,omitempty"`
-	TemplateHash  string          `json:"template_hash,omitempty"`
-	ProjectRoot   string          `json:"project_root,omitempty"`
-	PanePIDs      map[string]int  `json:"pane_pids,omitempty"`
-	NextByRole    map[string]int  `json:"next_by_role,omitempty"`
-	Turn          int             `json:"turn"`
-	Dispatches    []StageDispatch `json:"dispatches"`
-	Completed     bool            `json:"completed"`
+	ResumeVersion int    `json:"resume_version,omitempty"`
+	TemplateHash  string `json:"template_hash,omitempty"`
+	ProjectRoot   string `json:"project_root,omitempty"`
+	// TmuxEndpoint binds physical pane IDs and PIDs to their host namespace.
+	// Equal numeric identities on a different SSH target are unrelated work.
+	TmuxEndpoint string          `json:"tmux_endpoint,omitempty"`
+	PanePIDs     map[string]int  `json:"pane_pids,omitempty"`
+	NextByRole   map[string]int  `json:"next_by_role,omitempty"`
+	Turn         int             `json:"turn"`
+	Dispatches   []StageDispatch `json:"dispatches"`
+	Completed    bool            `json:"completed"`
 	// Evidence belongs to this particular visit to a stage. Its capture
 	// boundary is saved before prompts, and observed verdicts are saved before
 	// advancing. Resuming never substitutes old pane history for that boundary.
 	Evidence *StageEvidence `json:"evidence,omitempty"`
+	// Files retains the original filesystem boundary and observed file
+	// transitions for this stage visit and prompt round, including downtime.
+	Files *StageFileEvidence `json:"files,omitempty"`
+	// ManualGate is published only after this stage's deliveries complete.
+	ManualGate *ManualGate `json:"manual_gate,omitempty"`
+	// Recovery retains consumed attempts for the entire workflow, including
+	// resumed runs and later visits to the same stage or agent.
+	Recovery *RecoveryBudgets `json:"recovery,omitempty"`
+	// Timeout belongs to one stage visit and prompt round. Its absolute
+	// deadline and action receipt survive runner restarts.
+	Timeout *StageTimeout `json:"timeout,omitempty"`
+}
+
+// StageTimeout records a deadline before the round's first delivery. Handling
+// is written before entering the policy; an interrupted action must never be
+// replayed when its outcome is unknown. Handled acknowledges pause/notify/abort
+// for this round, while retry and skip replace the entire receipt.
+type StageTimeout struct {
+	Version    int         `json:"version"`
+	Stage      string      `json:"stage"`
+	StartedAt  time.Time   `json:"started_at"`
+	Round      int         `json:"round"`
+	Deadline   time.Time   `json:"deadline"`
+	Action     ErrorAction `json:"action"`
+	Handling   bool        `json:"handling"`
+	Handled    bool        `json:"handled"`
+	StopReason string      `json:"stop_reason,omitempty"`
+}
+
+// RecoveryBudgets records attempts reserved before retrying a stage or
+// restarting an agent. Failed or uncertain side effects still consume their
+// reservation, so process restarts cannot replenish recovery budgets.
+type RecoveryBudgets struct {
+	Retries  map[string]int `json:"retries"`
+	Restarts map[string]int `json:"restarts"`
+}
+
+// StageFileEvidence binds filesystem observations to exactly the same stage
+// visit and dispatch round as pane evidence. A loop or intentional retry must
+// establish a new boundary instead of inheriting an earlier file verdict.
+type StageFileEvidence struct {
+	Version   int                      `json:"version"`
+	Stage     string                   `json:"stage"`
+	StartedAt time.Time                `json:"started_at"`
+	Round     int                      `json:"round"`
+	Triggers  map[int]FileTriggerState `json:"triggers"`
 }
 
 // StageEvidence binds incremental pane observations to one stage dispatch.
@@ -98,12 +147,13 @@ type StageDispatch struct {
 	ResolutionToken    string     `json:"resolution_token,omitempty"`
 }
 type StageRecord struct {
-	Stage       string    `json:"stage"`
-	StartedAt   time.Time `json:"started_at"`
-	CompletedAt time.Time `json:"completed_at"`
-	DurationSec int       `json:"duration_sec"`
-	Result      string    `json:"result"`
-	Trigger     string    `json:"trigger"`
+	Stage          string          `json:"stage"`
+	StartedAt      time.Time       `json:"started_at"`
+	CompletedAt    time.Time       `json:"completed_at"`
+	DurationSec    int             `json:"duration_sec"`
+	Result         string          `json:"result"`
+	Trigger        string          `json:"trigger"`
+	ManualDecision *ManualDecision `json:"manual_decision,omitempty"`
 }
 
 type StateStore struct{ Dir string }
@@ -544,9 +594,30 @@ func (s *StateStore) Save(state *WorkflowState) error {
 	if err := os.MkdirAll(s.Dir, 0o755); err != nil {
 		return fmt.Errorf("create workflow state directory: %w", err)
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), manualCheckpointTimeout)
+	defer cancel()
+	unlock, err := s.lockManualCheckpoint(ctx, state.SessionName)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if state.ManualGate != nil {
+		ready, err := manualStageReady(state)
+		if err != nil {
+			return err
+		}
+		if !ready {
+			state.ManualGate = nil
+		} else if err := validateManualGate(state); err != nil {
+			return err
+		}
+	}
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode workflow state: %w", err)
+	}
+	if len(data) > workflowStateMaxBytes {
+		return fmt.Errorf("workflow checkpoint exceeds %d bytes", workflowStateMaxBytes)
 	}
 	if err := util.AtomicWriteFile(path, data, 0o600); err != nil {
 		return fmt.Errorf("write workflow state: %w", err)
@@ -558,7 +629,7 @@ func (s *StateStore) Load(session string) (*WorkflowState, error) {
 	if err != nil {
 		return nil, err
 	}
-	data, err := os.ReadFile(path)
+	data, err := readWorkflowRegularFile(path, workflowStateMaxBytes)
 	if os.IsNotExist(err) {
 		return nil, nil
 	}

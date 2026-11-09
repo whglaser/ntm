@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -29,6 +30,149 @@ func schedulerDeadline(t *testing.T) context.Context {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	t.Cleanup(cancel)
 	return ctx
+}
+
+func TestParallelSchedulerRetainsBackgroundContextsUntilSettlement(t *testing.T) {
+	type valueKey struct{}
+	parent, cancel := context.WithTimeout(context.WithValue(context.Background(), valueKey{}, "original"), time.Minute)
+	t.Cleanup(cancel)
+	parent, finish := withCommandCancellationScope(parent, cancel)
+	graph := schedulerGraph(t, []parallelTask{{id: "first"}, {id: "second"}}, nil)
+	var contexts []context.Context
+	var release []context.CancelFunc
+	err := graph.run(parent, 1, false, nil, func(int) error { return nil },
+		func(ctx context.Context, _ int) parallelTaskOutcome {
+			contexts = append(contexts, ctx)
+			release = append(release, retainCommandCancellationScopes(ctx))
+			return parallelTaskSucceeded
+		}, func(int, parallelTaskOutcome, []string) error { return nil })
+	if err != nil || len(contexts) != 2 {
+		t.Fatalf("scheduler failed before both launches: %v", err)
+	}
+	for _, done := range release {
+		t.Cleanup(done)
+	}
+	finish()
+	deadline, _ := parent.Deadline()
+	for _, ctx := range contexts {
+		gotDeadline, ok := ctx.Deadline()
+		if ctx.Err() != nil || ctx.Value(valueKey{}) != "original" || !ok || !gotDeadline.Equal(deadline) {
+			t.Fatalf("normal scope completion changed the background context: error=%v value=%v deadline=%v", ctx.Err(), ctx.Value(valueKey{}), gotDeadline)
+		}
+	}
+	release[0]()
+	release[0]() // Cleanup handoff must not count the same worker twice.
+	if contexts[1].Err() != nil || parent.Err() != nil {
+		t.Fatal("one settled worker canceled the other retained command")
+	}
+	release[1]()
+	if contexts[1].Err() != context.Canceled || parent.Err() != context.Canceled {
+		t.Fatal("completed scheduler scopes remained open after the last worker settled")
+	}
+}
+
+func TestParallelSchedulerFailureCancelsRetainedBackgroundContexts(t *testing.T) {
+	for _, failure := range []string{"fail_fast", "start checkpoint", "result checkpoint"} {
+		t.Run(failure, func(t *testing.T) {
+			graph := schedulerGraph(t, []parallelTask{{id: "sidecar"}, {id: "failure"}}, nil)
+			checkpointErr := errors.New("injected scheduler checkpoint failure")
+			var background context.Context
+			var release context.CancelFunc
+			err := graph.run(schedulerDeadline(t), 1, true, nil,
+				func(i int) error {
+					if i == 1 && failure == "start checkpoint" {
+						return checkpointErr
+					}
+					return nil
+				},
+				func(ctx context.Context, i int) parallelTaskOutcome {
+					if i == 0 {
+						background, release = ctx, retainCommandCancellationScopes(ctx)
+						return parallelTaskSucceeded
+					}
+					return parallelTaskFailed
+				},
+				func(i int, _ parallelTaskOutcome, _ []string) error {
+					if i == 1 && failure == "result checkpoint" {
+						return checkpointErr
+					}
+					return nil
+				})
+			if release == nil {
+				t.Fatal("fixture never retained its background command")
+			}
+			defer release()
+			if failure != "fail_fast" && !errors.Is(err, checkpointErr) {
+				t.Fatalf("checkpoint failure was lost: %v", err)
+			}
+			if background.Err() != context.Canceled {
+				t.Fatalf("actual scheduler failure waited for background settlement: %v", background.Err())
+			}
+		})
+	}
+}
+
+func TestCommandCancellationScopeJoinCanBeInterruptedWithoutReleasingWorkers(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		ctx, finish := withCommandCancellationScope(ctx, cancel)
+		first := retainCommandCancellationScopes(ctx)
+		last := retainCommandCancellationScopes(ctx)
+		defer first()
+		defer last()
+		finish()
+		scope := ctx.Value(commandCancellationScopeKey{}).(*commandCancellationScope)
+
+		interrupt, stop := context.WithCancel(context.Background())
+		defer stop()
+		interrupted, joined := make(chan struct{}), make(chan struct{})
+		go func() {
+			scope.wait(interrupt)
+			close(interrupted)
+		}()
+		go func() {
+			scope.wait(context.Background())
+			close(joined)
+		}()
+		synctest.Wait()
+		select {
+		case <-interrupted:
+			t.Fatal("cleanup join returned before supervision or caller cancellation")
+		case <-joined:
+			t.Fatal("cleanup join returned with both workers outstanding")
+		default:
+		}
+
+		first()
+		stop()
+		synctest.Wait()
+		select {
+		case <-interrupted:
+		default:
+			t.Fatal("caller cancellation did not interrupt the cleanup join")
+		}
+		select {
+		case <-joined:
+			t.Fatal("an interrupted join released another waiter's cleanup worker")
+		default:
+		}
+		if ctx.Err() != nil {
+			t.Fatal("an interrupted join released the still-retained command scope")
+		}
+
+		last()
+		synctest.Wait()
+		select {
+		case <-joined:
+		default:
+			t.Fatal("last supervisor did not release the cleanup join")
+		}
+		if ctx.Err() != context.Canceled {
+			t.Fatal("completed scope retained cancellation after its workers returned")
+		}
+		scope.wait(context.Background()) // Already-drained scopes never block.
+	})
 }
 
 func TestParallelSchedulerReverseChainAndSettledOutputs(t *testing.T) {

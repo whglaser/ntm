@@ -17,8 +17,16 @@ import (
 // runParallelChildren supplies the canonical step lifecycle and persistence
 // boundaries to the body scheduler. It does not implement another executor.
 func (e *Executor) runParallelChildren(ctx context.Context, step *Step, workflow *Workflow, onError ErrorAction) ([]StepResult, error) {
+	release, err := e.acquireStepMaterialization(ctx, len(step.Parallel.Steps))
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	children, tasks, err := parallelChildDefinitions(step)
 	if err != nil {
+		return nil, err
+	}
+	if err := e.admitRuntimeIDs(ctx, runtimeStepIDs(children)); err != nil {
 		return nil, err
 	}
 	results := make([]StepResult, len(children))
@@ -164,7 +172,10 @@ func (e *Executor) runParallelChildren(ctx context.Context, step *Step, workflow
 					}
 				}
 				e.varMu.Unlock()
-				hookRecoveryErrors[i] = e.resumeParallelSuccessHooks(childCtx, &children[i], workflow)
+				hookRecoveryErrors[i] = e.prepareSuccessHooks(childCtx, &children[i], results[i])
+				if hookRecoveryErrors[i] == nil {
+					hookRecoveryErrors[i] = e.runOnSuccessSteps(childCtx, &children[i], workflow)
+				}
 				hooksSettled[i] = hookRecoveryErrors[i] == nil
 				receipts[i] = "" // Persist the new tail status after this attempt.
 				if err := hookRecoveryErrors[i]; err != nil {
@@ -193,7 +204,7 @@ func (e *Executor) runParallelChildren(ctx context.Context, step *Step, workflow
 					results[i].SkipReason = fmt.Sprintf("dependency failed: %v", blocked)
 				case parallelTaskCancelled:
 					results[i].Status = StatusCancelled
-					results[i].SkipKind = SkipKindCancelled
+					results[i].SkipKind = SkipKindCancelledBeforeDispatch
 					results[i].SkipReason = "cancelled before parallel child dispatch"
 				default:
 					return fmt.Errorf("parallel child %q produced no result", children[i].ID)
@@ -278,46 +289,6 @@ func (e *Executor) runParallelChildren(ctx context.Context, step *Step, workflow
 	}
 	e.completeParallelState(step.ID)
 	return results, persist()
-}
-
-// A retained hook body may itself have been interrupted in its success tail.
-// The ordinary walker skips that completed body, so visit its retained parents
-// first, using the SAME depth and runtime-address rules. Only the canonical
-// walker dispatches missing/unfinished hooks; no completed body is re-executed.
-func (e *Executor) resumeParallelSuccessHooks(ctx context.Context, parent *Step, workflow *Workflow) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if err := e.checkpointFailure(); err != nil {
-		return err
-	}
-	depth := onSuccessDepth(ctx)
-	if depth < maxOnSuccessDepth {
-		childCtx := withOnSuccessDepth(ctx, depth+1)
-		for i, child := range parent.OnSuccess {
-			child.ID = onSuccessChildStepID(parent.ID, child.ID, i+1)
-			e.stateMu.RLock()
-			prior, exists := e.state.Steps[child.ID]
-			_, inFlight := e.state.InFlightSteps[child.ID]
-			e.stateMu.RUnlock()
-			if exists && prior.StepID != child.ID {
-				return fmt.Errorf("success hook %q has mismatched saved identity; refusing recovery", child.ID)
-			}
-			if exists && !shouldRerunStep(prior) && inFlight {
-				return fmt.Errorf("success hook %q has contradictory in-flight completion evidence", child.ID)
-			}
-			if exists && prior.Status == StatusCompleted && !shouldRerunStep(prior) && len(child.OnSuccess) > 0 {
-				if err := e.resumeParallelSuccessHooks(childCtx, &child, workflow); err != nil {
-					return err
-				}
-			}
-		}
-	}
-	e.runOnSuccessSteps(ctx, parent, workflow)
-	if err := e.checkpointFailure(); err != nil {
-		return err
-	}
-	return ctx.Err()
 }
 
 // A direct parallel child carries this private capture through its canonical

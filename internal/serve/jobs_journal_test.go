@@ -1,7 +1,9 @@
 package serve
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -66,6 +68,203 @@ func TestJobJournalRoundTripAndInterruptedRecovery(t *testing.T) {
 	}
 }
 
+func TestJobJournalRecoveryChecksExcludedHistoryBeforeMutation(t *testing.T) {
+	journal, err := openJobJournal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer journal.Close()
+	base := time.Date(2026, time.November, 1, 0, 0, 0, 0, time.UTC)
+	ids := make([]string, 0, maxRetainedJobs+3)
+	for i := 0; i < maxRetainedJobs+3; i++ {
+		id := fmt.Sprintf("history-%04d", i)
+		ids = append(ids, id)
+		status := []JobStatus{JobStatusPending, JobStatusRunning, JobStatusCancelled}[i%3]
+		job := &Job{ID: id, Type: JobTypeSwarmSpawn, Status: status,
+			CreatedAt: base.Format(time.RFC3339), UpdatedAt: base.Format(time.RFC3339),
+			Error: "cancelled by user", Result: map[string]interface{}{
+				"session": "existing", "pane_id": "%9", "_execution_in_progress": true,
+			}}
+		if err := journal.save(job); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// ReadDir streams filesystem order, not sorted names. Put bad evidence at
+	// the actual end of that order without renaming its entry, so a one-pass
+	// rewrite would deterministically mutate earlier receipts before failing.
+	directory, err := os.Open(journal.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := directory.ReadDir(-1)
+	err = errors.Join(err, directory.Close())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var excludedID string
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".json") {
+			excludedID = strings.TrimSuffix(entry.Name(), ".json")
+		}
+	}
+	if excludedID == "" {
+		t.Fatal("missing fixture receipts")
+	}
+	excluded := &Job{ID: excludedID, Type: JobTypeSwarmSpawn, Status: JobStatusCompleted,
+		CreatedAt: base.Add(-time.Hour).Format(time.RFC3339), Result: map[string]interface{}{"session": "old-final"}}
+	validExcluded, err := json.Marshal(jobJournalRecord{Version: jobJournalVersion, Job: excluded})
+	if err != nil {
+		t.Fatal(err)
+	}
+	excludedPath := filepath.Join(journal.dir, excludedID+".json")
+	if err := os.WriteFile(excludedPath, validExcluded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	original := make(map[string][]byte, len(ids))
+	for _, id := range ids {
+		data, err := os.ReadFile(filepath.Join(journal.dir, id+".json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		original[id] = data
+	}
+	assertUnchanged := func(t *testing.T, excludedData []byte) {
+		t.Helper()
+		for id, before := range original {
+			if id == excludedID {
+				before = excludedData
+			}
+			after, err := os.ReadFile(filepath.Join(journal.dir, id+".json"))
+			if err != nil || !bytes.Equal(after, before) {
+				t.Fatalf("failed preflight rewrote or lost receipt %s: %v", id, err)
+			}
+		}
+	}
+	unsupported, err := json.Marshal(jobJournalRecord{Version: jobJournalVersion + 1, Job: excluded})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		data []byte
+	}{
+		{"trailing data", append(append([]byte(nil), validExcluded...), []byte(" {}")...)},
+		{"unsupported version", unsupported},
+		{"oversized record", append(append([]byte(nil), validExcluded...), bytes.Repeat([]byte(" "), jobJournalMaxRecordBytes+1-len(validExcluded))...)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.WriteFile(excludedPath, tc.data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := os.WriteFile(excludedPath, validExcluded, 0o600); err != nil {
+					t.Error(err)
+				}
+			})
+			jobs, err := journal.recover(base.Add(time.Hour))
+			if err == nil || jobs != nil {
+				t.Fatalf("out-of-window invalid history became a healthy view: count=%d error=%v", len(jobs), err)
+			}
+			assertUnchanged(t, tc.data)
+		})
+	}
+	for _, id := range []string{excludedID, "orphan-without-receipt"} {
+		t.Run("live fence "+id, func(t *testing.T) {
+			release, err := lockJobJournal(filepath.Join(journal.dir, id+".worker.lock"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer release()
+			jobs, err := journal.recover(base.Add(time.Hour))
+			if err == nil || !strings.Contains(err.Error(), "still active") || jobs != nil {
+				t.Fatalf("out-of-window worker was recovered: count=%d error=%v", len(jobs), err)
+			}
+			assertUnchanged(t, validExcluded)
+		})
+	}
+	// Separate operation receipts and uncommitted writes must not be decoded,
+	// pruned, or rewritten by job-history retention.
+	operationPath := jobOperationPath(journal.dir, "retain-uncertain-operation")
+	if err := os.MkdirAll(filepath.Dir(operationPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	untouched := map[string][]byte{
+		operationPath: []byte(`{"status":"running","evidence":"unchanged"}`),
+		filepath.Join(journal.dir, ".job-uncommitted.tmp"): []byte("incomplete write"),
+	}
+	for path, data := range untouched {
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	recoveredAt := base.Add(time.Hour)
+	jobs, err := journal.recover(recoveredAt)
+	if err != nil || len(jobs) != maxRetainedJobs {
+		t.Fatalf("recovery did not bound retained payloads: count=%d error=%v", len(jobs), err)
+	}
+	expected := NewJobStore()
+	recoveredBytes := make(map[string][]byte, len(ids))
+	for _, id := range ids {
+		data, err := os.ReadFile(filepath.Join(journal.dir, id+".json"))
+		if err != nil {
+			t.Fatalf("retention removed receipt %s: %v", id, err)
+		}
+		recoveredBytes[id] = data
+		var before, after jobJournalRecord
+		if err := json.Unmarshal(original[id], &before); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(data, &after); err != nil {
+			t.Fatal(err)
+		}
+		if id == excludedID {
+			if !bytes.Equal(data, original[id]) {
+				t.Fatal("retention rewrote an old final receipt")
+			}
+		} else {
+			wantStatus := JobStatusFailed
+			if before.Job.Status == JobStatusCancelled {
+				wantStatus = JobStatusCancelled
+				if after.Job.Error != before.Job.Error {
+					t.Fatalf("recovery replaced cancellation reason for %s", id)
+				}
+			}
+			if after.Job.Status != wantStatus || after.Job.UpdatedAt != recoveredAt.Format(time.RFC3339) ||
+				after.Job.Result["outcome_unknown"] != true || after.Job.Result["interrupted"] != true ||
+				after.Job.Result["_execution_in_progress"] != nil || after.Job.Result["pane_id"] != "%9" {
+				t.Fatalf("interrupted receipt was not recovered, including outside retention: %+v", after.Job)
+			}
+		}
+		expected.jobs[id] = after.Job
+	}
+	expected.mu.Lock()
+	expected.evictTerminalLocked(maxRetainedJobs)
+	expected.mu.Unlock()
+	if !reflect.DeepEqual(jobs, expected.List()) {
+		t.Fatal("bounded recovery changed existing retention membership or display order at tied timestamps")
+	}
+	again, err := journal.recover(recoveredAt.Add(time.Hour))
+	if err != nil || !reflect.DeepEqual(jobs, again) {
+		t.Fatalf("bounded recovery is not idempotent: %v", err)
+	}
+	loaded, err := journal.load()
+	if err != nil || !reflect.DeepEqual(jobs, loaded) {
+		t.Fatalf("read-only history differs from bounded recovery: %v", err)
+	}
+	for id, before := range recoveredBytes {
+		after, err := os.ReadFile(filepath.Join(journal.dir, id+".json"))
+		if err != nil || !bytes.Equal(before, after) {
+			t.Fatalf("repeat recovery rewrote or lost receipt %s: %v", id, err)
+		}
+	}
+	for path, before := range untouched {
+		after, err := os.ReadFile(path)
+		if err != nil || !bytes.Equal(before, after) {
+			t.Fatalf("job retention changed separate durable evidence %s: %v", path, err)
+		}
+	}
+}
+
 func TestJobJournalFailedSaveKeepsLastCheckpoint(t *testing.T) {
 	journal, err := openJobJournal(t.TempDir())
 	if err != nil {
@@ -91,6 +290,45 @@ func TestJobJournalFailedSaveKeepsLastCheckpoint(t *testing.T) {
 	jobs, err = journal.load()
 	if err != nil || jobs[0].Result["session"] != "keep" {
 		t.Fatalf("oversized write destroyed checkpoint: %+v %v", jobs, err)
+	}
+}
+
+func TestJobOutcomePublicationFollowsDurableCheckpoint(t *testing.T) {
+	srv, journal := progressJournalServer(t)
+	job := srv.jobStore.Create(JobTypeSwarmSpawn)
+	srv.jobStore.Update(job.ID, JobStatusRunning, 0, nil, "")
+	if _, err := srv.checkpointJobProgress(job.ID, map[string]interface{}{"pane_id": "%17"}); err != nil {
+		t.Fatal(err)
+	}
+	result := map[string]interface{}{"pane_id": "%17", "finished": true}
+	writes := 0
+	err := srv.jobStore.checkpointOutcome(job.ID, JobStatusCompleted, 100, result, "", func(candidate *Job) error {
+		writes++
+		// The publication helper holds the store lock, so this inspection
+		// observes the exact row that concurrent GET/list requests will read.
+		visible := srv.jobStore.jobs[job.ID]
+		if visible.Status != JobStatusRunning || visible.Result["finished"] != nil || candidate == visible {
+			t.Fatalf("terminal outcome was published before persistence: %+v", visible)
+		}
+		prior, err := journal.load()
+		if err != nil || len(prior) != 1 || prior[0].Status != JobStatusRunning {
+			t.Fatalf("expected the actual preceding checkpoint: %+v %v", prior, err)
+		}
+		if candidate.Status != JobStatusCompleted || candidate.Result["finished"] != true {
+			t.Fatalf("writer did not receive the complete terminal candidate: %+v", candidate)
+		}
+		return journal.save(candidate)
+	})
+	if err != nil || writes != 1 {
+		t.Fatalf("terminal checkpoint: writes=%d error=%v", writes, err)
+	}
+	visible := srv.jobStore.Get(job.ID)
+	persisted, err := journal.load()
+	if err != nil || len(persisted) != 1 || !reflect.DeepEqual(visible, persisted[0]) || visible.Status != JobStatusCompleted {
+		t.Fatalf("published terminal outcome differs from its durable receipt: %+v %+v %v", visible, persisted, err)
+	}
+	if len(result) != 2 {
+		t.Fatalf("publication modified the engine's result: %+v", result)
 	}
 }
 
@@ -303,12 +541,16 @@ func TestJobProgressCheckpointIsImmutableAndDurable(t *testing.T) {
 		t.Fatal(err)
 	}
 	final := finishJobProgress(snapshot, map[string]interface{}{"session": "partial", "monitor_pid": 42})
-	srv.jobStore.retainCancelledResult(job.ID, final)
+	if err := srv.checkpointJobOutcome(job.ID, JobStatusCompleted, 100, final, ""); err != nil {
+		t.Fatal(err)
+	}
 	got := srv.jobStore.Get(job.ID)
 	if got.Status != JobStatusCancelled || got.Error != "cancelled by user" || got.Result["monitor_pid"] != 42 || got.Result["_execution_in_progress"] != nil {
 		t.Fatalf("late final result did not replace progress safely: %+v", got)
 	}
-	srv.jobStore.retainCancelledResult(job.ID, map[string]interface{}{"monitor_pid": 99})
+	if err := srv.checkpointJobOutcome(job.ID, JobStatusCompleted, 100, map[string]interface{}{"monitor_pid": 99}, ""); err != nil {
+		t.Fatal(err)
+	}
 	if srv.jobStore.Get(job.ID).Result["monitor_pid"] != 42 {
 		t.Fatal("a final cancellation receipt was replaced")
 	}

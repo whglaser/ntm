@@ -120,7 +120,7 @@ func validateBranchDecisions(state *ExecutionState) error {
 	return nil
 }
 
-// prepareBranchDecision returns the original selector result and selected body.
+// prepareBranchDecision returns the saved selector text and selected body.
 // Even default fallback records BOTH keys. Anonymous child IDs use the matched
 // map key, so the dispatcher and recovery namespace resolver agree even when
 // the selector returns an arbitrary string that falls back to "default".
@@ -170,12 +170,23 @@ func (e *Executor) prepareBranchDecision(ctx context.Context, step *Step) (branc
 		if _, err := lookupBranch(step.Branches, key); err != nil {
 			return fail(err)
 		}
-		decision = branchDecision{Version: branchDecisionVersion, ParentID: step.ID, DefinitionHash: digest, SelectorKey: key, BranchKey: matched}
+		// JSON cannot preserve invalid UTF-8 in a string. Canonicalize only
+		// this diagnostic text, after matching the original byte-exact key,
+		// so both copies of the checkpoint identity survive serialization.
+		// The source journal retains the exact stdout bytes and their hash;
+		// dispatch and recovery continue to use the original matched key.
+		decision = branchDecision{Version: branchDecisionVersion, ParentID: step.ID, DefinitionHash: digest,
+			SelectorKey: strings.ToValidUTF8(key, "\uFFFD"), BranchKey: matched}
 	}
 	body, found := step.Branches[decision.BranchKey]
 	if !found {
 		return fail(fmt.Errorf("saved branch %q is missing from step %q; refusing fallback during recovery", decision.BranchKey, step.ID))
 	}
+	release, err := e.retainDefinitionMaterialization(ctx, body)
+	if err != nil {
+		return fail(err)
+	}
+	defer release()
 	steps, err := parseBranchSteps(body, step.ID, decision.BranchKey)
 	if err != nil {
 		return fail(fmt.Errorf("failed to parse branch body: %w", err))
@@ -226,6 +237,16 @@ func (e *Executor) prepareBranchDecision(ctx context.Context, step *Step) (branc
 			}
 		}
 	}
+	if err := e.admitRuntimeBatch(ctx, func(yield func(string) error) error {
+		for i := range steps {
+			if err := yield(scopedChildStepID(step.ID, steps[i].ID, i+1)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		return fail(err)
+	}
 	owned := branchBodyOutputVars(steps)
 	for name := range decision.Scope {
 		if _, ok := owned[name]; !ok {
@@ -272,6 +293,24 @@ func branchChildHash(result StepResult, outputs map[string]interface{}) (string,
 	}{result, outputs})
 	if err != nil {
 		return "", fmt.Errorf("hash branch child result: %w", err)
+	}
+
+	// Hash the representation that can actually survive the ExecutionState
+	// JSON checkpoint. Interface-backed parsed/output values may carry richer
+	// Go types before persistence (for example json.Number("1.0")); LoadState
+	// decodes them into ordinary JSON values, and re-marshalling those values
+	// can otherwise produce different bytes ("1.0" -> "1"). A receipt created
+	// from the live representation would then reject its own durable result.
+	//
+	// Round-tripping here intentionally uses the same encoding/json semantics as
+	// state persistence, so the receipt binds to exactly what resume can recover.
+	var durable interface{}
+	if err := json.Unmarshal(data, &durable); err != nil {
+		return "", fmt.Errorf("canonicalize branch child result: %w", err)
+	}
+	data, err = json.Marshal(durable)
+	if err != nil {
+		return "", fmt.Errorf("canonicalize branch child result: %w", err)
 	}
 	digest := sha256.Sum256(data)
 	return hex.EncodeToString(digest[:]), nil
@@ -338,7 +377,12 @@ func (e *Executor) adoptBranchChild(ctx context.Context, decision branchDecision
 			// A native command journal can reconstruct the result of a child
 			// interrupted during hooks. The existing hook runner adopts its
 			// own completed children; do not run the original command again.
-			e.runOnSuccessSteps(ctx, child, workflow)
+			if err := e.prepareSuccessHooks(ctx, child, prior); err != nil {
+				return StepResult{}, false, err
+			}
+			if err := e.runOnSuccessSteps(ctx, child, workflow); err != nil {
+				return StepResult{}, false, err
+			}
 		}
 	}
 	return prior, true, nil
@@ -456,6 +500,11 @@ func (e *Executor) branchHasChildEvidence(parent *Step) bool {
 		}
 	}
 	for id := range e.state.CommandExecutions {
+		if belongs(id) {
+			return true
+		}
+	}
+	for id := range e.state.CommandEvaluations {
 		if belongs(id) {
 			return true
 		}

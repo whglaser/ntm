@@ -9,6 +9,51 @@ import (
 	"time"
 )
 
+func TestWorkflowManualAdvanceSelectsExactActiveEdge(t *testing.T) {
+	template := &WorkflowTemplate{
+		Name: "manual-choice", Coordination: CoordPipeline,
+		Agents: []WorkflowAgent{{Profile: "cod", Role: "review"}},
+		Flow: &FlowConfig{Initial: "review", Stages: []string{"review", "automatic", "approved", "revise", "done"}, Transitions: []Transition{
+			{From: "review", To: "automatic", Trigger: Trigger{Type: TriggerAgentSays, Pattern: "APPROVED", Label: "choose"}},
+			{From: "review", To: "approved", Trigger: Trigger{Type: TriggerManual, Label: "choose"}},
+			{From: "review", To: "revise", Trigger: Trigger{Type: TriggerManual, Label: "choose"}},
+			{From: "revise", To: "done", Trigger: Trigger{Type: TriggerManual}},
+		}},
+	}
+	coordinator, err := NewCoordinator(template, []CoordinatorAgent{{ID: "%1", Role: "review"}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := coordinator.(*PipelineCoordinator)
+	ctx := &TriggerContext{Context: t.Context(), ProjectRoot: t.TempDir()}
+	if err := runtime.AdvanceManual(ctx, 2); err == nil {
+		t.Fatal("manual selection advanced an unstarted coordinator")
+	}
+	if err := runtime.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Stop()
+	for _, index := range []int{-1, 0, 3, len(template.Flow.Transitions)} {
+		if err := runtime.AdvanceManual(ctx, index); err == nil || runtime.CurrentStage() != "review" {
+			t.Fatalf("manual request %d selected an automatic, inactive, or missing edge: %v stage=%s", index, err, runtime.CurrentStage())
+		}
+	}
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := runtime.AdvanceManual(&TriggerContext{Context: cancelled}, 2); !errors.Is(err, context.Canceled) || runtime.CurrentStage() != "review" {
+		t.Fatalf("cancelled manual request advanced: %v stage=%s", err, runtime.CurrentStage())
+	}
+	if err := runtime.AdvanceManual(ctx, 2); err != nil || runtime.CurrentStage() != "revise" {
+		t.Fatalf("exact second manual edge was not selected: %v stage=%s", err, runtime.CurrentStage())
+	}
+	if err := runtime.AdvanceManual(ctx, 1); err == nil || runtime.CurrentStage() != "revise" {
+		t.Fatalf("old stage choice advanced a later stage: %v stage=%s", err, runtime.CurrentStage())
+	}
+	if err := runtime.AdvanceManual(ctx, 3); err != nil || runtime.CurrentStage() != "done" {
+		t.Fatalf("unlabelled manual edge could not be selected by index: %v stage=%s", err, runtime.CurrentStage())
+	}
+}
+
 func TestCoordinatorTransitionsAndRoutesTasks(t *testing.T) {
 	template := &WorkflowTemplate{
 		Name: "review-flow", Coordination: CoordPingPong,
@@ -283,6 +328,129 @@ func TestCoordinatorTransitionEvidenceDoesNotOverrideOtherTriggers(t *testing.T)
 	ctx.TransitionEvidence = map[int]bool{}
 	if transitioned, err := runtime.Evaluate(ctx); err != nil || !transitioned {
 		t.Fatalf("Evaluate() after timer = (%v, %v), empty receipts must not block time trigger", transitioned, err)
+	}
+}
+
+func TestCoordinatorCheckDeadlineBoundsCommandEvaluation(t *testing.T) {
+	for _, kind := range []TriggerType{TriggerCommandSuccess, TriggerCommandFailure} {
+		t.Run(string(kind), func(t *testing.T) {
+			template := &WorkflowTemplate{
+				Name: "bounded-check", Coordination: CoordPipeline,
+				Agents: []WorkflowAgent{{Profile: "cc", Role: "review"}},
+				Flow: &FlowConfig{Initial: "review", Stages: []string{"review", "done"}, Transitions: []Transition{
+					{From: "review", To: "done", Trigger: Trigger{Type: kind, Command: "sleep 2"}},
+				}},
+			}
+			coordinator, err := NewCoordinator(template, nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			runtime := coordinator.(*PipelineCoordinator)
+			runCtx, cancelRun := context.WithTimeout(t.Context(), 3*time.Second)
+			defer cancelRun()
+			ctx := &TriggerContext{Context: runCtx, ProjectRoot: t.TempDir()}
+			if err := runtime.Start(ctx); err != nil {
+				t.Fatal(err)
+			}
+			defer runtime.Stop()
+			checkCtx, cancelCheck := context.WithTimeout(runCtx, 50*time.Millisecond)
+			defer cancelCheck()
+			ctx.CheckContext = checkCtx
+			started := time.Now()
+			fired, err := runtime.Evaluate(ctx)
+			if fired || !errors.Is(err, context.DeadlineExceeded) || runtime.CurrentStage() != "review" {
+				t.Fatalf("expired command check advanced workflow: fired=%v err=%v stage=%s", fired, err, runtime.CurrentStage())
+			}
+			if elapsed := time.Since(started); elapsed >= time.Second {
+				t.Fatalf("evaluation ignored its shorter deadline: elapsed=%s", elapsed)
+			}
+			if err := runCtx.Err(); err != nil {
+				t.Fatalf("check deadline canceled the workflow lifecycle: %v", err)
+			}
+		})
+	}
+}
+
+func TestCoordinatorExpiredCheckCannotAdvanceFromReceiptsOrLateResults(t *testing.T) {
+	for _, receipt := range []bool{false, true} {
+		name := "late trigger result"
+		trigger := Trigger{Type: TriggerTimeElapsed, Minutes: 1}
+		if receipt {
+			name = "saved verdict receipt"
+			trigger = Trigger{Type: TriggerAgentSays, Pattern: "APPROVED"}
+		}
+		t.Run(name, func(t *testing.T) {
+			template := &WorkflowTemplate{
+				Name: "expired-check", Coordination: CoordPipeline,
+				Agents: []WorkflowAgent{{Profile: "cc", Role: "review"}},
+				Flow:   &FlowConfig{Initial: "review", Stages: []string{"review", "done"}, Transitions: []Transition{{From: "review", To: "done", Trigger: trigger}}},
+			}
+			coordinator, err := NewCoordinator(template, nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			runtime := coordinator.(*PipelineCoordinator)
+			start := time.Now()
+			ctx := &TriggerContext{Context: t.Context(), Now: func() time.Time { return start }}
+			if err := runtime.Start(ctx); err != nil {
+				t.Fatal(err)
+			}
+			defer runtime.Stop()
+			checkCtx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			ctx.CheckContext = checkCtx
+			if receipt {
+				ctx.TransitionEvidence = map[int]bool{0: true}
+				cancel()
+			} else {
+				ctx.Now = func() time.Time {
+					cancel() // The check returns a valid match after its lease ended.
+					return start.Add(time.Minute)
+				}
+			}
+			if fired, err := runtime.Evaluate(ctx); fired || !errors.Is(err, context.Canceled) || runtime.CurrentStage() != "review" {
+				t.Fatalf("expired observation advanced: fired=%v err=%v stage=%s", fired, err, runtime.CurrentStage())
+			}
+		})
+	}
+}
+
+func TestCoordinatorCheckContextDoesNotCancelDestinationStage(t *testing.T) {
+	projectRoot := t.TempDir()
+	template := &WorkflowTemplate{
+		Name: "check-lifetime", Coordination: CoordPipeline,
+		Agents: []WorkflowAgent{{Profile: "cc", Role: "watch"}},
+		Flow: &FlowConfig{Initial: "prepare", Stages: []string{"prepare", "watch", "done"}, Transitions: []Transition{
+			{From: "prepare", To: "watch", Trigger: Trigger{Type: TriggerTimeElapsed, Minutes: 1}},
+			{From: "watch", To: "done", Trigger: Trigger{Type: TriggerFileCreated, Pattern: "*.done"}},
+		}},
+	}
+	coordinator, err := NewCoordinator(template, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := coordinator.(*PipelineCoordinator)
+	now := time.Now()
+	ctx := &TriggerContext{Context: t.Context(), ProjectRoot: projectRoot, Now: func() time.Time { return now }}
+	if err := runtime.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Stop()
+	checkCtx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	ctx.CheckContext = checkCtx
+	now = now.Add(time.Minute)
+	if fired, err := runtime.Evaluate(ctx); err != nil || !fired || runtime.CurrentStage() != "watch" {
+		t.Fatalf("initial transition failed: fired=%v err=%v stage=%s", fired, err, runtime.CurrentStage())
+	}
+	cancel() // The completed poll ends while the destination stage keeps running.
+	if err := os.WriteFile(filepath.Join(projectRoot, "ready.done"), []byte("ready"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Exercise the destination's retained lifecycle context, including its
+	// live filesystem trigger, after the earlier operation was canceled.
+	if fired, err := runtime.Evaluate(runtime.triggerCtx); err != nil || !fired || runtime.CurrentStage() != "done" {
+		t.Fatalf("old check canceled destination work: fired=%v err=%v stage=%s", fired, err, runtime.CurrentStage())
 	}
 }
 

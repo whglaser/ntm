@@ -184,6 +184,25 @@ after its text scrolls out of the retained response buffer. `--resume` also
 observes responses produced while the runner was stopped without sending
 confirmed prompts again.
 
+`file_created` and `file_modified` also retain a durable boundary. Before a
+stage sends its first prompt, NTM checkpoints the matching regular files and
+their fingerprints. On `--resume`, it compares the current tree with that
+original boundary, so a matching file created or changed while the runner was
+stopped can complete the stage without another prompt. An unchanged file that
+already existed when the stage began does not complete new work. Content
+fingerprints detect offline changes even when file size and timestamps were
+preserved. Symlinks and the workflow checkpoint directory are excluded from
+this evidence, so NTM's own state writes cannot satisfy a broad file pattern.
+
+Observed file completions are retained until the destination stage commits,
+even if the matching file is removed afterward. Each visit to a stage and
+each intentional retry receives a fresh file boundary. A checkpoint with
+missing, mismatched, or invalid filesystem evidence cannot resume an
+already-dispatched file-triggered stage; inspect the work before using
+`--restart`. Filesystem inventories and fingerprint reads are bounded, and an
+unreadable or oversized matching set is reported explicitly. Narrow the
+trigger pattern when an inventory exceeds its limits.
+
 A review gate requiring several replies must prompt those reviewers: use
 `parallel_within_stage = true` or stage-to-role routing that selects the full
 reviewer role. A stage named exactly after its role otherwise uses the
@@ -251,15 +270,40 @@ checkpoint's `errors` list and in the `faults` list of the `--json` result
 | `restart_agent` | Restarts the faulted pane with the same engine as `ntm respawn`: respawns the pane, replays its saved launch command, and waits until the agent is ready. The run then binds to the replacement process. If the pane had already received the current stage's prompt, the prompt is sent again, and any verdict the previous process gave in this stage is discarded. Each pane may restart at most `[resilience] max_restarts` times per run (default 3); the next fault aborts the run, so a crash loop cannot restart forever. If a restart does not end with a ready agent, the run stops with reason `restart-failed`. Not valid for `on_timeout`, because a timeout names no agent. |
 | `pause` | Saves a paused checkpoint and stops with reason `paused`. Continue with `--resume` once the agent is healthy. |
 | `abort` | Stops with reason `aborted`. |
-| `notify` | Reports the fault and keeps running. An unset `on_agent_crash` or `on_agent_error` behaves the same way. |
-| `skip_stage` | Leaves the current stage through its first usable outgoing transition. |
+| `notify` | Reports the fault and keeps running. An unset `on_agent_crash`, `on_agent_error`, or `on_timeout` behaves the same way. |
+| `skip_stage` | Leaves the current stage through its first configured outgoing transition. The destination and history are checkpointed before its prompts are sent; a failed transition or checkpoint stops recovery. |
 | `retry` | Sends the current stage prompt to its panes again, up to `max_retries_per_stage` times, then aborts. It does not restart a crashed agent. |
 
-`stage_timeout_minutes` starts a timer for each stage. If the stage is still
-current when the timer expires, `on_timeout` runs; it accepts any action
-except `restart_agent`. A `parallel` template without a flow sends its
-prompts once and completes, so its agents are checked once, just before that
-dispatch, and that single check acts only on confirmed crashes.
+Retry and restart allowances belong to the saved workflow run. `--resume`
+retains the counts already consumed, including across repeated resumes.
+Each allowance is checkpointed before another prompt is sent or an agent
+process is restarted. If that write fails, the runner stops with
+`checkpoint-failed` without performing the recovery action. An unfinished
+checkpoint created before recovery budgets were recorded cannot safely
+resume a retry/restart policy; inspect the existing work before choosing a
+deliberate `--restart`.
+
+`stage_timeout_minutes` saves an absolute deadline for each stage visit and
+prompt round before its first delivery. Downtime counts toward that deadline;
+an expired resumed round runs `on_timeout` before sending any pending prompts.
+The policy accepts any action except `restart_agent`, and defaults to `notify`
+when omitted. A deliberate `retry` receives a fresh deadline while retaining
+the consumed retry allowance. Polling, pane observations, and command-trigger
+checks honor the remaining time instead of extending the round.
+
+The runner records timeout intent before acting and acknowledges completed
+`pause`, `notify`, and `abort` actions afterward. Resuming a handled pause or
+notification does not replay it or rearm that round. A previously aborted
+timeout or an interrupted action with an unknown outcome cannot be resumed;
+inspect the work before a deliberate `--restart`. The same refusal applies
+when a saved timed round lacks its original deadline or contains mismatched
+stage, visit, or prompt-round evidence. A successful skip commits its new stage
+and clears the previous deadline atomically, including a transition back to
+the same stage.
+
+A `parallel` template without a flow sends its prompts once and completes, so
+its agents are checked once, just before that dispatch, and that single check
+acts only on confirmed crashes.
 
 ### Best Practices
 
@@ -452,6 +496,103 @@ The `mail` channel sends as `ntm-pipeline`, using the workflow's working
 directory as the Agent Mail project key (the same key `mail_send` steps take
 explicitly as `project_key`).
 
+### Selector Output Limits
+
+Shell branch predicates, external foreach sources, and bead queries retain their
+successful stdout in the run checkpoint so ordinary resume can reuse the result
+without repeating source effects. Configure their capture limits and aggregate
+journal budget under `settings.limits`:
+
+```yaml
+settings:
+  limits:
+    max_command_stdout_bytes: 16777216       # Per source: 16 MiB
+    max_command_stderr_bytes: 4194304        # Per source: 4 MiB
+    max_selector_output_bytes_total: 33554432 # Retained stdout + reservations: 32 MiB
+```
+
+All values are bytes; omitted or nonpositive workflow limits use their defaults.
+Each new selector reserves its full stdout allowance before launch. On proven
+success the charge becomes its actual retained bytes. Unresolved selectors keep
+the original full reservation until their outcome is explicitly recovered or
+their scope is deliberately reset. Existing cached outcomes remain available
+even when a saved journal exceeds the aggregate budget.
+
+Parallel sources wait within their source deadlines while active reservations
+can shrink. If the retained evidence makes admission impossible, a new source is
+refused before launch. Lower the per-source stdout cap for small outputs, or
+increase the aggregate budget when more retained output is expected. The
+aggregate limit does not cap other checkpoint fields, parsed item lists, or
+temporary capture and serialization copies.
+
+For an existing frozen run, a positive
+`ntm pipeline resume <run-id> --max-selector-output-bytes-total <bytes>` override
+changes admission policy for that attempt without changing captured output,
+receipt identity, or the frozen workflow. REST resume requests and
+`pipeline_resume` jobs accept `max_selector_output_bytes_total` with the same
+meaning. Zero uses the frozen workflow's configured limit or its default;
+negative resume overrides are rejected.
+
+### Step Admission and Materialization Limits
+
+Dynamic workflows have two independent node limits, both defaulting to 100,000:
+
+```yaml
+settings:
+  limits:
+    max_step_count_total: 100000
+    max_materialized_step_nodes: 100000
+```
+
+`max_step_count_total` bounds the distinct concrete runtime step IDs admitted
+over the life of a run. Workflow roots reserve IDs before execution; containers
+admit child batches before dispatch. Foreach with a literal round count admits
+the complete eligible expansion together. Expression-driven rounds and legacy
+loops admit each round or iteration before its body starts. A refused batch adds
+no child IDs, results, in-flight entries, or command launch receipts.
+
+Retries and resumed work reuse their existing IDs. Explicit scope resets also
+retain admissions; a fresh run starts a new ledger. Older checkpoints seed the
+ledger from their retained runtime evidence. A journal already above the current
+limit may reuse admitted IDs, but cannot add new ones. Admission records capacity
+only: it never establishes that an effect occurred, that a process terminated,
+or that replay is safe. Unresolved execution receipts retain their normal
+recovery requirements regardless of capacity overrides.
+
+Authored `on_cancel` and `post_pipeline_steps` roots reserve capacity before main
+work starts in a separate finalization allowance of the same size. Their nested
+work shares that allowance. Exhaustion in an earlier cleanup body does not
+consume a later root's reserved slot. Owned process-group termination remains
+part of the executor's cleanup regardless of these authored-step limits.
+
+`max_materialized_step_nodes` bounds the literal workflow definition and active
+copies retained by planners. The executor checks it before constructing its
+dependency graph, cloning eager foreach plans, decoding selected branches, or
+copying parallel bodies. Temporary leases are released when consumers finish.
+Nested planners fail promptly when the remaining capacity is insufficient;
+they do not wait for capacity held by an ancestor. This is a node limit, not a
+byte limit for command output, parsed item values, or the entire checkpoint.
+
+Main-work admission failure stops the attempt even with `on_error: continue`
+or retry policies. A completed native command whose success hook exceeds a
+limit retains its original receipt and output, allowing recovery to finish the
+hook without repeating that command. Ordinary post-pipeline failure policy is
+unchanged; later reserved finalization roots can still run.
+
+To increase capacity for one attempt of a frozen run, use:
+
+```bash
+ntm pipeline resume <run-id> --max-step-count-total 200000 \
+  --max-materialized-step-nodes 200000
+```
+
+REST resume requests and `pipeline_resume` jobs accept `max_step_count_total`
+and `max_materialized_step_nodes` with the same meaning. Positive values change
+only the current attempt, preserving the frozen workflow and receipt identities.
+Zero uses the frozen configuration or default. Negative resume values are
+rejected before checkpoint mutation. Omitted or nonpositive workflow settings
+use the defaults.
+
 ### Error Actions
 
 | Action | Behavior |
@@ -566,6 +707,15 @@ Define when a step is considered complete:
 | `time` | Wait for timeout duration only |
 | `none` | Fire and forget (don't wait) |
 
+For shell commands, `wait: none` completes the step after launching its owned
+process group. Normal completion of an enclosing parallel group or parallel
+foreach does not stop that command. It can serve downstream steps and
+`post_pipeline` hooks until workflow finalization cancels and joins it.
+Explicit cancellation and fail-fast still cancel the affected process groups.
+Explicit command and enclosing parallel-group deadlines
+remain active after a container returns; deadline expiry is a background failure,
+and unresolved cleanup continues to prevent automatic replay.
+
 ### Pi-safe prompts
 
 `pi` renders a prompt as Markdown before echoing it, so the delivery receipt
@@ -620,6 +770,7 @@ Completion still requires a stable idle streak unless this fallback fires:
 the detector must report idle for the configured number of consecutive polls
 (`ExecutorConfig.IdleStablePolls`, default 3), and the executor resets a
 pane's cached classification history when it starts a new step on it.
+
 
 ## Error Handling
 
@@ -704,6 +855,24 @@ are rejected so unknown-field validation can stay strict.
 2. The parallel group completes when all sub-steps finish
 3. If any sub-step fails, the group fails (unless `on_error: continue`)
 4. Outputs are accessible via `${steps.<sub_id>.output}`
+
+### Parallel Foreach Scheduling
+
+For `foreach` or `foreach_pane` with `parallel: true`, `max_concurrent` bounds
+worker creation as well as active iteration bodies. The effective width is
+capped by `settings.limits.max_concurrent_foreach` and the number of items in
+that fan-out. Queued items remain in the plan list until a worker slot opens.
+
+Cancellation and `on_error: fail_fast` stop further iteration launches.
+The executor joins active iteration workers before returning from the loop.
+Background command cleanup finishes before the workflow publishes its final
+outcome. Results retain item order even when workers finish out of order;
+filtered items and completed iterations reused on resume retain their own skip
+classifications. Pane assignment, filters, and iteration substitutions are
+resolved before any iteration body starts.
+
+Authored `loop_control: break` remains limited to sequential foreach; parallel
+foreach rejects it because other admitted iterations may already have effects.
 
 ## Conditional Steps
 

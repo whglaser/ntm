@@ -380,10 +380,25 @@ func buildRouterOperation(rt RouterRoute, components *OpenAPIComponents) *Operat
 	case "handleCancelJob":
 		op.Responses["409"] = errorResponse("Job is not cancellable in its current state")
 		op.Responses["503"] = errorResponse("Cancellation signalled but its receipt could not be checkpointed")
+	case "handleResumePipeline":
+		op.Description += " By default this request waits for the resumed workflow and remains tied to the HTTP connection. Set background=true to continue the saved run in a detached worker that survives client disconnection and server exit. A 202 response acknowledges worker startup, not workflow completion; poll the existing run ID for status and use its cancel endpoint to stop it. Detached resume uses saved variables and rejects nonempty variable overrides. An omitted session is resolved from the checkpoint by the worker after it acquires run ownership."
+		synchronous := op.Responses["200"]
+		synchronous.Description = "Synchronous resume completed"
+		op.Responses["200"] = synchronous
+		accepted := synchronous
+		accepted.Description = "Detached resume accepted; response includes the saved run_id, workflow_id, session, pending status, progress, resumed=true, and background=true"
+		op.Responses["202"] = accepted
+		op.Responses["403"] = errorResponse("Missing pipelines:write permission")
+		op.Responses["409"] = errorResponse("Pipeline already has a live execution owner")
+		op.Responses["504"] = errorResponse("Detached startup canceled or timed out before authorization")
 	case "handleRecoverPipeline":
-		op.Description += " Uses the server's configured project, fixed for execution and HTTP idempotency replay; project and session overrides are not accepted. GET inspects receipt identities without prompt or transcript contents. POST records explicit acceptance only; use the ordinary resume endpoint or a pipeline_resume job to continue."
+		op.Description += " Uses the server's configured project, fixed for execution and HTTP idempotency replay; project and session overrides are not accepted. GET returns deliveries, commands, and selectors arrays containing receipt identities and acceptance eligibility without prompt, transcript, or captured output contents. POST records one explicit acceptance only; it does not launch work, signal processes, or infer settlement from a saved PID. Before accepting command or selector output, independently verify that the original process and all descendants have finished. Use the ordinary resume endpoint or a pipeline_resume job to continue."
 		op.Responses["403"] = errorResponse("Missing pipelines:read for inspection or pipelines:write for acceptance")
 		op.Responses["409"] = errorResponse("Run is owned, receipt is stale, or the recovery decision conflicts with saved state")
+		if rt.Method == http.MethodPost {
+			op.Responses["413"] = errorResponse("Encoded recovery request exceeds the server's 10 MiB body limit")
+			op.Responses["422"] = errorResponse("Request redaction refused sensitive outcome data before persistence")
+		}
 		op.Responses["503"] = errorResponse("Configured project is unavailable or recovery storage failed; inspect recovery before retrying")
 		op.Responses["504"] = errorResponse("Recovery canceled or timed out")
 	}
@@ -397,18 +412,36 @@ func buildRouterOperation(rt RouterRoute, components *OpenAPIComponents) *Operat
 			},
 		}
 	}
+	if rt.Handler == "handleResumePipeline" && rt.Method == http.MethodPost {
+		op.RequestBody.Description = "Resume the saved run; an empty body preserves synchronous behavior and saved session/variables."
+		op.RequestBody.Content["application/json"] = MediaType{Schema: &Schema{
+			Type: "object", AdditionalProperties: true,
+			Properties: map[string]*Schema{
+				"session":                         {Type: "string", Description: "Optional session override; omitted keeps the saved session subject to normal resume identity checks."},
+				"variables":                       {Type: "object", AdditionalProperties: true, Description: "Variable overrides for synchronous resume only. A nonempty object is rejected when background=true; detached resume retains saved variables."},
+				"background":                      {Type: "boolean", Description: "Start a detached worker and return 202 after startup is accepted. Defaults to false; does not opt into restarting completed work."},
+				"max_selector_output_bytes_total": {Type: "integer", Format: "int64", Description: "Zero or a positive selector-output byte budget for this attempt. Zero uses the saved workflow."},
+				"max_step_count_total":            {Type: "integer", Description: "Zero or a positive distinct runtime-step admission limit for this attempt. Zero uses the saved workflow."},
+				"max_materialized_step_nodes":     {Type: "integer", Description: "Zero or a positive transient step-planning limit for this attempt. Zero uses the saved workflow."},
+			},
+		}}
+	}
 	if rt.Handler == "handleRecoverPipeline" && rt.Method == http.MethodPost {
 		op.RequestBody.Required = true
-		op.RequestBody.Description = "One JSON object of at most 32 KiB. Unknown fields are rejected. The exact receipt_token returned by inspection and an explicit operator observation are required; acceptance never resends the prompt."
+		op.RequestBody.Description = "One JSON object of at most 10 MiB including encoded output and metadata. Unknown fields are rejected. Exactly one of accept_delivery, accept_command, or accept_selector must be true. Every decision requires the exact receipt_token returned by inspection and an operator observation. Command and selector decisions additionally require explicit exit_code and output values; an empty string records observed empty output. Delivery decisions cannot supply outcome fields. Output is never truncated, and invalid UTF-8 or unpaired Unicode surrogates are rejected. Enabled redact/block modes reject detected secrets before persistence."
 		op.RequestBody.Content["application/json"] = MediaType{Schema: &Schema{
 			Type: "object",
 			Properties: map[string]*Schema{
 				"step_id":         {Type: "string", Description: "Exact step_id returned by inspection."},
 				"receipt":         {Type: "string", Description: "Exact 64-character lowercase hexadecimal receipt_token returned by inspection."},
-				"accept_delivery": {Type: "boolean", Description: "Must be true to record acceptance."},
-				"reason":          {Type: "string", Description: "Operator observation; after trimming whitespace, 1 to 4096 UTF-8 bytes. Configured request redaction applies before persistence."},
+				"accept_delivery": {Type: "boolean", Description: "Accept the inspected agent delivery; mutually exclusive with accept_command and accept_selector."},
+				"accept_command":  {Type: "boolean", Description: "Accept the independently verified final outcome of the inspected foreground command; requires exit_code and output."},
+				"accept_selector": {Type: "boolean", Description: "Accept the independently verified final outcome of the inspected selector; requires exit_code and output."},
+				"exit_code":       {Type: "integer", Description: "Explicit observed exit code from 0 to 255 for a command or selector. Omitted and null values are refused for these decisions."},
+				"output":          {Type: "string", Description: "Complete observed UTF-8 output, including an explicit empty string when no output was produced. Use stdout for selectors and commands with output_parse, otherwise combined stdout and stderr. The encoded request and frozen capture limits apply; binary selector output can be recovered through the CLI."},
+				"reason":          {Type: "string", Description: "Operator observation; after trimming whitespace, 1 to 4096 UTF-8 bytes. Enabled redact/block modes reject detected secrets with 422 SECRETS_DETECTED before persistence; submitted values are never replaced with placeholders."},
 			},
-			Required:             []string{"step_id", "receipt", "accept_delivery", "reason"},
+			Required:             []string{"step_id", "receipt", "reason"},
 			AdditionalProperties: false,
 		}}
 	}

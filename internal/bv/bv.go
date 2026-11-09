@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"math/rand/v2"
 	"os"
@@ -27,6 +28,7 @@ import (
 
 	assignmentstore "github.com/Dicklesworthstone/ntm/internal/assignment"
 	"github.com/Dicklesworthstone/ntm/internal/sqliteutil"
+	"github.com/Dicklesworthstone/ntm/internal/util"
 	"github.com/Dicklesworthstone/ntm/internal/worksource"
 )
 
@@ -832,6 +834,106 @@ func HasLocalBeadsDB(dir string) bool {
 	return info.IsDir()
 }
 
+// beadsReadOnlyFlags stop br changing the tracker it reads. Without them an
+// ordinary read upgrades an older-schema database in place and can rebuild it
+// from JSONL, leaving events and non-default config only in .br_recovery.
+var beadsReadOnlyFlags = []string{"--no-auto-import", "--no-auto-flush"}
+
+// isBeadsReadCommand reports whether args is a br read that honors
+// beadsReadOnlyFlags. `info` is left out because br rewrites an older-schema
+// tracker under it even with those flags.
+func isBeadsReadCommand(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	switch args[0] {
+	case "list", "ready", "show", "stats", "blocked":
+		return true
+	case "dep":
+		return len(args) > 1 && (args[1] == "list" || args[1] == "tree")
+	}
+	return false
+}
+
+// readsWalkedUpTracker reports whether a br read for dir lands on a tracker that
+// was found by walking up and is not this project's own. dir alone cannot always
+// say: a caller that resolved the project first passes the tracker root itself,
+// so the walk from the process's own directory counts too.
+func readsWalkedUpTracker(dir string) bool {
+	if !HasLocalBeadsDB(dir) {
+		root, err := util.FindBeadsRoot(dir)
+		return err != nil || !trackerInSameRepo(dir, root)
+	}
+	cwd, err := os.Getwd()
+	if err != nil || HasLocalBeadsDB(cwd) {
+		return false
+	}
+	root, err := util.FindBeadsRoot(cwd)
+	if err != nil {
+		return false
+	}
+	rootInfo, err := os.Stat(root)
+	if err != nil {
+		return false
+	}
+	dirInfo, err := os.Stat(dir)
+	if err != nil || !os.SameFile(rootInfo, dirInfo) {
+		return false
+	}
+	return !trackerInSameRepo(cwd, root)
+}
+
+// trackerInSameRepo reports whether start and the tracker at root, an ancestor
+// of start, belong to one git repository: no directory from start up to but not
+// including root has a .git entry, and one exists at or above root. A .git file
+// (worktree or submodule) counts like a directory. Stat calls only, so a tree
+// with no repository, or a .git that cannot be read, stays on the safe side.
+func trackerInSameRepo(start, root string) bool {
+	dir, err := filepath.Abs(start)
+	if err != nil {
+		return false
+	}
+	for dir != root {
+		if _, err := os.Lstat(filepath.Join(dir, ".git")); !errors.Is(err, fs.ErrNotExist) {
+			return false
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return false
+		}
+		dir = parent
+	}
+	for {
+		if _, err := os.Lstat(filepath.Join(dir, ".git")); err == nil {
+			return true
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return false
+		}
+		dir = parent
+	}
+}
+
+// BeadsReadArgs returns a copy of args for running br from dir. When br would
+// reach a tracker by walking up, and that tracker is outside dir's own git
+// repository, ntm did not choose it, so a read of it gets beadsReadOnlyFlags. The
+// read can then lag a newer issues.jsonl until an ordinary br command imports it.
+// Writes, reads from a directory with its own .beads, and reads from anywhere
+// inside the tracker's repository are unchanged.
+func BeadsReadArgs(dir string, args []string) []string {
+	result := append([]string(nil), args...)
+	if !isBeadsReadCommand(result) || !readsWalkedUpTracker(dir) {
+		return result
+	}
+	for _, flag := range beadsReadOnlyFlags {
+		if !containsString(result, flag) {
+			result = append(result, flag)
+		}
+	}
+	return result
+}
+
 // RunBd executes br (beads_rust) with given args and returns stdout.
 // If br reports a missing database and suggests `--no-db`, it retries once with `--no-db`
 // and caches that preference for the remainder of the process.
@@ -908,8 +1010,14 @@ func runBdCommandContext(parent context.Context, dir string, options beadsComman
 	if err != nil {
 		return "", err
 	}
+	// Decide on the literal dir: normalization has already moved normalizedDir
+	// to the discovered tracker root, which always has a .beads of its own.
+	if options.projectBound {
+		args = append([]string(nil), args...)
+	} else {
+		args = BeadsReadArgs(dir, args)
+	}
 	dir = normalizedDir
-	args = append([]string(nil), args...)
 
 	// br's SQLite-backed workspace can self-contend when a single ntm process
 	// launches multiple br subprocesses against the same directory in parallel.

@@ -3,11 +3,16 @@
 package pipeline
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -21,7 +26,7 @@ func TestCommandOutputPreservesCompleteStdoutAndExitDiagnostics(t *testing.T) {
 		cancel()
 		if strings.HasSuffix(script, "exit 7") {
 			var exit *exec.ExitError
-			if out != nil || !errors.As(err, &exit) || exit.ExitCode() != 7 || string(exit.Stderr) != "abc" {
+			if out != nil || !errors.As(err, &exit) || exit.ExitCode() != 7 || string(exit.Stderr) != "abc" || errors.Is(err, errCommandOutputUnsettled) {
 				t.Fatalf("lost failure diagnostics or exposed partial stdout: %q %v", out, err)
 			}
 		} else if err != nil || string(out) != "12345" {
@@ -135,4 +140,599 @@ func TestCancelOnTruncationWriterRetainsBoundedBytes(t *testing.T) {
 	if capture.Len() != 4 || capture.Total() != 10004 || capture.String() != "1234" || ctx.Err() == nil {
 		t.Fatalf("unbounded bytes or missing cancellation: kept=%d total=%d context=%v", capture.Len(), capture.Total(), ctx.Err())
 	}
+}
+
+func TestCancelOnTruncationWriterTracksStreamFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	writer := &cancelOnTruncationWriter{capture: newCappedWriter(4), cancel: cancel}
+	reader, pipe := io.Pipe()
+	defer reader.Close()
+	defer pipe.Close()
+	done := make(chan error, 1)
+	go func() {
+		_, err := writer.ReadFrom(reader)
+		done <- err
+	}()
+	if _, err := pipe.Write([]byte("partial")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("ReaderFrom bypassed cancellation on truncation")
+	}
+	if writer.outputCaptureComplete() {
+		t.Fatal("truncation was mistaken for EOF while the source pipe remained open")
+	}
+	if err := pipe.CloseWithError(io.ErrUnexpectedEOF); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("wrapper lost the output read failure: %v", err)
+	}
+	if _, err := writer.ReadFrom(strings.NewReader("later")); err != nil {
+		t.Fatal(err)
+	}
+	if writer.outputCaptureComplete() || writer.capture.String() != "part" || writer.capture.Total() != 12 {
+		t.Fatalf("later EOF erased incomplete capture evidence: complete=%t output=%q total=%d",
+			writer.outputCaptureComplete(), writer.capture.String(), writer.capture.Total())
+	}
+}
+
+func TestCommandOutputLifecycleGatesDispatchAndPublication(t *testing.T) {
+	for _, phase := range []string{"before_start", "cancel_after_intent", "start_failure", "after_wait", "cancel_after_wait"} {
+		t.Run(phase, func(t *testing.T) {
+			root := t.TempDir()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			cmd := exec.Command("/bin/sh", "-c", "printf ran > marker; printf good")
+			cmd.Dir = root
+			if phase == "start_failure" {
+				cmd = exec.Command(filepath.Join(root, "missing"))
+			}
+			injected := errors.New("injected selector checkpoint failure")
+			beforeCalls, afterCalls := 0, 0
+			var observedErr error
+			observedSettled := false
+			ctx = context.WithValue(ctx, commandOutputLifecycleKey{}, &commandOutputLifecycle{
+				beforeStart: func(commandOutputRequest) ([]byte, bool, error) {
+					beforeCalls++
+					if phase == "before_start" {
+						return nil, false, injected
+					}
+					if phase == "cancel_after_intent" {
+						cancel()
+					}
+					return nil, false, nil
+				},
+				afterWait: func(observed *exec.Cmd, settled bool, _ []byte, err error) error {
+					afterCalls++
+					observedSettled, observedErr = settled, err
+					if observed != cmd {
+						t.Error("completion callback changed command identity")
+					}
+					if phase == "after_wait" {
+						return injected
+					}
+					if phase == "cancel_after_wait" {
+						cancel()
+					}
+					return nil
+				},
+			})
+			out, err := runCommandOutput(ctx, cmd, 64, 64)
+			if out != nil || err == nil || beforeCalls != 1 {
+				t.Fatalf("failed lifecycle admitted command output: %q %v before=%d", out, err, beforeCalls)
+			}
+			if phase == "before_start" {
+				if afterCalls != 0 || !errors.Is(err, injected) {
+					t.Fatalf("failed launch intent continued into completion: after=%d err=%v", afterCalls, err)
+				}
+			} else if afterCalls != 1 || !observedSettled {
+				t.Fatalf("lost no-process or completed-command proof: after=%d settled=%t error=%v", afterCalls, observedSettled, observedErr)
+			}
+			if phase == "after_wait" || phase == "cancel_after_wait" {
+				wantErr := injected
+				if phase == "cancel_after_wait" {
+					wantErr = context.Canceled
+				}
+				if !errors.Is(err, wantErr) || observedErr != nil || cmd.ProcessState == nil {
+					t.Fatalf("settlement persistence failure replaced the real process outcome: %v observed=%v", err, observedErr)
+				}
+				if data, err := os.ReadFile(filepath.Join(root, "marker")); err != nil || string(data) != "ran" {
+					t.Fatalf("fixture command never performed its effect: %q %v", data, err)
+				}
+			} else {
+				if cmd.Process != nil {
+					t.Fatal("failed prelaunch boundary started a process")
+				}
+				if _, err := os.Stat(filepath.Join(root, "marker")); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("failed prelaunch boundary performed work: %v", err)
+				}
+				if phase == "cancel_after_intent" && (!errors.Is(err, context.Canceled) || !errors.Is(observedErr, context.Canceled)) {
+					t.Fatalf("cancellation during checkpoint was lost: %v observed=%v", err, observedErr)
+				}
+				if phase == "start_failure" && observedErr == nil {
+					t.Fatal("start failure was not delivered with its no-process proof")
+				}
+			}
+		})
+	}
+}
+
+func TestCommandOutputRejectsEscapedInheritedPipes(t *testing.T) {
+	for _, stream := range []string{"stdout", "stderr"} {
+		for _, exitCode := range []int{0, 7} {
+			t.Run(fmt.Sprintf("%s/exit_%d", stream, exitCode), func(t *testing.T) {
+				root := t.TempDir()
+				script, release := escapedCommandOutputFixture(t, root, stream, exitCode)
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				observed, settled := false, true
+				var observedErr error
+				ctx = context.WithValue(ctx, commandOutputLifecycleKey{}, &commandOutputLifecycle{
+					afterWait: func(_ *exec.Cmd, proof bool, _ []byte, err error) error {
+						observed, settled, observedErr = true, proof, err
+						return nil
+					},
+				})
+				cmd := exec.Command("/bin/sh", "-c", script)
+				cmd.Dir, cmd.WaitDelay = root, 80*time.Millisecond
+				out, err := runCommandOutput(ctx, cmd, 64, 64)
+				if out != nil || !errors.Is(err, errCommandOutputUnsettled) || ctx.Err() != nil ||
+					!strings.Contains(err.Error(), stream+" output capture did not reach EOF") {
+					t.Fatalf("escaped %s was admitted as authoritative output: %q %v", stream, out, err)
+				}
+				if !observed || settled || !errors.Is(observedErr, errCommandOutputUnsettled) {
+					t.Fatalf("completion callback was given unsafe settlement authority: observed=%t settled=%t err=%v", observed, settled, observedErr)
+				}
+				if exitCode != 0 {
+					var exit *exec.ExitError
+					if !errors.As(err, &exit) || exit.ExitCode() != exitCode || string(exit.Stderr) != "diagnostic" {
+						t.Fatalf("uncertainty erased the original exit diagnostics: %v", err)
+					}
+				}
+				release()
+				if data, err := os.ReadFile(filepath.Join(root, "late-effect")); err != nil || string(data) != "late" {
+					t.Fatalf("fixture failed to demonstrate work surviving capture: %q %v", data, err)
+				}
+			})
+		}
+	}
+}
+
+func TestCommandOutputReusesDurableSuccessBytesAfterReload(t *testing.T) {
+	for _, empty := range []bool{false, true} {
+		t.Run(fmt.Sprintf("empty_%t", empty), func(t *testing.T) {
+			e := newCommandTestExecutor(t)
+			script := `printf x >> selections; printf '\377\000\300tail'`
+			want := []byte{0xff, 0, 0xc0, 't', 'a', 'i', 'l'}
+			if empty {
+				script, want = `printf x >> selections`, nil
+			}
+			step := &Step{ID: "source", Branch: "$(" + script + ")"}
+			command := func() *exec.Cmd {
+				cmd := exec.Command("/bin/sh", "-c", script)
+				cmd.Dir = e.config.ProjectDir
+				cmd.Env = []string{"SOURCE_VALUE=original", "DUP=discarded", "DUP=effective"}
+				return cmd
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			out, err := runCommandOutput(e.commandEvaluationContext(ctx, step), command(), 64, 64)
+			if err != nil || !bytes.Equal(out, want) {
+				t.Fatalf("initial complete output: %x %v", out, err)
+			}
+			prior, err := LoadState(e.config.ProjectDir, e.state.RunID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			record := prior.CommandEvaluations[step.ID]
+			if record.Status != commandExecutionSettled || !bytes.Equal(record.Output, want) || validateCommandEvaluation(step.ID, record) != nil {
+				t.Fatalf("saved success lost exact bytes or proof: %+v output=%x", record, record.Output)
+			}
+			if len(want) != 0 {
+				snapshot := e.snapshotState()
+				snapshot.CommandEvaluations[step.ID].Output[0] = 'z'
+				if !bytes.Equal(e.state.CommandEvaluations[step.ID].Output, want) {
+					t.Fatal("snapshot output aliases the live evaluation receipt")
+				}
+			}
+			fresh := NewExecutor(e.config)
+			fresh.state = prior
+			cmd := command()
+			// Equivalent effective environments have the same identity despite
+			// order changes or a duplicate variable that exec would discard.
+			cmd.Env = []string{"DUP=effective", "SOURCE_VALUE=original"}
+			out, err = runCommandOutput(fresh.commandEvaluationContext(ctx, step), cmd, 64, 64)
+			if err != nil || !bytes.Equal(out, want) || cmd.Process != nil {
+				t.Fatalf("reload reran or altered successful output: %x %v process=%v", out, err, cmd.Process)
+			}
+			if len(out) != 0 {
+				out[0] = 'z'
+				if !bytes.Equal(fresh.state.CommandEvaluations[step.ID].Output, want) {
+					t.Fatal("returned output aliases its durable receipt")
+				}
+			}
+			if data, err := os.ReadFile(filepath.Join(e.config.ProjectDir, "selections")); err != nil || string(data) != "x" {
+				t.Fatalf("successful evaluation effects were repeated: %q %v", data, err)
+			}
+		})
+	}
+}
+
+func TestCommandOutputInvocationFreezePreservesEffectiveEnvironment(t *testing.T) {
+	t.Setenv("PWD", "/inherited/logical/directory")
+	cmd := exec.Command("/bin/sh", "-c", "true")
+	before := cmd.Environ()
+	request := commandOutputRequest{Cmd: cmd, StdoutLimit: 64, StderrLimit: 64}
+	digest, err := commandEvaluationInvocationHash(request)
+	if err != nil || !filepath.IsAbs(cmd.Dir) || strings.Join(cmd.Env, "\x00") != strings.Join(before, "\x00") {
+		t.Fatalf("freezing an implicit cwd changed the effective launch environment: dir=%q env=%q err=%v", cmd.Dir, cmd.Env, err)
+	}
+	if again, err := commandEvaluationInvocationHash(request); err != nil || again != digest {
+		t.Fatalf("freezing a command twice changed its identity: %q %q %v", digest, again, err)
+	}
+}
+
+func TestCommandOutputRejectsChangedDurableInvocation(t *testing.T) {
+	for _, change := range []string{"expanded command", "executable", "directory", "environment", "definition", "stdout limit", "stderr limit", "invalid UTF-8 argument"} {
+		t.Run(change, func(t *testing.T) {
+			e := newCommandTestExecutor(t)
+			script := "printf x >> selections; printf original"
+			step := &Step{ID: "source", Branch: "${vars.expanded_selector}"}
+			command := func() *exec.Cmd {
+				cmd := exec.Command("/bin/sh", "-c", script, "source", string([]byte{0xff}))
+				cmd.Dir, cmd.Env = e.config.ProjectDir, []string{"SOURCE_VALUE=original"}
+				return cmd
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if _, err := runCommandOutput(e.commandEvaluationContext(ctx, step), command(), 64, 64); err != nil {
+				t.Fatal(err)
+			}
+			prior, err := LoadState(e.config.ProjectDir, e.state.RunID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.ReadFile(pipelineStatePath(e.config.ProjectDir, e.state.RunID))
+			if err != nil {
+				t.Fatal(err)
+			}
+			fresh := NewExecutor(e.config)
+			fresh.state = prior
+			cmd := command()
+			stdoutLimit, stderrLimit := int64(64), int64(64)
+			switch change {
+			case "expanded command":
+				cmd.Args[2] += "; printf changed"
+			case "executable":
+				cmd.Path = "/bin/false"
+			case "directory":
+				cmd.Dir = t.TempDir()
+			case "environment":
+				cmd.Env = []string{"SOURCE_VALUE=changed"}
+			case "definition":
+				step.Branch = "${vars.other_selector}"
+			case "stdout limit":
+				stdoutLimit++
+			case "stderr limit":
+				stderrLimit++
+			case "invalid UTF-8 argument":
+				cmd.Args[len(cmd.Args)-1] = string([]byte{0xfe})
+			}
+			out, err := runCommandOutput(fresh.commandEvaluationContext(ctx, step), cmd, stdoutLimit, stderrLimit)
+			if out != nil || err == nil || !strings.Contains(err.Error(), "expanded invocation changed") || cmd.Process != nil {
+				t.Fatalf("changed invocation reused output or launched work: %q %v process=%v", out, err, cmd.Process)
+			}
+			after, err := os.ReadFile(pipelineStatePath(e.config.ProjectDir, e.state.RunID))
+			if err != nil || !bytes.Equal(before, after) {
+				t.Fatalf("rejected invocation changed its saved evidence: %v", err)
+			}
+			if data, err := os.ReadFile(filepath.Join(e.config.ProjectDir, "selections")); err != nil || string(data) != "x" {
+				t.Fatalf("identity rejection repeated source effects: %q %v", data, err)
+			}
+		})
+	}
+}
+
+func TestCommandOutputLostSuccessCheckpointKeepsIntentUnresolved(t *testing.T) {
+	e := newCommandTestExecutor(t)
+	step := &Step{ID: "source", Branch: "$(printf x >> selections; printf complete)"}
+	ctx := e.commandEvaluationContext(context.Background(), step)
+	lifecycle := ctx.Value(commandOutputLifecycleKey{}).(*commandOutputLifecycle)
+	injected := errors.New("owner stopped before success checkpoint")
+	lifecycle.afterWait = func(_ *exec.Cmd, settled bool, output []byte, err error) error {
+		if !settled || err != nil || string(output) != "complete" {
+			t.Fatalf("fixture did not reach the completed-command crash boundary: settled=%t output=%q err=%v", settled, output, err)
+		}
+		return injected
+	}
+	cmd := exec.Command("/bin/sh", "-c", "printf x >> selections; printf complete")
+	cmd.Dir = e.config.ProjectDir
+	if out, err := runCommandOutput(ctx, cmd, 64, 64); out != nil || !errors.Is(err, injected) {
+		t.Fatalf("lost checkpoint published authoritative output: %q %v", out, err)
+	}
+	prior, err := LoadState(e.config.ProjectDir, e.state.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prior.CommandEvaluations[step.ID].Status != commandExecutionStarting {
+		t.Fatalf("lost success checkpoint erased launch intent: %+v", prior.CommandEvaluations)
+	}
+	fresh := NewExecutor(e.config)
+	fresh.state = prior
+	if err := fresh.applyResumeOptions(&Workflow{Steps: []Step{*step}}, ResumeOptions{}); !errors.Is(err, errCommandOutputUnsettled) {
+		t.Fatalf("missing completion proof authorized replay: %v", err)
+	}
+	if data, err := os.ReadFile(filepath.Join(e.config.ProjectDir, "selections")); err != nil || string(data) != "x" {
+		t.Fatalf("refused resume repeated effects: %q %v", data, err)
+	}
+}
+
+// A real command completes its effect and drains both output pipes, then the
+// lifecycle hook loses the final publication. This leaves the actual durable
+// starting receipt (PID zero), without inventing hashes or leaving live work.
+// The alternate case preserves a deterministic returned observation failure.
+func selectorOperatorRecoveryFixture(t *testing.T, kind string, output []byte, exitCode int, unresolved bool, configure ...func(*Workflow)) (ExecutorConfig, *Workflow, *ExecutionState, string) {
+	t.Helper()
+	e := newCommandTestExecutor(t)
+	e.config.RunID = e.state.RunID
+	script := fmt.Sprintf("printf 'once\\n' >> source-effects; cat source-output; exit %d", exitCode)
+	step := Step{ID: "select", OnError: ErrorActionRetry, RetryCount: 2, RetryDelay: Duration{Duration: time.Millisecond}}
+	if kind == "foreach" {
+		step.Foreach = &ForeachConfig{Beads: "$(" + script + ")", Steps: []Step{{ID: "body", Command: "printf '%s\\n' '${item}' >> admitted"}}}
+	} else {
+		step.Branch = "$(" + script + ")"
+		step.Branches = map[string]interface{}{"good": Step{ID: "body", Command: "printf 'good\\n' >> admitted"}}
+	}
+	workflow := &Workflow{SchemaVersion: SchemaVersion, Name: e.state.WorkflowID, Settings: DefaultWorkflowSettings(), Steps: []Step{step}}
+	workflow.Settings.Limits.MaxCommandStdoutBytes, workflow.Settings.Limits.MaxCommandStderrBytes = 64, 64
+	for _, update := range configure {
+		update(workflow)
+	}
+	frozen, path, err := SnapshotWorkflow(context.Background(), e.config.ProjectDir, workflow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.config.WorkflowFile = path
+	e.state.WorkflowFile, e.state.Session, e.state.Status, e.state.StartedAt = path, e.config.Session, StatusRunning, time.Now()
+	e.graph, e.limits = NewDependencyGraph(frozen), frozen.Settings.Limits.EffectiveLimits()
+	if err := os.WriteFile(filepath.Join(e.config.ProjectDir, "source-output"), output, 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ctx = e.commandEvaluationContext(ctx, &frozen.Steps[0])
+	lifecycle := ctx.Value(commandOutputLifecycleKey{}).(*commandOutputLifecycle)
+	nativeAfterWait := lifecycle.afterWait
+	lost := errors.New("injected completion checkpoint loss")
+	lifecycle.afterWait = func(cmd *exec.Cmd, settled bool, captured []byte, waitErr error) error {
+		if !settled || (exitCode == 0 && (waitErr != nil || !bytes.Equal(captured, output))) {
+			t.Fatalf("fixture failed before the final outcome boundary: settled=%t output=%x err=%v", settled, captured, waitErr)
+		}
+		if exitCode != 0 {
+			var exit *exec.ExitError
+			if !errors.As(waitErr, &exit) || exit.ExitCode() != exitCode {
+				t.Fatalf("fixture lost the real nonzero outcome: %v", waitErr)
+			}
+		}
+		if unresolved {
+			return errors.Join(lost, nativeAfterWait(cmd, false, nil, errors.New("injected final-census uncertainty")))
+		}
+		return lost
+	}
+	cmd := exec.Command("/bin/sh", "-c", script)
+	cmd.Dir = e.config.ProjectDir
+	if got, err := runCommandOutput(ctx, cmd, 64, 64); got != nil || !errors.Is(err, lost) {
+		t.Fatalf("lost outcome published source bytes: %x %v", got, err)
+	}
+	if cmd.ProcessState == nil {
+		t.Fatal("fixture left the original command unjoined")
+	}
+	prior, err := LoadState(e.config.ProjectDir, e.config.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := prior.CommandEvaluations[step.ID]
+	wantStatus := commandExecutionStarting
+	if unresolved {
+		wantStatus = commandExecutionUnresolved
+	}
+	if record.Status != wantStatus || (!unresolved && record.ProcessID != 0) || len(prior.Steps) != 0 || len(prior.ForeachState) != 0 {
+		t.Fatalf("fixture did not preserve the original pre-admission receipt: %+v", record)
+	}
+	return e.config, frozen, prior, script
+}
+
+func selectorRecoveryEntry(t *testing.T, cfg ExecutorConfig) CommandEvaluationRecoveryEntry {
+	t.Helper()
+	inspection, err := InspectCommandEvaluationRecovery(context.Background(), cfg.ProjectDir, cfg.RunID)
+	if err != nil || len(inspection.Selectors) != 1 {
+		t.Fatalf("inspect selector recovery: %+v %v", inspection, err)
+	}
+	return inspection.Selectors[0]
+}
+
+func selectorRecoveryCheckpoint(t *testing.T, cfg ExecutorConfig) []byte {
+	t.Helper()
+	data, err := os.ReadFile(pipelineStatePath(cfg.ProjectDir, cfg.RunID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+func TestSelectorOperatorRecoveryPreservesOriginalEvidenceAndBytes(t *testing.T) {
+	for _, unresolved := range []bool{false, true} {
+		for _, exitCode := range []int{0, 7, 255} {
+			t.Run(fmt.Sprintf("unresolved_%t/exit_%d", unresolved, exitCode), func(t *testing.T) {
+				output := []byte{0xff, 0, 0xc0, 'r', 'a', 'w'}
+				cfg, workflow, prior, script := selectorOperatorRecoveryFixture(t, "branch", output, exitCode, unresolved)
+				original := prior.CommandEvaluations["select"]
+				entry := selectorRecoveryEntry(t, cfg)
+				if !entry.CanAccept || entry.ReceiptToken == "" {
+					t.Fatalf("recoverable selector was not offered: %+v", entry)
+				}
+				reason := "Independently verified the original process tree ended and captured complete stdout"
+				accepted, err := AcceptCommandEvaluationContext(context.Background(), cfg.ProjectDir, cfg.RunID, entry.StepID, entry.ReceiptToken, reason, exitCode, output)
+				if err != nil || accepted.Replayed || accepted.Selector.Status != commandEvaluationAccepted || accepted.Selector.ExitCode == nil || *accepted.Selector.ExitCode != exitCode {
+					t.Fatalf("accept selector outcome: %+v %v", accepted, err)
+				}
+				prior, err = LoadState(cfg.ProjectDir, cfg.RunID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				record := prior.CommandEvaluations[entry.StepID]
+				if record.OriginalStatus != original.Status || record.ProcessID != original.ProcessID ||
+					!record.StartedAt.Equal(original.StartedAt) || !record.FinishedAt.Equal(original.FinishedAt) || record.Error != original.Error ||
+					!bytes.Equal(record.Output, output) || record.ResolutionToken != entry.ReceiptToken || len(prior.Steps) != 0 {
+					t.Fatalf("acceptance replaced original evidence or published source output: %+v", record)
+				}
+				if unresolved && !strings.Contains(record.Error, "injected final-census uncertainty") {
+					t.Fatal("acceptance erased the original cleanup cause")
+				}
+				inspection := selectorRecoveryEntry(t, cfg)
+				public, err := json.Marshal(inspection)
+				if err != nil || bytes.Contains(public, []byte(`"output":`)) || inspection.OutputBytes != len(output) || inspection.OutputHash == "" {
+					t.Fatalf("inspection exposed source bytes or lost metadata: %s %v", public, err)
+				}
+				before := selectorRecoveryCheckpoint(t, cfg)
+				fresh := NewExecutor(cfg)
+				fresh.state = prior
+				if err := fresh.applyResumeOptions(workflow, ResumeOptions{}); err != nil {
+					t.Fatalf("accepted selector did not pass resume admission: %v", err)
+				}
+				cmd := exec.Command("/bin/sh", "-c", script)
+				cmd.Dir = cfg.ProjectDir
+				got, err := runCommandOutput(fresh.commandEvaluationContext(context.Background(), &workflow.Steps[0]), cmd, 64, 64)
+				if cmd.Process != nil || (exitCode == 0 && (err != nil || !bytes.Equal(got, output))) ||
+					(exitCode != 0 && (got != nil || err == nil || !strings.Contains(err.Error(), fmt.Sprintf("status %d", exitCode)))) {
+					t.Fatalf("accepted outcome was reexecuted or misinterpreted: %x %v process=%v", got, err, cmd.Process)
+				}
+				if !bytes.Equal(before, selectorRecoveryCheckpoint(t, cfg)) {
+					t.Fatal("consuming accepted output rewrote its immutable evidence")
+				}
+				if data, err := os.ReadFile(filepath.Join(cfg.ProjectDir, "source-effects")); err != nil || string(data) != "once\n" {
+					t.Fatalf("acceptance repeated source effects: %q %v", data, err)
+				}
+			})
+		}
+	}
+}
+
+func TestSelectorOperatorRecoveryChangedInvocationCannotConsumeOrLaunch(t *testing.T) {
+	for _, change := range []string{"command", "directory", "environment", "definition", "stdout cap", "stderr cap"} {
+		t.Run(change, func(t *testing.T) {
+			cfg, workflow, _, script := selectorOperatorRecoveryFixture(t, "branch", []byte("good"), 0, false)
+			entry := selectorRecoveryEntry(t, cfg)
+			if _, err := AcceptCommandEvaluationContext(context.Background(), cfg.ProjectDir, cfg.RunID, entry.StepID, entry.ReceiptToken, "Verified complete original outcome", 0, []byte("good")); err != nil {
+				t.Fatal(err)
+			}
+			prior, err := LoadState(cfg.ProjectDir, cfg.RunID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			before := selectorRecoveryCheckpoint(t, cfg)
+			fresh := NewExecutor(cfg)
+			fresh.state = prior
+			step := cloneStep(workflow.Steps[0])
+			cmd := exec.Command("/bin/sh", "-c", script)
+			cmd.Dir = cfg.ProjectDir
+			stdoutLimit, stderrLimit := int64(64), int64(64)
+			switch change {
+			case "command":
+				cmd.Args[2] += "; printf changed"
+			case "directory":
+				cmd.Dir = t.TempDir()
+			case "environment":
+				cmd.Env = append(cmd.Environ(), "NTM_CHANGED_ACCEPTED_SOURCE=1")
+			case "definition":
+				step.Name = "changed"
+			case "stdout cap":
+				stdoutLimit++
+			case "stderr cap":
+				stderrLimit++
+			}
+			out, err := runCommandOutput(fresh.commandEvaluationContext(context.Background(), &step), cmd, stdoutLimit, stderrLimit)
+			if out != nil || err == nil || !strings.Contains(err.Error(), "expanded invocation changed") || cmd.Process != nil {
+				t.Fatalf("changed %s consumed accepted bytes or launched: %x %v", change, out, err)
+			}
+			if !bytes.Equal(before, selectorRecoveryCheckpoint(t, cfg)) {
+				t.Fatal("identity refusal rewrote the accepted checkpoint")
+			}
+		})
+	}
+}
+
+// The detached child retains exactly one output stream and can produce a
+// side effect only after capture has returned. The release callback also owns
+// fixture cleanup, so assertion failures never leave a perpetual file waiter.
+func escapedCommandOutputFixture(t *testing.T, root, stream string, exitCode int) (string, func()) {
+	t.Helper()
+	return escapedCommandOutputFixtureWithOutput(t, root, stream, exitCode, "good")
+}
+
+func escapedCommandOutputFixtureWithOutput(t *testing.T, root, stream string, exitCode int, output string) (string, func()) {
+	t.Helper()
+	setsid, err := exec.LookPath("setsid")
+	if err != nil {
+		t.Skip("setsid is required for escaped output fixtures")
+	}
+	child := `case "$1" in
+stdout) exec 2>/dev/null ;;
+stderr) exec 1>/dev/null ;;
+esac
+printf '%s' "$$" > escaped.pid
+attempts=0
+while [ ! -f release ] && [ "$attempts" -lt 1000 ]; do
+  sleep 0.01
+  attempts=$((attempts + 1))
+done
+if [ -f release ]; then printf late > late-effect; fi
+printf done > escaped.done
+`
+	if err := os.WriteFile(filepath.Join(root, "escaped.sh"), []byte(child), 0600); err != nil {
+		t.Fatal(err)
+	}
+	released := false
+	release := func() {
+		if released {
+			return
+		}
+		released = true
+		var process *os.Process
+		if data, err := os.ReadFile(filepath.Join(root, "escaped.pid")); err == nil {
+			if pid, err := strconv.Atoi(string(data)); err == nil {
+				process, _ = os.FindProcess(pid)
+			}
+		}
+		if process != nil {
+			defer process.Release()
+		}
+		if err := os.WriteFile(filepath.Join(root, "release"), []byte("finish"), 0600); err != nil {
+			t.Errorf("release escaped fixture: %v", err)
+		}
+		deadline := time.Now().Add(3 * time.Second)
+		for process != nil && time.Now().Before(deadline) {
+			if _, err := os.Stat(filepath.Join(root, "escaped.done")); err == nil {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if process != nil {
+			_ = process.Kill()
+			t.Error("escaped fixture did not finish after release")
+		}
+	}
+	t.Cleanup(release)
+	quote := func(value string) string { return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'" }
+	script := fmt.Sprintf(`printf 'launch\n' >> selector.launches
+%s /bin/sh escaped.sh %s &
+while [ ! -s escaped.pid ]; do sleep 0.01; done
+printf '%%s' %s
+printf diagnostic >&2
+exit %d`, quote(setsid), quote(stream), quote(output), exitCode)
+	return script, release
 }

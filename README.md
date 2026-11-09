@@ -7,7 +7,7 @@
 <div align="center">
 
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-blue.svg)
-![Go Version](https://img.shields.io/badge/go-1.26.9+-00ADD8.svg)
+![Go Version](https://img.shields.io/badge/go-1.26.10+-00ADD8.svg)
 ![License](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)
 ![Release](https://img.shields.io/github/v/release/Dicklesworthstone/ntm?include_prereleases)
 
@@ -732,6 +732,85 @@ ntm pipeline resume run-20241230-123456-abcd --mode=continue
 ntm pipeline cleanup --older=7d
 ```
 
+Workflow templates with manual gates, including `review-pipeline` and
+`specialist-team`, can wait for an operator to select a specific transition:
+
+```bash
+ntm workflow status --session payments --json
+ntm workflow trigger --session payments --token "MANUAL_GATE_TOKEN_FROM_STATUS" \
+  --transition 0 --reason "Design reviewed and ready for implementation"
+```
+
+Choose the exact index from `manual_gate.transitions`, together with that gate's
+`token`. A gate appears after the stage's prompts have been delivered. Its token
+stays stable while output is observed, and changes when work is retried, an agent
+is replaced, or another stage visit begins. The command records one immutable
+decision; the active runner applies it on its next poll and records it in stage
+history. Repeating the same choice and reason returns the original receipt.
+
+Decisions can also be recorded while a runner is offline or paused. Continue
+with `ntm workflow run TEMPLATE --session payments --resume` to apply the saved
+decision and continue from the existing delivery checkpoint. Each later manual
+gate requires its own choice. Use `--project-root DIR` with status and trigger
+when the project is elsewhere; `workflow run --fire-manual` remains the explicit
+option for automatically advancing every manual gate.
+
+Workflow checkpoints also retain the selected tmux endpoint: local, or the exact
+SSH target. `workflow status` reports it, and `--resume` requires that original
+endpoint even if another host has matching pane IDs and PIDs. Legacy checkpoints
+without an endpoint remain inspectable, but require independent inspection and
+an explicit `--restart` before running the workflow again. Changing an endpoint
+also invalidates its manual gate decisions.
+
+SSH workflows can use agent-output, idle, elapsed-time, and manual triggers.
+File and command triggers require NTM to run on the agents' host; remote workflows
+reject those triggers before starting, including triggers in later stages.
+A same-named local directory or explicit `--project-root` does not establish a
+shared filesystem. For SSH workflows, `--project-root` selects the local project
+directory containing the checkpoint and defaults to the local current directory.
+
+Workflow `stage_timeout_minutes` deadlines are saved before each prompt round.
+Downtime counts toward the deadline: `--resume` handles an expired stage before
+sending any remaining prompts. A timeout policy of `retry` starts another timed
+round, bounded by `max_retries_per_stage`; retry and agent-restart allowances
+remain consumed across resumes. Command checks and pane observations are bounded
+by the current round's remaining time.
+
+Successful timeout `pause` and `notify` actions retain receipts, so resuming does
+not repeat them or silently grant a fresh timeout for the same round. A timeout
+`abort`, an interrupted action with an unknown outcome, or an older timed
+checkpoint without its original deadline requires inspection and a deliberate
+`--restart`. Timeout-driven skips commit the destination stage before its prompts
+are sent, including transitions that revisit the same stage.
+
+The dashboard resumes pipelines in a detached worker, so closing the browser or
+restarting the HTTP server does not cancel an authorized resume. REST clients can
+request the same lifetime with `POST /api/v1/pipelines/{id}/resume` and
+`{"background":true}`. HTTP `202 Accepted` acknowledges worker startup, not
+workflow completion. Poll the existing pipeline status endpoint and cancel
+through `POST /api/v1/pipelines/{id}/cancel`; the run ID stays unchanged.
+
+The worker acquires exclusive run ownership before reloading the saved state and
+validating its workflow inside the configured project. Omit `session` to use the
+session from that owned checkpoint. Detached resume retains saved variables and
+rejects nonempty variable overrides. Omitting `background`, or setting it to
+`false`, retains synchronous REST resume; `pipeline_resume` jobs also keep their
+own execution and cancellation lifetime.
+
+Pipeline cleanup removes old checkpoints only after acquiring the run's ownership
+lock and verifying that execution and every saved command, selector, delivery,
+mail, and reservation receipt have settled. Active runs and unresolved receipts
+remain available for recovery, even when their checkpoint is old. Legacy,
+malformed, oversized, or otherwise uninspectable states are also retained;
+cleanup never treats missing evidence as permission to replay work.
+
+Use `ntm pipeline cleanup --older=7d --dry-run` to inspect the same eligibility
+checks without removing files. Human and JSON output include retained run IDs
+and reason codes, without command output or message contents. Shared workflow
+snapshots and stable ownership lock files are preserved. The REST cleanup
+endpoint applies the same checks and returns deleted, eligible, and retained
+counts with per-run results.
+
 Pipeline resume preserves completed step outputs. Prompt and template steps also
 save their delivery and response evidence: `--mode=continue` resumes observing a
 confirmed request on its original tmux host and physical pane without submitting
@@ -780,10 +859,28 @@ step-definition checks. A live run owner, stale receipt, or conflicting decision
 is refused; repeating the same receipt and reason returns the saved decision,
 including after the run completes.
 
+Structured `on_failure` recovery has its own delivery receipt, identified by
+the failed step's runtime ID followed by `.on_failure`. Use the exact ID and
+receipt token from inspection, including any enclosing branch or iteration
+namespace. After an uncertain fallback is accepted, resume finishes that
+original fallback without repeating the native command that triggered it.
+The original command receipt remains intact. Parent and fallback definition
+checks still apply, and the parent failure is suppressed only when the saved
+workflow explicitly configures `suppress_failure: true`.
+
+The dashboard exposes these decisions for failed or cancelled runs under
+**Recovery decisions**. Review the original agent or process, open the relevant
+receipt, enter your observation, and explicitly confirm what you verified.
+Command and selector decisions require the original exit code and complete
+output, including an explicitly verified empty output. Changed receipts require
+a fresh review. Recording a decision does not restart execution; use **Resume**
+separately when ready to continue in the detached worker.
+
 REST clients can perform the same recovery through the server's configured
 project. `GET /api/v1/pipelines/{id}/recover` requires `pipelines:read` and returns
-the inspectable delivery identities and their `receipt_token` values. To record
-an observation, send `POST /api/v1/pipelines/{id}/recover` with
+the `deliveries`, `commands`, and `selectors` arrays, including receipt identities,
+acceptance eligibility, refusal reasons, and exact `receipt_token` values. To record
+an agent-delivery observation, send `POST /api/v1/pipelines/{id}/recover` with
 `pipelines:write` permission, `Content-Type: application/json`, and this JSON body:
 
 ```json
@@ -795,10 +892,36 @@ an observation, send `POST /api/v1/pipelines/{id}/recover` with
 }
 ```
 
-Acceptance records the same durable decision as the CLI. Continue with
+To accept a command outcome after independently verifying that the original
+command **and all descendants have finished**, use the command receipt from GET:
+
+```json
+{
+  "step_id": "migrate",
+  "receipt": "<command receipt_token from GET>",
+  "accept_command": true,
+  "exit_code": 0,
+  "output": "Migration completed\n",
+  "reason": "Verified the migration and all child processes finished successfully"
+}
+```
+
+Use `accept_selector: true` and a selector receipt for an interrupted branch,
+foreach, or bead-query source. Exactly one acceptance flag must be true. Command
+and selector decisions require an explicit `exit_code` from 0 to 255 and `output`;
+an empty string records observed empty output, while omission or `null` is refused.
+Delivery decisions cannot include outcome values. Requests use UTF-8 JSON and must
+fit the server's 10 MiB encoded-body limit, including metadata and escaping, as
+well as the frozen workflow's capture limits. Output is never truncated or
+silently repaired. Use the CLI for binary selector output or larger captures
+within its 16 MiB limit. Enabled request redaction rejects detected secrets in
+output or reasons before persistence.
+
+Acceptance records the same durable decision as the CLI without launching work,
+signalling processes, or inferring settlement from a saved PID. Continue with
 `POST /api/v1/pipelines/{id}/resume`, or submit a `pipeline_resume` job for
 pollable execution. Inspection and acceptance expose receipt metadata without
-prompt or transcript contents. Recovery requests cannot select another project
+prompt, transcript, or captured output contents. Recovery requests cannot select another project
 or replace the saved session. Stale receipts, conflicting observations, and a live
 run owner produce a conflict response without changing the checkpoint.
 
@@ -812,12 +935,271 @@ operation that required it. File-based run, validation, and resume still require
 a configured project; recovery additionally requires an accessible absolute
 project directory.
 
-Foreground command steps in the main workflow have a separate CLI recovery path
+Foreground command steps in the main workflow have an explicit recovery path
 for the case where the command finished but its final checkpoint was lost. `pipeline recover`
 includes these command receipts in its `commands` JSON array, with eligibility
 and refusal information. Before accepting one, independently verify that the
 original command **and all its descendants have finished**, then supply its
-observed exit code and complete captured output:
+observed exit code and complete captured output.
+
+A `wait: none` launch acknowledgement does not establish successful execution.
+A later unsuccessful exit makes the final workflow fail, while healthy sidecars
+stopped at normal workflow completion remain expected shutdowns. On Linux, a
+leader failure observed before cleanup signals retains its original exit error
+even if workflow shutdown begins before its receipt is saved. Failed, settled
+background receipts follow the existing resume reconciliation: the failed command
+runs again while completed dependent steps retain their results. Uncertain
+settlement still refuses replay.
+
+A background command inside a parallel group or parallel foreach keeps running
+after its container finishes normally. It remains available to downstream steps
+and post-pipeline hooks until workflow finalization stops and joins it. Explicit
+cancellation and fail-fast still stop affected commands.
+An explicit command or enclosing parallel-group deadline remains in force even
+after the container returns; expiry is recorded as a background failure. Moving a
+sidecar into a nested container therefore does not shorten its healthy lifetime
+or remove its cancellation and timeout boundaries.
+
+A fatal main step failure requests cancellation of its main sidecars and joins
+their supervision before running post-pipeline hooks. This lets SIGTERM handlers
+and receipt persistence finish before hooks release resources. The workflow context stays
+live for those hooks; caller cancellation during the wait switches to `on_cancel`
+cleanup. Returned uncertainty still leaves an unresolved receipt and refuses
+replay.
+
+Cancellation before the first execution attempt retains explicit no-dispatch
+evidence. Native commands cancelled before launch retain a settled receipt with
+process ID zero. Ordinary resume can continue this proven-unstarted work; prior
+attempts and unresolved receipts keep their existing replay restrictions.
+
+For a command with `wait: none`, an explicit step `timeout` applies to the
+background process's whole lifetime. Expiry requests normal command cleanup,
+records a timeout outcome, and prevents the final workflow from reporting success.
+Already-admitted dependent work keeps its existing scheduling. A later workflow
+cancellation does not erase the original timeout cause. Without an explicit
+timeout, a sidecar retains the workflow's lifetime instead of inheriting the
+foreground command default. Uncertain cleanup still leaves an unresolved receipt
+and refuses replay, even when the deadline has expired.
+
+On Unix, a failed process-group observation keeps the command under supervision
+and is retried within its existing execution deadline. It does not request
+cancellation or shorten the five-second SIGTERM grace period. After the final
+group signal, NTM retries observation for up to one second while retaining the
+original group leader's identity. If that final census remains unknown after a
+successful signal, a separate five-second recovery window retries observation
+without sending another signal. The original leader and exclusive run ownership
+remain held until recovery finishes, so later quiet evidence can settle the exact
+foreground, background, or selector receipt before the run returns. A confirmed
+live group or failed final signal keeps the original cleanup budget. A complete
+quiet-group observation and complete output capture are both required for a
+`settled` receipt.
+The stdin feeder must also finish copying or receive a kernel broken-pipe
+response confirming that its readers closed. A forced stdin-pipe closure during
+the wait timeout leaves the receipt unresolved, including when a nonzero command
+exit would otherwise hide that pipe error. Completing the feed does not establish
+containment of descendants that deliberately leave the group and no longer keep
+NTM's I/O open.
+Linux observes the original leader through its stable pidfd when supported.
+Transient leader-observation failures then retain supervision within the existing
+execution deadline, so later recovery can still settle the receipt. Cancellation
+allows a separate 250 ms of observation recovery before falling back to leader
+cleanup. A system without a stable handle or pidfd-based wait support retains the
+bounded 250 ms observation fallback. An explicit loss of child ownership ends
+observation and signalling immediately; a saved numeric PID cannot authorize a
+later signal.
+Linux requires cancellation of the command's own context before group cleanup,
+even when an observation error contains a cancellation or deadline error. It rechecks the
+original leader's waitability before SIGTERM, before SIGKILL, and before accepting
+settlement. Lost ownership during observation or grace leaves the receipt
+unresolved and prevents further group signals, preserving the ordinary-resume
+replay barrier.
+If leader observation remains unavailable during explicit cancellation, NTM can
+still send SIGTERM through the original leader's pidfd and wait up to five seconds
+for graceful exit. Failed pidfd observations preserve that grace period before
+SIGKILL. This fallback never signals a numeric PID or process group. Stopping
+only the leader cannot settle the command's receipt because descendants may
+remain alive. If no stable handle is available, the command remains unresolved
+without a fallback numeric signal.
+For normal Linux completion, NTM checks that the kernel's process-creation counter
+did not change during a quiet census and that zombie process leaders have no
+surviving threads. A child that forks and exits during enumeration therefore
+cannot hide a still-running grandchild. A raced census is retried; natural
+completion sends no termination signal. Host-wide process churn can delay this
+proof, while the command's existing deadline and cancellation remain effective.
+The same proof requires a complete, stable `/proc` mount view. Modes that hide
+process directories, such as `hidepid=2` or `hidepid=4`, cannot authorize a settled
+receipt; an apparently empty visible group does not prove hidden work ended.
+The mount must also expose the observer's own PID namespace: a single `NSpid`
+value in `/proc/self/status` must match its process ID before and after the
+census. An ancestor namespace's process numbers can alias unrelated local
+processes, so matching numeric group IDs alone cannot prove settlement. Missing
+namespace evidence (including kernels without `NSpid` support or `CONFIG_PID_NS`)
+also leaves observation uncertain; use a complete procfs mount for the process's
+own namespace on a kernel that supplies this evidence.
+
+If cleanup returns without that proof, the receipt becomes `unresolved`, with the
+failed or cancelled outcome and cleanup details preserved, rather than remaining
+`running` after supervision ended. Ordinary resume and automatic retry refuse
+these receipts. A saved PID disappearing later is not sufficient evidence for
+automatic reconciliation: its original group identity is no longer pinned.
+Use the explicit recovery procedure below only after independently verifying the
+original command and its effects.
+
+Handling a command or selector error with `on_error: continue` can let other
+steps finish, but it cannot establish process settlement. At finalization, any
+remaining unsettled process receipt prevents a successful workflow outcome.
+The original receipts remain unchanged for inspection and supported recovery;
+confirmed settled failures keep their existing error-policy behavior.
+
+An `on_failure` action or fallback waits until its failed source and owned
+process work have a known outcome. Unresolved command and selector receipts keep
+their failed scheduler results, without publishing failure-action variables or
+dispatching fallback work that would prevent later acceptance. Once the original
+outcome is explicitly accepted, ordinary resume applies the authored failure
+policy. Unrelated scopes and healthy supervised background children keep their
+normal failure handling.
+
+Ordinary execution checks owned command and selector receipts before publishing
+successful scheduler results. An uncertain success hook leaves its parent failed
+and stops later hooks. An uncertain foreach body also stops its iteration before
+a completed-round checkpoint is written. Explicit acceptance and resume can then revisit the
+unfinished work while retaining the successful parent's native receipt, earlier
+completed hooks, and immutable accepted outcomes. Ordinary settled hook failures
+keep their existing logging behavior; healthy background acknowledgements remain
+valid while their command supervision is active.
+
+Success-hook sequences now checkpoint the completed parent body before the first
+hook, then checkpoint each consumed hook outcome before starting the next one.
+Cancellation leaves the parent unfinished until its remaining hooks settle.
+Ordinary resume reuses the successful body and earlier consumed outcomes,
+including advisory hooks that returned a known failure after producing effects.
+The same continuation applies inside branches, parallel groups, foreach
+iterations, and nested success hooks. A delivered agent prompt resumes observation;
+an unconfirmed delivery still requires its existing explicit recovery decision.
+
+These checkpoints bind both the authored and materialized step definitions,
+ordered hook identities, results, and output bindings. Missing or altered
+consumption evidence stops resume before downstream work. Completed hook outputs
+can be rebuilt from the saved evidence even when the variable cache is missing.
+Explicit whole-run reset and valid forced-iteration scopes clear the matching
+hook progress; restarting a consumed failed hook alone refuses a replay that
+would leave its containing work inconsistent. Background commands retain their
+existing supervised relaunch behavior. This records orchestration progress; it
+does not make a remote side effect and its local checkpoint one atomic operation.
+
+An older checkpoint may already report `completed` while retaining an unfinished
+foreground command or selector receipt. If that step's scheduler result is
+failed or cancelled, recovery inspection can offer the same explicit acceptance
+procedure. Acceptance retains all existing identity, ownership, and
+enclosing-work checks, then saves the observed outcome and changes the
+contradictory workflow status to `failed` in one checkpoint, with a recovery
+diagnostic. Ordinary resume then applies the accepted outcome. Completed work
+and any other unresolved receipts retain their evidence; repeating an accepted
+decision after successful resume does not reopen the run.
+
+A failed or cancelled scheduler result from an older checkpoint is not evidence
+that a command group stopped. Without an execution receipt, ordinary resume also
+refuses these steps and background rerun markers; an intentional replay requires
+`--mode=restart-failed` or an explicit reset. Proven-settled failures retain normal
+retry behavior. Newly cancelled parallel children that never entered their executor
+carry separate scheduler evidence, so they can resume without being mistaken for
+previously launched work.
+
+During cancellation, NTM saves the cancelled state before waiting for background
+command supervision to return and persist its receipts. Only then does it start
+authored `on_cancel` cleanup, so graceful sidecar shutdown can finish before
+cleanup releases its resources. Each cleanup step receives its full configured
+timeout after this wait. Returned uncertainty still leaves an unresolved receipt;
+it does not suppress authored cleanup or prove that every process has exited.
+Background commands started by cleanup are also joined before the run returns.
+
+Shell branch predicates, external foreach sources, and bead queries also persist
+launch intent before starting their command. Their output is usable only after
+the owned group settles and both captured streams reach EOF. A returned cleanup
+failure leaves an `unresolved` entry in `command_evaluations`; automatic retries
+and ordinary resume refuse it even when a failure handler completed the enclosing
+step. If the original source and its descendants finished and its final outcome
+can be independently verified, `pipeline recover --accept-selector` can record
+that outcome without repeating its effects. Inspect the original work before
+deliberately authorizing `restart-failed`, a containing `force-iter` scope, or a
+whole-run reset. Unfinished external selectors
+from older checkpoints without sufficient source or decision evidence require the
+same explicit decision.
+Successful evaluations retain their complete bounded output in the checkpoint
+before it can choose a branch or admit iterations. Ordinary resume reuses that
+output, including after a crash between command completion and decision storage,
+instead of repeating source effects. Reuse requires the same step definition,
+expanded executable and arguments, working directory, effective environment, and
+capture limits. Changed inputs require restoring the original inputs or an
+explicit replay of the affected scope. A failed child does not discard an already
+admitted branch choice or foreach item list. A normal nonzero source exit with
+proven cleanup still clears its receipt and retains configured retry behavior.
+
+External branch, foreach, and bead-query sources use `step.timeout`, or the
+executor's default timeout when no step override is set, and the workflow's
+`max_command_stdout_bytes` and `max_command_stderr_bytes` limits. A source deadline
+applies to source evaluation; branch and foreach bodies keep their own lifetimes.
+The run also limits retained selector stdout and outstanding stdout reservations
+with `settings.limits.max_selector_output_bytes_total` (default **32 MiB**).
+Before a new source starts, it reserves its entire `max_command_stdout_bytes`
+allowance. Successful completion replaces that reservation with the exact saved
+bytes; uncertain completion keeps the full reservation and its replay barrier.
+Parallel sources wait within their existing deadlines when active captures can
+free enough capacity. If saved output or unresolved receipts leave insufficient
+capacity, the next source fails before launch, without creating a receipt or
+performing its command's effects. Already saved outcomes remain reusable even
+when an older checkpoint exceeds the current budget.
+
+For sources that return small records, a smaller `max_command_stdout_bytes`
+allows more concurrent reservations. To raise capacity for an existing frozen
+run without resetting its evidence, use
+`ntm pipeline resume <run-id> --max-selector-output-bytes-total 67108864`.
+This positive byte override applies only to that resume attempt; it preserves
+the frozen workflow, original capture limits, and cached output identities.
+The REST resume endpoint and `pipeline_resume` jobs accept the corresponding
+`max_selector_output_bytes_total` field. This budget covers selector stdout and
+reservations; other checkpoint fields, parsed items, and temporary serialization
+buffers have separate memory and storage costs.
+
+Dynamic step expansion is bounded separately by
+`settings.limits.max_step_count_total` and `max_materialized_step_nodes`, both
+defaulting to **100,000**. The first limits distinct concrete runtime IDs across
+the run; retries, ordinary resume, and explicit scope resets reuse the existing
+admission ledger. The second limits literal definitions and active planner
+copies, checked before eager foreach expansion, branch decoding, and parallel
+body allocation. Nested planners refuse insufficient capacity promptly.
+Neither limit is a byte cap for all pipeline memory or checkpoint data.
+
+Main work stops on admission exhaustion even under continue or retry policies.
+Authored cancellation and post-pipeline roots reserve a separate bounded ID
+allowance before main execution, so an earlier dynamic cleanup cannot consume
+a later release root's slot. Existing process cleanup and uncertain-execution
+replay barriers remain authoritative; an admission is never proof of execution
+or termination. A successful command whose success hook exceeds capacity keeps
+its receipt, allowing the hook to finish on resume without repeating the command.
+
+For a frozen run, raise either limit for the current attempt with
+`ntm pipeline resume <run-id> --max-step-count-total 200000
+--max-materialized-step-nodes 200000`. The REST resume endpoint and
+`pipeline_resume` jobs accept the corresponding snake_case fields. Positive
+overrides preserve the frozen workflow and native receipts; zero uses the
+frozen policy, and negative values are rejected before checkpoint mutation.
+See [step admission limits](docs/WORKFLOW_SCHEMA.md#step-admission-and-materialization-limits)
+for accounting and cleanup details.
+
+Dry runs preview dynamic foreach sources without executing their shell commands
+or `br` queries; static item and model lists can still be expanded for preview.
+
+Foreach item bindings also apply to command `stdin`, native `bead_query` fields,
+Agent Mail send and inbox requests, and reservation acquisition and release
+requests. For example, a loop with `as: assignment` can send mail to
+`${assignment.agent}`, reserve `${assignment.path}`, and query beads labelled
+`${assignment.label}`. Each iteration receives its own request values, including
+inside selected branches, success hooks, and failure recovery handlers. Nested
+loops retain their own item bindings; round variables and downstream step
+outputs resolve when the corresponding operation executes.
+
+For a foreground command receipt:
 
 ```bash
 ntm pipeline recover run-20241230-123456-abcd --json
@@ -847,6 +1229,44 @@ after completion; a conflicting observation is refused. A live run owner,
 background command, cleanup or post-pipeline command, or command whose enclosing
 work already completed prevents acceptance. Recorded PIDs are diagnostic only: recovery neither infers completion
 from PID disappearance nor signals a saved process ID.
+
+For an interrupted selector receipt, inspection includes a `selectors` array
+with its exact receipt token, acceptance eligibility, and refusal reason:
+
+```bash
+ntm pipeline recover run-20241230-123456-abcd --json
+
+ntm pipeline recover run-20241230-123456-abcd --step-id choose \
+  --receipt <selector-receipt-from-inspection> --accept-selector \
+  --exit-code 0 --output-file selector-stdout.bin \
+  --reason "Verified the original selector and all descendants finished"
+
+ntm pipeline resume run-20241230-123456-abcd --mode=continue
+```
+
+First independently verify that the original selector **and all its descendants
+have finished**. Supply its observed exit code and complete stdout, including an
+empty regular file when it emitted no stdout. Selector output is retained as
+exact bytes, including non-UTF-8 data, and is bounded by the original capture
+limit, the frozen workflow's limit, and the 16 MiB recovery limit. Recovery
+responses expose only identity, decision metadata, byte counts, and hashes.
+
+Acceptance writes a distinct `accepted` receipt with an immutable decision hash.
+It preserves the original intent or cleanup status, timestamps, diagnostic error,
+and recorded PID. An intent whose PID was never checkpointed stays without a PID;
+the operator's observation does not invent native process-settlement evidence.
+No command, signal, branch selection, or item admission occurs during acceptance.
+Ordinary resume checks the exact selector definition and expanded invocation
+before consuming successful output. A nonzero accepted exit follows normal
+failure handling without relaunching the source, even when retry is configured.
+
+The exact receipt, reason, exit code, and stdout replay the same saved decision;
+changing any part is refused. Recovery also refuses a live run owner, a stale or
+corrupt receipt, legacy evidence without an invocation identity, changed frozen
+definitions, already-admitted output, completed enclosing work, and selectors in
+cleanup or post-pipeline phases. An intentional reevaluation requires the normal
+explicit replay scope. Older executors that do not understand `accepted` refuse
+that receipt rather than interpreting it as native settlement.
 
 Pipeline `mail_send` steps also checkpoint their send intent and delivery receipt.
 If a response is lost or the run stops while a send is unresolved, automatic
@@ -935,6 +1355,34 @@ or its session or project does not match, spawn reports partial recovery and can
 proceed with its other available context.
 Remote tmux sessions skip local handoffs and report that source as unavailable;
 NTM does not treat a matching local path as proof of the remote project's identity.
+
+To continue a specific Agent Mail conversation in newly spawned agents, use
+`--thread`:
+
+```bash
+ntm spawn payments --cc=2 --thread=FEAT-123
+ntm spawn payments --label=follow-up --cc=2 --thread=FEAT-123 --prompt="Finish the agreed tests"
+# For servers requiring an authenticated thread reader:
+ntm spawn payments --cc=1 --thread=FEAT-123 --thread-agent=BlueLake
+```
+
+NTM reads the thread summary once from the resolved project's Agent Mail scope,
+then includes its key points and action items in each agent's initial prompt.
+Per-agent defaults, `--prompt`, and pane-specific marching orders follow that
+context. Delivery uses the existing readiness checks and configured secret
+redaction. The new agents keep their own assigned identities; the read does not
+create an extra identity. `--thread-agent` uses an existing registration token
+cached by NTM for that project when the server requires authenticated reads.
+
+Thread continuation requires `agent_mail.enabled = true` and the server's
+`summarize_thread` tool. It requests a deterministic summary with LLM refinement
+and raw message examples disabled. A missing, unavailable, mismatched, empty,
+or oversized summary stops the command before project-directory creation,
+hooks, or tmux changes; the prepared context is limited to 32 KiB. The flag
+accepts one thread ID and is unavailable with remote tmux sessions. It remains
+active with `--no-recovery` and `--no-cass-context`, since it is an explicit
+request. Successful JSON output identifies the context with `thread_id` without
+echoing the conversation contents.
 
 Checkpoint restoration accepts `--as` to recover into a different tmux session
 without replacing the source session or rewriting its checkpoint. The REST

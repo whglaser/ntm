@@ -2,10 +2,11 @@ package workflow
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
-	"time"
 )
 
 type recordingActions struct {
@@ -19,8 +20,7 @@ func (a *recordingActions) add(s string) {
 	a.calls = append(a.calls, s)
 }
 
-// snapshot reads calls under the same lock add uses: the TimeoutMonitor
-// invokes actions on its own goroutine.
+// snapshot reads calls under the same lock used by action callbacks.
 func (a *recordingActions) snapshot() []string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -88,20 +88,185 @@ func TestErrorHandlerRestartBudgetIsPerAgent(t *testing.T) {
 	}
 }
 
-func TestTimeoutMonitorFiresOnlyForCurrentStage(t *testing.T) {
+func TestErrorHandlerRecoveryBudgetsSurviveResume(t *testing.T) {
+	config := ErrorHandlingConfig{
+		OnTimeout: ErrorActionRetry, MaxRetriesPerStage: 2,
+		OnAgentCrash: ErrorActionRestartAgent, MaxRestartsPerAgent: 2,
+	}
+	var saved RecoveryBudgets
 	actions := &recordingActions{}
-	h := NewErrorHandler(ErrorHandlingConfig{OnTimeout: ErrorActionNotify}, actions)
-	m := NewTimeoutMonitor(time.Millisecond, h, func() string { return "build" })
-	m.Start(context.Background(), "build")
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		calls := actions.snapshot()
-		if len(calls) == 1 && calls[0] == "notify" {
-			return
+	persisted := 0
+	for attempt := 0; attempt < 3; attempt++ {
+		h := NewErrorHandler(config, actions)
+		if err := h.ConfigureRecovery(saved, func(next RecoveryBudgets) error {
+			// The attempted side effect is not allowed to precede this write.
+			if len(actions.snapshot()) != persisted {
+				t.Fatal("recovery action ran before its durable budget reservation")
+			}
+			saved = next
+			persisted++
+			return nil
+		}); err != nil {
+			t.Fatal(err)
 		}
-		if len(calls) > 1 || time.Now().After(deadline) {
-			t.Fatalf("calls=%v", calls)
+		for _, fault := range []*WorkflowError{
+			{Type: ErrorTimeout, Stage: "build"},
+			{Type: ErrorAgentCrash, AgentID: "%1", Stage: "build"},
+		} {
+			if err := h.Handle(t.Context(), fault); err != nil {
+				t.Fatal(err)
+			}
 		}
-		time.Sleep(2 * time.Millisecond)
+	}
+	if calls := strings.Join(actions.snapshot(), ","); calls != "retry,restart,retry,restart,abort,abort" {
+		t.Fatalf("restored recovery actions = %s", calls)
+	}
+	if persisted != 4 || saved.Retries["build"] != 2 || saved.Restarts["%1"] != 2 {
+		t.Fatalf("saved budgets = %+v, writes = %d", saved, persisted)
+	}
+}
+
+func TestErrorHandlerRecoveryRefusesSideEffectsWhenSaveFails(t *testing.T) {
+	for _, scenario := range []struct {
+		name   string
+		config ErrorHandlingConfig
+		fault  WorkflowError
+	}{
+		{"retry", ErrorHandlingConfig{OnTimeout: ErrorActionRetry, MaxRetriesPerStage: 1}, WorkflowError{Type: ErrorTimeout, Stage: "build"}},
+		{"restart", ErrorHandlingConfig{OnAgentCrash: ErrorActionRestartAgent, MaxRestartsPerAgent: 1}, WorkflowError{Type: ErrorAgentCrash, AgentID: "%1"}},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			actions := &recordingActions{}
+			h := NewErrorHandler(scenario.config, actions)
+			saveErr := errors.New("checkpoint unavailable")
+			fail := true
+			writes := 0
+			if err := h.ConfigureRecovery(RecoveryBudgets{}, func(RecoveryBudgets) error {
+				writes++
+				if fail {
+					return saveErr
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := h.Handle(t.Context(), &scenario.fault); !errors.Is(err, saveErr) {
+				t.Fatalf("save failure = %v", err)
+			}
+			if calls := actions.snapshot(); len(calls) != 0 {
+				t.Fatalf("unpersisted action ran: %v", calls)
+			}
+			fail = false
+			if err := h.Handle(t.Context(), &scenario.fault); err != nil {
+				t.Fatal(err)
+			}
+			if calls := strings.Join(actions.snapshot(), ","); calls != scenario.name || writes != 2 {
+				t.Fatalf("failed save consumed budget: calls=%s, writes=%d", calls, writes)
+			}
+		})
+	}
+}
+
+func TestErrorHandlerRecoverySnapshotsDoNotAlias(t *testing.T) {
+	config := ErrorHandlingConfig{
+		OnTimeout: ErrorActionRetry, MaxRetriesPerStage: 2,
+		OnAgentCrash: ErrorActionRestartAgent, MaxRestartsPerAgent: 2,
+	}
+	actions := &recordingActions{}
+	h := NewErrorHandler(config, actions)
+	restored := RecoveryBudgets{Retries: map[string]int{"build": 1}, Restarts: map[string]int{"%1": 1}}
+	var published RecoveryBudgets
+	if err := h.ConfigureRecovery(restored, func(next RecoveryBudgets) error {
+		published = next
+		next.Retries["build"] = 0
+		next.Restarts["%1"] = 0
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	restored.Retries["build"], restored.Restarts["%1"] = 0, 0
+	for _, fault := range []*WorkflowError{
+		{Type: ErrorTimeout, Stage: "build"},
+		{Type: ErrorAgentCrash, AgentID: "%1"},
+		{Type: ErrorTimeout, Stage: "build"},
+		{Type: ErrorAgentCrash, AgentID: "%1"},
+	} {
+		if err := h.Handle(t.Context(), fault); err != nil {
+			t.Fatal(err)
+		}
+		if published.Retries != nil {
+			published.Retries["build"], published.Restarts["%1"] = 0, 0
+		}
+	}
+	if calls := strings.Join(actions.snapshot(), ","); calls != "retry,restart,abort,abort" {
+		t.Fatalf("external map mutation changed recovery budgets: %s", calls)
+	}
+}
+
+func TestErrorHandlerRecoveryValidatesRestoredBudgets(t *testing.T) {
+	for _, invalid := range []RecoveryBudgets{
+		{Retries: map[string]int{"build": -1}},
+		{Retries: map[string]int{" ": 1}},
+		{Restarts: map[string]int{"%1": -1}},
+		{Restarts: map[string]int{"": 1}},
+	} {
+		actions := &recordingActions{}
+		h := NewErrorHandler(ErrorHandlingConfig{OnTimeout: ErrorActionRetry, MaxRetriesPerStage: 1}, actions)
+		if err := h.ConfigureRecovery(RecoveryBudgets{Retries: map[string]int{"build": 1}}, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.ConfigureRecovery(invalid, nil); err == nil {
+			t.Fatalf("accepted invalid recovery budgets: %+v", invalid)
+		}
+		if err := h.Handle(t.Context(), &WorkflowError{Type: ErrorTimeout, Stage: "build"}); err != nil {
+			t.Fatal(err)
+		}
+		if calls := strings.Join(actions.snapshot(), ","); calls != "abort" {
+			t.Fatalf("rejected restore replaced existing budget: %s", calls)
+		}
+	}
+}
+
+func TestErrorHandlerRecoveryDoesNotActAfterCancellation(t *testing.T) {
+	for _, cancelDuringSave := range []bool{false, true} {
+		t.Run(fmt.Sprint(cancelDuringSave), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			actions := &recordingActions{}
+			h := NewErrorHandler(ErrorHandlingConfig{OnTimeout: ErrorActionRetry, MaxRetriesPerStage: 1}, actions)
+			writes := 0
+			if err := h.ConfigureRecovery(RecoveryBudgets{}, func(RecoveryBudgets) error {
+				writes++
+				cancel()
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if !cancelDuringSave {
+				cancel()
+			}
+			fault := &WorkflowError{Type: ErrorTimeout, Stage: "build"}
+			if err := h.Handle(ctx, fault); !errors.Is(err, context.Canceled) {
+				t.Fatalf("canceled recovery = %v", err)
+			}
+			if calls := actions.snapshot(); len(calls) != 0 {
+				t.Fatalf("canceled recovery action ran: %v", calls)
+			}
+			wantWrites := 0
+			if cancelDuringSave {
+				wantWrites = 1
+			}
+			if writes != wantWrites {
+				t.Fatalf("writes=%d, want %d", writes, wantWrites)
+			}
+			if cancelDuringSave {
+				if err := h.Handle(t.Context(), fault); err != nil {
+					t.Fatal(err)
+				}
+				if calls := strings.Join(actions.snapshot(), ","); calls != "abort" {
+					t.Fatalf("persisted reservation was refunded after cancellation: %s", calls)
+				}
+			}
+		})
 	}
 }

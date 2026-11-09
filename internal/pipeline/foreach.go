@@ -1,7 +1,10 @@
 package pipeline
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -35,6 +38,21 @@ type foreachIterationResult struct {
 	SkipReason string                 `json:"skip_reason,omitempty"`
 	SkipKind   SkipKind               `json:"skip_kind,omitempty"`
 	Error      string                 `json:"error,omitempty"`
+	// Admission can fail between rounds without creating a child result.
+	// Keep its local classification until the container aggregates outcomes.
+	admissionError *StepError
+}
+
+func (r foreachIterationResult) admissionFailure() *StepError {
+	if r.admissionError != nil {
+		return r.admissionError
+	}
+	for _, result := range r.Results {
+		if cause := findStepAdmissionError(result.Error); cause != nil {
+			return cause
+		}
+	}
+	return nil
 }
 
 func (r foreachIterationResult) failed() bool {
@@ -64,14 +82,53 @@ func (e *Executor) executeForeach(ctx context.Context, step *Step, workflow *Wor
 	if config == nil {
 		return finishForeachFailure(result, "foreach", "step has no foreach configuration")
 	}
+	bodyCount := len(config.Steps)
+	if bodyCount == 0 {
+		bodyCount = len(config.Body)
+	}
+	if bodyCount == 0 && config.Template != "" {
+		bodyCount = 1
+	}
+	releaseBody, err := e.acquireStepMaterialization(ctx, bodyCount)
+	if err != nil {
+		return finishForeachFailure(result, "step_limit", err.Error())
+	}
+	defer releaseBody()
 
 	body, err := foreachBodySteps(step, config)
 	if err != nil {
 		return finishForeachFailure(result, "foreach", err.Error())
 	}
 
-	items, err := e.resolveForeachItems(ctx, config, kind)
+	// Dynamic sources can execute arbitrary shell commands. A preview cannot
+	// safely discover their items; leave static item/model previews unchanged.
+	if e.config.DryRun && stepUsesCommandEvaluation(step) {
+		source := config.Beads
+		if source == "" {
+			source = config.Pairs
+		}
+		if source == "" {
+			source = config.Debates
+		}
+		if source == "" {
+			source = strings.Join(config.Models, ", ")
+		}
+		result.Status = StatusCompleted
+		result.Output = dryRunOutput(step, "Would resolve foreach iteration source: "+truncatePrompt(SanitizeDescriptionForTerminal(source), 200))
+		result.FinishedAt = time.Now()
+		return result
+	}
+
+	evaluationCtx, cancel := e.selectorEvaluationContext(ctx, step)
+	items, err := e.resolveForeachItems(evaluationCtx, config, kind)
+	if evaluationCtx.Err() != nil {
+		err = errors.Join(evaluationCtx.Err(), err)
+	}
+	cancel()
 	if err != nil {
+		if errors.Is(err, errCommandOutputUnsettled) {
+			return finishForeachFailure(result, "execution_unknown", err.Error())
+		}
 		return finishForeachFailure(result, "foreach_source", err.Error())
 	}
 	if len(items) > e.limits.MaxForeachIterations {
@@ -96,9 +153,47 @@ func (e *Executor) executeForeach(ctx context.Context, step *Step, workflow *Wor
 		fmt.Sprintf("Starting %s with %d iterations", kind, len(items)),
 		e.calculateProgress())
 
+	releasePlans, err := e.acquireDefinitionCopies(ctx, body, len(items))
+	if err != nil {
+		return finishForeachFailure(result, "step_limit", err.Error())
+	}
+	defer releasePlans()
 	plans, err := e.prepareForeachIterations(ctx, step, config, kind, body, items)
 	if err != nil {
 		return finishForeachFailure(result, "foreach", err.Error())
+	}
+	// Literal round counts are known without changing the existing timing of
+	// expression evaluation. Admit their complete expansion before any body.
+	if config.MaxRounds.Expr == "" {
+		rounds := config.MaxRounds.Value
+		if rounds <= 0 {
+			rounds = 1
+		}
+		err := e.admitRuntimeBatch(ctx, func(yield func(string) error) error {
+			for _, plan := range plans {
+				if plan.Skipped {
+					continue
+				}
+				for round := 1; ; round++ {
+					for _, child := range plan.Steps {
+						id := child.ID
+						if rounds > 1 {
+							id = fmt.Sprintf("%s_round%d", id, round)
+						}
+						if err := yield(id); err != nil {
+							return err
+						}
+					}
+					if round == rounds {
+						break
+					}
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return finishForeachFailure(result, "step_limit", err.Error())
+		}
 	}
 
 	// bd-gstw3: items-fingerprint drift detection (parity with bd-3awat for
@@ -149,6 +244,11 @@ func (e *Executor) executeForeach(ctx context.Context, step *Step, workflow *Wor
 	outputBindings := e.storeForeachOutputVars(step, config, plans, iterations)
 	if failed > 0 {
 		result.Error = aggregateForeachErrors(iterations, step.ID, total)
+		if findStepAdmissionError(result.Error) != nil {
+			result.Status = StatusFailed
+			result.Error.Type = "step_limit"
+			return result
+		}
 		if onError != ErrorActionContinue {
 			result.Status = StatusFailed
 			e.emitProgress("step_error", step.ID, result.Error.Message, e.calculateProgress())
@@ -228,6 +328,7 @@ func (e *Executor) resolveForeachItems(ctx context.Context, config *ForeachConfi
 
 	resolver := IterationSourceResolver{
 		ProjectDir: e.config.ProjectDir,
+		Limits:     e.limits,
 		RunBr:      e.config.BeadQueryRunBr,
 	}
 	switch {
@@ -505,6 +606,9 @@ func (e *Executor) executeForeachIterationsSequential(ctx context.Context, paren
 			}
 			break
 		}
+		if iterResult.admissionFailure() != nil {
+			break
+		}
 		if iterResult.failed() && onError == ErrorActionFailFast {
 			for _, remaining := range plans[i+1:] {
 				results = append(results, cancelledForeachIteration(remaining))
@@ -522,8 +626,12 @@ func (e *Executor) executeForeachIterationsParallel(ctx context.Context, parent 
 	if maxConcurrent <= 0 {
 		maxConcurrent = 1
 	}
+	if maxConcurrent > len(plans) {
+		maxConcurrent = len(plans)
+	}
 	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	runCtx, finish := withCommandCancellationScope(runCtx, cancel)
+	defer finish()
 
 	results := make([]foreachIterationResult, len(plans))
 	sem := make(chan struct{}, maxConcurrent)
@@ -543,6 +651,12 @@ func (e *Executor) executeForeachIterationsParallel(ctx context.Context, parent 
 		defer controlMu.Unlock()
 		return breakSeen
 	}
+	cancelledResult := func(plan foreachIterationPlan) foreachIterationResult {
+		if isBreak() {
+			return foreachBreakSkippedIteration(plan)
+		}
+		return cancelledForeachIteration(plan)
+	}
 
 	for i, plan := range plans {
 		if plan.Skipped {
@@ -556,19 +670,37 @@ func (e *Executor) executeForeachIterationsParallel(ctx context.Context, parent 
 			progress.iterationFinished()
 			continue
 		}
+		// Bound goroutine creation as well as active iteration bodies. Taking
+		// the permit inside a worker leaves one blocked goroutine per item.
+		if runCtx.Err() != nil {
+			results[i] = cancelledResult(plan)
+			progress.iterationFinished()
+			continue
+		}
+		select {
+		case sem <- struct{}{}:
+		case <-runCtx.Done():
+			results[i] = cancelledResult(plan)
+			progress.iterationFinished()
+			continue
+		}
+		// Cancellation and a released permit may become ready together.
+		// A successful select must not authorize another dispatch afterward.
+		if runCtx.Err() != nil {
+			<-sem
+			results[i] = cancelledResult(plan)
+			progress.iterationFinished()
+			continue
+		}
 		wg.Add(1)
 		go func(i int, plan foreachIterationPlan) {
-			defer wg.Done()
-			defer progress.iterationFinished()
-			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-			case <-runCtx.Done():
-				if isBreak() {
-					results[i] = foreachBreakSkippedIteration(plan)
-				} else {
-					results[i] = cancelledForeachIteration(plan)
-				}
+			defer func() {
+				progress.iterationFinished()
+				<-sem
+				wg.Done()
+			}()
+			if runCtx.Err() != nil {
+				results[i] = cancelledResult(plan)
 				return
 			}
 			iterResult := e.executeForeachIteration(runCtx, parent, workflow, plan, onError)
@@ -659,6 +791,29 @@ func (e *Executor) executeForeachIteration(ctx context.Context, parent *Step, wo
 	}
 
 	for round := startRound; round <= maxRounds; round++ {
+		if err := e.admitRuntimeBatch(ctx, func(yield func(string) error) error {
+			for _, child := range plan.Steps {
+				id := child.ID
+				if maxRounds > 1 {
+					id = fmt.Sprintf("%s_round%d", id, round)
+				}
+				if err := yield(id); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			iterResult.Error = err.Error()
+			if isStepAdmissionError(err) {
+				iterResult.admissionError = &StepError{Type: "step_limit", Message: err.Error(), Timestamp: time.Now()}
+			} else if err == ctx.Err() {
+				// Cancellation can arrive before any child exists. Preserve
+				// its provenance so a sibling's loop break can normalize it.
+				iterResult.SkipKind = SkipKindCancelled
+				iterResult.SkipReason = err.Error()
+			}
+			return iterResult
+		}
 		// bd-2ubxp.20: bind round/rounds_remaining/loop.round on a derived
 		// context instead of writing to shared state.Variables, so parallel
 		// iterations don't race on each other's round values.
@@ -668,11 +823,25 @@ func (e *Executor) executeForeachIteration(ctx context.Context, parent *Step, wo
 		}
 
 		stepsForRound := plan.Steps
+		releaseRound := func() {}
 		if maxRounds > 1 {
+			var err error
+			releaseRound, err = e.acquireStepMaterialization(ctx, len(plan.Steps))
+			if err != nil {
+				iterResult.Error = err.Error()
+				if isStepAdmissionError(err) {
+					iterResult.admissionError = &StepError{Type: "step_limit", Message: err.Error(), Timestamp: time.Now()}
+				} else if err == ctx.Err() {
+					iterResult.SkipKind = SkipKindCancelled
+					iterResult.SkipReason = err.Error()
+				}
+				return iterResult
+			}
 			stepsForRound = rewriteRoundStepIDs(plan.Steps, round)
 		}
 
 		exit := e.runForeachIterationRound(roundCtx, parent, workflow, plan, parentOnError, stepsForRound, &iterResult)
+		releaseRound()
 		if exit {
 			return iterResult
 		}
@@ -736,8 +905,21 @@ func (e *Executor) runForeachIterationRound(ctx context.Context, parent *Step, w
 
 		step := stepsForRound[i]
 		result := e.executeForeachNestedStep(ctx, &step, workflow)
+		unsettled := findStepAdmissionError(result.Error) == nil &&
+			(e.hasUnresolvedCommandExecutionForOutcome(&step, &result) || e.hasUnresolvedCommandEvaluation(&step))
+		if unsettled {
+			result = unsettledProcessStepFailure(result, fmt.Errorf("%w for %q", errStepProcessUnsettled, step.ID))
+		}
 		iterResult.Results = append(iterResult.Results, result)
 		e.storeForeachNestedResult(&step, result)
+		if findStepAdmissionError(result.Error) != nil {
+			iterResult.Error = resultErrorMessage(result)
+			return true
+		}
+		if unsettled {
+			iterResult.Error = resultErrorMessage(result)
+			return true
+		}
 
 		if result.Status == StatusSkipped {
 			if step.LoopControl == LoopControlBreak || step.LoopControl == LoopControlContinue {
@@ -875,6 +1057,15 @@ func (e *Executor) logForeachLoopControl(control LoopControl, workflow *Workflow
 }
 
 func (e *Executor) executeForeachNestedStep(ctx context.Context, step *Step, workflow *Workflow) StepResult {
+	if err := e.admitRuntimeIDs(ctx, []string{step.ID}); err != nil {
+		return stepAdmissionResult(step, err)
+	}
+	e.markStepInFlight(step.ID, stepKind(step), -1)
+	e.persistState()
+	defer e.clearStepInFlight(step.ID)
+	if recovered, ok := e.resumeSuccessHookStep(ctx, step, workflow); ok {
+		return recovered
+	}
 	if step.When != "" {
 		skip, err := e.evaluateConditionCtx(ctx, step.When)
 		if err != nil {
@@ -919,12 +1110,43 @@ func (e *Executor) executeForeachNestedStep(ctx context.Context, step *Step, wor
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		result = e.executeForeachNestedStepOnce(ctx, step, workflow)
 		result.Attempts = attempt
+		if result.Status == StatusCancelled && result.SkipKind == SkipKindCancelledBeforeDispatch {
+			result.Attempts = attempt - 1
+		}
+		if findStepAdmissionError(result.Error) != nil {
+			return result
+		}
+		if result.Status == StatusCompleted && len(step.OnSuccess) > 0 {
+			if e.hasUnresolvedCommandExecutionForOutcome(step, &result) || e.hasUnresolvedCommandEvaluation(step) {
+				return unsettledProcessStepFailure(result, fmt.Errorf("%w for %q", errStepProcessUnsettled, step.ID))
+			}
+			if err := e.prepareSuccessHooks(ctx, step, result); err != nil {
+				return successHookExecutionFailure(result, err)
+			}
+		}
+		if err := e.stepAdmissionFailure(ctx); err != nil {
+			if result.Status == StatusCompleted && len(step.OnSuccess) > 0 {
+				return stepAdmissionExecutionFailure(result, err)
+			}
+			return result
+		}
 		if result.Status == StatusCompleted {
-			e.runOnSuccessSteps(ctx, step, workflow)
+			if e.hasUnresolvedCommandExecutionForOutcome(step, &result) || e.hasUnresolvedCommandEvaluation(step) {
+				return unsettledProcessStepFailure(result, fmt.Errorf("%w for %q", errStepProcessUnsettled, step.ID))
+			}
+			if err := e.runOnSuccessSteps(ctx, step, workflow); err != nil {
+				return successHookExecutionFailure(result, err)
+			}
+			result.FinishedAt = time.Now()
 			return result
 		}
 		if result.Status == StatusSkipped || result.Status == StatusCancelled {
 			return result
+		}
+		if _, pending := e.pendingOnFailureDelivery(step); pending {
+			// Revisit the existing recovery delivery without spending retries
+			// on the settled failure that originally dispatched it.
+			break
 		}
 		if attempt < maxAttempts {
 			select {
@@ -1145,6 +1367,9 @@ func foreachIterationKey(iter foreachIterationResult) string {
 }
 
 func (e *Executor) storeForeachNestedResult(step *Step, result StepResult) {
+	if !e.runtimeIDAdmitted(result.StepID) {
+		return
+	}
 	e.stateMu.Lock()
 	if e.state.Steps == nil {
 		e.state.Steps = make(map[string]StepResult)
@@ -1190,6 +1415,7 @@ func (e *Executor) substituteForeachStepFieldsProtected(step *Step, protected ma
 	step.Prompt = e.substituteForeachString(step.Prompt, protected)
 	step.PromptFile = e.substituteForeachString(step.PromptFile, protected)
 	step.Command = e.substituteForeachString(step.Command, protected)
+	step.Stdin = e.substituteForeachString(step.Stdin, protected)
 	step.Template = e.substituteForeachString(step.Template, protected)
 	step.Wait = WaitCondition(e.substituteForeachString(string(step.Wait), protected))
 	step.When = e.substituteForeachString(step.When, protected)
@@ -1198,6 +1424,29 @@ func (e *Executor) substituteForeachStepFieldsProtected(step *Step, protected ma
 	step.Args = substituteForeachInterfaceMap(e, step.Args, protected)
 	step.Params = substituteForeachInterfaceMap(e, step.Params, protected)
 	step.TemplateParams = substituteForeachInterfaceMap(e, step.TemplateParams, protected)
+	step.OnFailure.Action = e.substituteForeachString(step.OnFailure.Action, protected)
+	step.OnFailure.Fallback = substituteForeachInterfaceMap(e, step.OnFailure.Fallback, protected)
+	if query := step.BeadQuery; query != nil {
+		query.Label = e.substituteForeachStringList(query.Label, protected)
+		e.substituteForeachStrings(protected, &query.Status, &query.State, &query.Type,
+			&query.Priority, &query.Assignee, &query.Filter)
+	}
+	if mail := step.MailSend; mail != nil {
+		mail.To = e.substituteForeachStringList(mail.To, protected)
+		e.substituteForeachStrings(protected, &mail.ProjectKey, &mail.AgentName,
+			&mail.Subject, &mail.Body, &mail.ThreadID)
+	}
+	if reservation := step.FileReservationPaths; reservation != nil {
+		reservation.Paths = e.substituteForeachStringList(reservation.Paths, protected)
+		e.substituteForeachStrings(protected, &reservation.ProjectKey, &reservation.AgentName, &reservation.Reason)
+	}
+	if inbox := step.MailInboxCheck; inbox != nil {
+		e.substituteForeachStrings(protected, &inbox.ProjectKey, &inbox.AgentName)
+	}
+	if release := step.FileReservationRelease; release != nil {
+		release.Paths = e.substituteForeachStringList(release.Paths, protected)
+		e.substituteForeachStrings(protected, &release.ProjectKey, &release.AgentName)
+	}
 	if step.Pane.Expr != "" {
 		resolved := strings.TrimSpace(e.substituteForeachString(step.Pane.Expr, protected))
 		if idx, err := strconv.Atoi(resolved); err == nil {
@@ -1213,12 +1462,23 @@ func (e *Executor) substituteForeachStepFieldsProtected(step *Step, protected ma
 	for i := range step.OnSuccess {
 		e.substituteForeachStepFieldsProtected(&step.OnSuccess[i], protected)
 	}
+	for key, value := range step.Branches {
+		step.Branches[key] = e.substituteForeachBranchFields(value, protected)
+	}
 	if step.Loop != nil {
+		// Loop selectors and collection names are evaluated outside the
+		// nested iteration's scope. Only its body owns item and loop.*;
+		// legacy loops do not install a bare custom alias like foreach does.
+		e.substituteForeachStrings(protected, &step.Loop.Items, &step.Loop.While,
+			&step.Loop.Until, &step.Loop.Collect, &step.Loop.MaxIterations.Expr)
+		bodyProtected := cloneProtectedRoots(protected)
+		bodyProtected["item"] = struct{}{}
+		bodyProtected["loop"] = struct{}{}
 		for i := range step.Loop.Steps {
-			e.substituteForeachStepFieldsProtected(&step.Loop.Steps[i], protected)
+			e.substituteForeachStepFieldsProtected(&step.Loop.Steps[i], bodyProtected)
 		}
 		for i := range step.Loop.Body {
-			e.substituteForeachStepFieldsProtected(&step.Loop.Body[i], protected)
+			e.substituteForeachStepFieldsProtected(&step.Loop.Body[i], bodyProtected)
 		}
 	}
 	for _, config := range []*ForeachConfig{step.Foreach, step.ForeachPane} {
@@ -1227,7 +1487,11 @@ func (e *Executor) substituteForeachStepFieldsProtected(step *Step, protected ma
 		}
 		bodyProtected := cloneProtectedRoots(protected)
 		bodyProtected[foreachVarName(config)] = struct{}{}
+		bodyProtected["item"] = struct{}{}
 		bodyProtected["loop"] = struct{}{}
+		if config == step.ForeachPane || config.PaneStrategy != "" {
+			bodyProtected["pane"] = struct{}{}
+		}
 		if foreachVarName(config) == "item" && e.foreachLoopItemActive() {
 			slog.Debug("nested foreach item alias shadows outer item",
 				"run_id", e.state.RunID,
@@ -1241,6 +1505,7 @@ func (e *Executor) substituteForeachStepFieldsProtected(step *Step, protected ma
 		config.Pairs = e.substituteForeachString(config.Pairs, protected)
 		config.Debates = e.substituteForeachString(config.Debates, protected)
 		config.Filter = e.substituteForeachString(config.Filter, protected)
+		config.MaxRounds.Expr = e.substituteForeachString(config.MaxRounds.Expr, protected)
 		// bd-8bujt: foreach.models is a StringOrList that can hold either
 		// an inline literal list of model-family tokens or (single-entry)
 		// a shell command emitting one family per line. Both forms must
@@ -1260,6 +1525,64 @@ func (e *Executor) substituteForeachStepFieldsProtected(step *Step, protected ma
 			e.substituteForeachStepFieldsProtected(&config.Body[i], bodyProtected)
 		}
 	}
+}
+
+func (e *Executor) substituteForeachStrings(protected map[string]struct{}, fields ...*string) {
+	for _, field := range fields {
+		*field = e.substituteForeachString(*field, protected)
+	}
+}
+
+func (e *Executor) substituteForeachStringList(values StringOrList, protected map[string]struct{}) StringOrList {
+	if values == nil {
+		return nil
+	}
+	out := make(StringOrList, len(values))
+	for i, value := range values {
+		out[i] = e.substituteForeachString(value, protected)
+	}
+	return out
+}
+
+// Branch bodies use the same heterogeneous representation accepted by
+// parseBranchSteps. Decode their step fields so nested loop boundaries are
+// respected, without assigning IDs before the branch has its runtime scope.
+// Leave malformed values for the existing branch validation path, and retain
+// unchanged representations to keep existing checkpoint hashes stable.
+func (e *Executor) substituteForeachBranchFields(value interface{}, protected map[string]struct{}) interface{} {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return value
+	}
+	var steps []Step
+	if err := json.Unmarshal(data, &steps); err == nil && len(steps) > 0 {
+		before, err := json.Marshal(steps)
+		if err != nil {
+			return value
+		}
+		for i := range steps {
+			e.substituteForeachStepFieldsProtected(&steps[i], protected)
+		}
+		after, err := json.Marshal(steps)
+		if err != nil || bytes.Equal(before, after) {
+			return value
+		}
+		return steps
+	}
+	var step Step
+	if err := json.Unmarshal(data, &step); err != nil {
+		return value
+	}
+	before, err := json.Marshal(step)
+	if err != nil {
+		return value
+	}
+	e.substituteForeachStepFieldsProtected(&step, protected)
+	after, err := json.Marshal(step)
+	if err != nil || bytes.Equal(before, after) {
+		return value
+	}
+	return step
 }
 
 func foreachVarName(config *ForeachConfig) string {
@@ -1547,6 +1870,11 @@ func (e *Executor) foreachCompletedIterationIDs(stepID string) map[string]struct
 }
 
 func foreachIterationCancelled(result foreachIterationResult) bool {
+	// A prior cancelled child may have been handled with on_error: continue.
+	// A later admission refusal must remain visible even if a sibling breaks.
+	if result.admissionFailure() != nil {
+		return false
+	}
 	if result.SkipKind == SkipKindCancelled {
 		return true
 	}
@@ -1578,10 +1906,36 @@ func cloneStep(step Step) Step {
 	step.Args = cloneInterfaceMap(step.Args)
 	step.Params = cloneInterfaceMap(step.Params)
 	step.TemplateParams = cloneInterfaceMap(step.TemplateParams)
+	step.OnFailure.Fallback = cloneInterfaceMap(step.OnFailure.Fallback)
+	step.Branches = cloneInterfaceMap(step.Branches)
 	step.DependsOn = append([]string(nil), step.DependsOn...)
 	step.After = append(AfterRef(nil), step.After...)
 	step.OnSuccess = cloneSteps(step.OnSuccess)
 	step.Parallel.Steps = cloneSteps(step.Parallel.Steps)
+	if step.BeadQuery != nil {
+		query := *step.BeadQuery
+		query.Label = append(StringOrList(nil), query.Label...)
+		step.BeadQuery = &query
+	}
+	if step.MailSend != nil {
+		mail := *step.MailSend
+		mail.To = append(StringOrList(nil), mail.To...)
+		step.MailSend = &mail
+	}
+	if step.FileReservationPaths != nil {
+		reservation := *step.FileReservationPaths
+		reservation.Paths = append(StringOrList(nil), reservation.Paths...)
+		step.FileReservationPaths = &reservation
+	}
+	if step.MailInboxCheck != nil {
+		inbox := *step.MailInboxCheck
+		step.MailInboxCheck = &inbox
+	}
+	if step.FileReservationRelease != nil {
+		release := *step.FileReservationRelease
+		release.Paths = append(StringOrList(nil), release.Paths...)
+		step.FileReservationRelease = &release
+	}
 	if step.Loop != nil {
 		loop := *step.Loop
 		loop.Steps = cloneSteps(loop.Steps)
@@ -1636,6 +1990,16 @@ func cloneInterfaceMap(in map[string]interface{}) map[string]interface{} {
 
 func cloneInterfaceValue(value interface{}) interface{} {
 	switch v := value.(type) {
+	case Step:
+		return cloneStep(v)
+	case *Step:
+		if v == nil {
+			return (*Step)(nil)
+		}
+		step := cloneStep(*v)
+		return &step
+	case []Step:
+		return cloneSteps(v)
 	case map[string]interface{}:
 		return cloneInterfaceMap(v)
 	case map[string]string:
@@ -1685,6 +2049,12 @@ func substituteForeachInterfaceValue(e *Executor, value interface{}, protected m
 		return e.substituteForeachString(v, protected)
 	case map[string]interface{}:
 		return substituteForeachInterfaceMap(e, v, protected)
+	case map[string]string:
+		out := make(map[string]string, len(v))
+		for key, item := range v {
+			out[key] = e.substituteForeachString(item, protected)
+		}
+		return out
 	case []interface{}:
 		out := make([]interface{}, len(v))
 		for i, item := range v {

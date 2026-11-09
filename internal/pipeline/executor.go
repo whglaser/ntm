@@ -47,6 +47,89 @@ var commandHeartbeatInterval = 30 * time.Second
 // that post-start save. Production contexts never carry it.
 type commandStartedTestHookKey struct{}
 
+// A scheduler joins its foreground workers before finishing, but wait:none
+// commands can still own processes after their launch acknowledgements return.
+// Retain the native cancellation contexts until those cleanup workers finish.
+// Explicit cancellation remains immediate; only normal scope exit is deferred.
+type commandCancellationScopeKey struct{}
+
+type commandCancellationScope struct {
+	parent   *commandCancellationScope
+	cancel   context.CancelFunc
+	mu       sync.Mutex
+	retained int
+	finished bool
+	drained  chan struct{}
+}
+
+func withCommandCancellationScope(ctx context.Context, cancel context.CancelFunc) (context.Context, context.CancelFunc) {
+	parent, _ := ctx.Value(commandCancellationScopeKey{}).(*commandCancellationScope)
+	scope := &commandCancellationScope{parent: parent, cancel: cancel}
+	return context.WithValue(ctx, commandCancellationScopeKey{}, scope), scope.finish
+}
+
+func (scope *commandCancellationScope) finish() {
+	scope.mu.Lock()
+	scope.finished = true
+	cancel := scope.retained == 0
+	scope.mu.Unlock()
+	if cancel {
+		scope.cancel()
+	}
+}
+
+// wait joins this scope's cleanup workers after its foreground scheduler has
+// stopped admitting commands. Caller cancellation hands control back to normal
+// finalization so it can checkpoint cancellation before its final cleanup join.
+// Returning from supervision does not imply that every receipt is settled.
+func (scope *commandCancellationScope) wait(ctx context.Context) {
+	scope.mu.Lock()
+	if scope.retained == 0 {
+		scope.mu.Unlock()
+		return
+	}
+	if scope.drained == nil {
+		scope.drained = make(chan struct{})
+	}
+	drained := scope.drained
+	scope.mu.Unlock()
+	select {
+	case <-drained:
+	case <-ctx.Done():
+	}
+}
+
+// Retain every enclosing scheduler and timeout scope before returning a
+// background launch. Keeping the original context chain preserves values,
+// cancellation causes, and container deadlines without reparenting processes.
+func retainCommandCancellationScopes(ctx context.Context) context.CancelFunc {
+	var scopes []*commandCancellationScope
+	for scope, _ := ctx.Value(commandCancellationScopeKey{}).(*commandCancellationScope); scope != nil; scope = scope.parent {
+		scope.mu.Lock()
+		scope.retained++
+		scope.mu.Unlock()
+		scopes = append(scopes, scope)
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			for _, scope := range scopes {
+				scope.mu.Lock()
+				scope.retained--
+				if scope.retained == 0 && scope.drained != nil {
+					close(scope.drained)
+					scope.drained = nil
+				}
+				cancel := scope.finished && scope.retained == 0
+				scope.mu.Unlock()
+				if cancel {
+					scope.cancel()
+				}
+			}
+		})
+	}
+}
+
 // ExecutorConfig configures the executor behavior
 type ExecutorConfig struct {
 	Session          string        // Required: tmux session name
@@ -134,9 +217,18 @@ type Executor struct {
 	// return cancels those commands and joins their workers so callers never
 	// observe state while cancellation persistence is still writing to disk.
 	backgroundCommandWG sync.WaitGroup
-	// Unsettled cleanup cannot authorize success merely because a WaitNone
-	// launch returned synchronously. Protected by stateMu and reset per attempt.
+	// Unsettled cleanup, an explicit timeout, or a background execution failure
+	// cannot authorize success merely because a WaitNone launch returned.
+	// Protected by stateMu and reset per attempt.
 	backgroundCommandErrors map[string]error
+
+	// Selector capture reservations are derived from durable receipts. Only
+	// these attempt-local owners may release capacity while another selector
+	// waits; interrupted starting receipts are never treated as live workers.
+	// Both fields are protected by stateMu.
+	selectorOutputActive map[string]selectorOutputReservation
+	selectorOutputWake   chan struct{}
+	stepAdmissionAttempt *stepAdmissionAttempt // Protected by stateMu; reset per attempt.
 
 	// persistMu serializes snapshot-and-save transactions. Multiple workers may
 	// checkpoint concurrently; without this lock an older snapshot whose fsync
@@ -296,25 +388,28 @@ func (e *Executor) Run(ctx context.Context, workflow *Workflow, vars map[string]
 
 	e.stateMu.Lock()
 	e.backgroundCommandErrors = nil
+	e.resetSelectorOutputBudgetLocked()
+	e.stepAdmissionAttempt = &stepAdmissionAttempt{}
 	e.reservationFailure = nil
 	e.reservationWake = make(chan struct{}, 1)
 	e.reservationStop = make(chan struct{})
 	e.reservationStopOnce = sync.Once{}
 	e.reservationFinalCheck = false
 	e.state = &ExecutionState{
-		RunID:         runID,
-		WorkflowID:    workflow.Name,
-		WorkflowFile:  e.config.WorkflowFile,
-		Session:       e.config.Session,
-		Status:        StatusRunning,
-		StartedAt:     time.Now(),
-		UpdatedAt:     time.Now(),
-		Steps:         make(map[string]StepResult),
-		Variables:     make(map[string]interface{}),
-		Errors:        []ExecutionError{},
-		ForeachState:  make(map[string]ForeachIterationState),
-		ParallelState: make(map[string]ParallelGroupState),
-		InFlightSteps: make(map[string]InFlightStepState),
+		RunID:                    runID,
+		WorkflowID:               workflow.Name,
+		WorkflowFile:             e.config.WorkflowFile,
+		Session:                  e.config.Session,
+		Status:                   StatusRunning,
+		StartedAt:                time.Now(),
+		UpdatedAt:                time.Now(),
+		Steps:                    make(map[string]StepResult),
+		Variables:                make(map[string]interface{}),
+		Errors:                   []ExecutionError{},
+		ForeachState:             make(map[string]ForeachIterationState),
+		ParallelState:            make(map[string]ParallelGroupState),
+		InFlightSteps:            make(map[string]InFlightStepState),
+		CommandEvaluationVersion: commandEvaluationVersion,
 	}
 	e.progress = progress
 	e.stateMu.Unlock()
@@ -345,6 +440,11 @@ func (e *Executor) Run(ctx context.Context, workflow *Workflow, vars map[string]
 	e.defaults = workflow.Defaults
 	e.limits = workflow.Settings.Limits.EffectiveLimits()
 	e.resetPaneMetadataLoader()
+	if err := e.validateStepDefinitionCapacity(workflow); err != nil {
+		e.state.Status = StatusFailed
+		e.state.FinishedAt = time.Now()
+		return e.state, errors.Join(err, e.persistState())
+	}
 
 	if err := e.persistState(); err != nil {
 		return e.state, err
@@ -367,6 +467,14 @@ func (e *Executor) Run(ctx context.Context, workflow *Workflow, vars map[string]
 		return e.state, joinCheckpointError(fmt.Errorf("workflow has dependency errors: %v", errors[0]), e.persistState())
 	}
 
+	if err := e.admitWorkflowRoots(ctx, workflow); err != nil {
+		if ctx.Err() != nil && errors.Is(err, ctx.Err()) && e.checkpointFailure() == nil {
+			return e.finishExecution(ctx, workflow, err)
+		}
+		e.state.Status = StatusFailed
+		e.state.FinishedAt = time.Now()
+		return e.state, errors.Join(err, e.persistState())
+	}
 	if err := e.applyStartFrom(workflow); err != nil {
 		e.stateMu.Lock()
 		e.state.Status = StatusFailed
@@ -395,6 +503,12 @@ func (e *Executor) Run(ctx context.Context, workflow *Workflow, vars map[string]
 func (e *Executor) Resume(ctx context.Context, workflow *Workflow, prior *ExecutionState, progress chan<- ProgressEvent) (*ExecutionState, error) {
 	if prior == nil {
 		return nil, fmt.Errorf("resume state is nil")
+	}
+	if e.config.ResumeOptions.MaxSelectorOutputBytesTotal < 0 {
+		return prior, fmt.Errorf("max_selector_output_bytes_total must not be negative")
+	}
+	if e.config.ResumeOptions.MaxStepCountTotal < 0 || e.config.ResumeOptions.MaxMaterializedStepNodes < 0 {
+		return prior, fmt.Errorf("max_step_count_total and max_materialized_step_nodes must not be negative")
 	}
 
 	// bd-0wzkc: reject resume of state captured for a different workflow.
@@ -429,6 +543,8 @@ func (e *Executor) Resume(ctx context.Context, workflow *Workflow, prior *Execut
 
 	e.stateMu.Lock()
 	e.backgroundCommandErrors = nil
+	e.resetSelectorOutputBudgetLocked()
+	e.stepAdmissionAttempt = &stepAdmissionAttempt{}
 	e.reservationFailure = nil
 	e.reservationWake = make(chan struct{}, 1)
 	e.reservationStop = make(chan struct{})
@@ -478,7 +594,10 @@ func (e *Executor) Resume(ctx context.Context, workflow *Workflow, prior *Execut
 
 	e.progress = progress
 	e.defaults = workflow.Defaults
-	e.limits = workflow.Settings.Limits.EffectiveLimits()
+	e.limits = resumeAttemptLimits(workflow.Settings.Limits, e.config.ResumeOptions)
+	if err := e.validateStepDefinitionCapacity(workflow); err != nil {
+		return prior, err
+	}
 
 	// Build dependency graph
 	e.graph = NewDependencyGraph(workflow)
@@ -503,6 +622,15 @@ func (e *Executor) Resume(ctx context.Context, workflow *Workflow, prior *Execut
 		// attempt, not failed protection. Run authored cleanup with the
 		// original receipts intact; do not reset or prune their identities.
 		// Concrete ownership and unknown-outcome errors do not match ctx.Err.
+		e.stateMu.Lock()
+		admissionErr := e.seedStepAdmissionsLocked(workflow, e.graph)
+		e.stateMu.Unlock()
+		if admissionErr != nil {
+			return e.state, errors.Join(resumeErr, admissionErr)
+		}
+		if err := e.admitFinalizationRoots(context.WithoutCancel(ctx), workflow); err != nil {
+			return e.state, errors.Join(resumeErr, err)
+		}
 		return e.finishExecution(ctx, workflow, resumeErr)
 	}
 	if resumeErr == nil {
@@ -534,6 +662,14 @@ func (e *Executor) Resume(ctx context.Context, workflow *Workflow, prior *Execut
 	// checkpoint age, advance the graph, or authorize downstream effects.
 	if err := e.applyResumeState(); err != nil {
 		return e.state, fmt.Errorf("restore resume outputs: %w", err)
+	}
+	if err := e.admitWorkflowRoots(ctx, workflow); err != nil {
+		if ctx.Err() != nil && errors.Is(err, ctx.Err()) && e.checkpointFailure() == nil {
+			return e.finishExecution(ctx, workflow, err)
+		}
+		// This attempt has not dispatched work. An admission checkpoint
+		// failure must not start authored cleanup as a side effect.
+		return e.state, err
 	}
 
 	// bd-05l02: now that resume validation has accepted the prior state,
@@ -587,6 +723,13 @@ func (e *Executor) finalizeCancelledWorkflow(ctx context.Context, workflow *Work
 	e.stateMu.Unlock()
 	e.persistState()
 
+	// Main sidecars retain their resources through graceful shutdown and
+	// receipt persistence. Join their supervision before authored cleanup can
+	// release those resources. An unresolved receipt still remains unresolved;
+	// it does not suppress the independently bounded best-effort cleanup.
+	e.Cancel()
+	e.backgroundCommandWG.Wait()
+
 	e.runOnCancelSteps(workflow)
 
 	finishedAt := time.Now()
@@ -628,10 +771,13 @@ func (e *Executor) runOnCancelSteps(workflow *Workflow) {
 		e.state.UpdatedAt = time.Now()
 		e.stateMu.Unlock()
 
-		cleanupCtx := context.WithValue(context.Background(), checkpointCleanupKey{}, true)
+		cleanupCtx := context.WithValue(finalizationContext(context.Background()), checkpointCleanupKey{}, true)
 		stepCtx, stepCancel := context.WithTimeout(cleanupCtx, cleanupTimeout)
 		result := e.executeStep(stepCtx, &step, &cleanupWorkflow)
 		stepCancel()
+		if !e.runtimeIDAdmitted(step.ID) {
+			continue
+		}
 		if result.FinishedAt.IsZero() {
 			result.FinishedAt = time.Now()
 		}
@@ -740,9 +886,11 @@ func (e *Executor) executeWorkflow(ctx context.Context, workflow *Workflow) erro
 
 	// stepCtx cancels in-flight siblings on fatal errors (fail / fail_fast /
 	// retry-exhausted) without tearing down the workflow ctx used by
-	// post-pipeline steps and finalization.
+	// post-pipeline steps and finalization. Normal main-phase completion
+	// retains sidecars until finalization cancels and joins their workers.
 	stepCtx, cancelSteps := context.WithCancel(ctx)
-	defer cancelSteps()
+	stepCtx, finishSteps := withCommandCancellationScope(stepCtx, cancelSteps)
+	defer finishSteps()
 
 	type stepDone struct {
 		stepID string
@@ -758,6 +906,9 @@ func (e *Executor) executeWorkflow(ctx context.Context, workflow *Workflow) erro
 	// state, and applies on_error semantics. A non-nil return is fatal.
 	finishStep := func(d stepDone) error {
 		stepID, step, result := d.stepID, d.step, d.result
+		if !e.runtimeIDAdmitted(stepID) {
+			return fmt.Errorf("runtime step %q was refused before admission", stepID)
+		}
 
 		e.stateMu.Lock()
 		e.state.Steps[stepID] = result
@@ -805,6 +956,9 @@ func (e *Executor) executeWorkflow(ctx context.Context, workflow *Workflow) erro
 			_ = e.graph.MarkFailed(stepID)
 		}
 
+		if err := e.stepAdmissionFailure(ctx); err != nil {
+			return err
+		}
 		// Handle failure based on error action
 		if result.Status == StatusFailed {
 			// Mark step as failed in dependency graph
@@ -931,11 +1085,50 @@ scheduler:
 		waitOne()
 	}
 
+	if fatalErr != nil {
+		cancelSteps()
+		// Fatal main failures have requested sidecar cancellation. Finish
+		// supervision before post hooks release resources still used
+		// by TERM handlers. Healthy runs retain sidecars through post hooks.
+		// Use the live workflow context so actual cancellation can proceed
+		// to its existing checkpoint-before-join path without another
+		// WaitGroup waiter racing commands started by authored cleanup.
+		stepCtx.Value(commandCancellationScopeKey{}).(*commandCancellationScope).wait(ctx)
+	}
 	return fatalErr
+}
+
+// resumeSuccessHookStep resumes a durable success tail before any condition,
+// retry, or kind executor can repeat the body's completed effects.
+func (e *Executor) resumeSuccessHookStep(ctx context.Context, step *Step, workflow *Workflow) (StepResult, bool) {
+	result, found, err := e.loadSuccessHookBody(step)
+	if err != nil {
+		now := time.Now()
+		return StepResult{
+			StepID: step.ID, Status: StatusFailed, StartedAt: now, FinishedAt: now,
+			Error: &StepError{Type: "recovery", Message: err.Error(), Timestamp: now},
+		}, true
+	}
+	if !found {
+		return StepResult{}, false
+	}
+	if e.hasUnresolvedCommandExecutionForOutcome(step, &result) || e.hasUnresolvedCommandEvaluation(step) {
+		return unsettledProcessStepFailure(result, fmt.Errorf("%w for %q", errStepProcessUnsettled, step.ID)), true
+	}
+	if err := e.runOnSuccessSteps(ctx, step, workflow); err != nil {
+		return successHookExecutionFailure(result, err), true
+	}
+	result.FinishedAt = time.Now()
+	e.emitProgress("step_complete", step.ID,
+		stepProgressMessage("Step completed", step, "success hooks resumed"), e.calculateProgress())
+	return result, true
 }
 
 // executeStep runs a single step with retry logic
 func (e *Executor) executeStep(ctx context.Context, step *Step, workflow *Workflow) StepResult {
+	if err := e.admitRuntimeIDs(ctx, []string{step.ID}); err != nil {
+		return stepAdmissionResult(step, err)
+	}
 	// Releasing an already-expired lease is valid cleanup. Its own identity
 	// check owns admission. Reset this marker for every child so success or
 	// recovery hooks cannot inherit a release parent's exemption.
@@ -947,13 +1140,27 @@ func (e *Executor) executeStep(ctx context.Context, step *Step, workflow *Workfl
 		Attempts:  0,
 	}
 	if e.stopBeforeDispatch(ctx, &result) {
+		if result.Status == StatusCancelled {
+			// No kind executor has run. Preserve that affirmative evidence
+			// without weakening resume's independent launch-receipt checks.
+			result.SkipKind = SkipKindCancelledBeforeDispatch
+		}
 		return result
 	}
 	e.markStepInFlight(step.ID, stepKind(step), -1)
 	e.persistState()
 	defer e.clearStepInFlight(step.ID)
 	if e.stopBeforeDispatch(ctx, &result) {
+		if result.Status == StatusCancelled {
+			result.SkipKind = SkipKindCancelledBeforeDispatch
+		}
 		return result
+	}
+
+	// A completed body owns its remaining success hooks even if a later
+	// attempt would evaluate different conditions or retry the original work.
+	if recovered, ok := e.resumeSuccessHookStep(ctx, step, workflow); ok {
+		return recovered
 	}
 
 	// Check for failed dependencies (in CONTINUE mode, skip steps with failed deps)
@@ -1017,13 +1224,48 @@ func (e *Executor) executeStep(ctx context.Context, step *Step, workflow *Workfl
 			stepProgressMessage("Executing step", step, fmt.Sprintf("attempt %d/%d", attempt, maxAttempts)),
 			e.calculateProgress())
 
-		// Execute the step
+		// Execute the step. The kind adapter preserves its input definition
+		// while resolving pane expressions for the current attempt.
 		stepResult := e.executeStepOnce(ctx, step, workflow)
+		startedAttempts := attempt
+		if stepResult.Status == StatusCancelled && stepResult.SkipKind == SkipKindCancelledBeforeDispatch {
+			// This attempt never entered its kind executor. Keep any
+			// earlier attempts visible to the missing-receipt fence.
+			startedAttempts--
+		}
+		if findStepAdmissionError(stepResult.Error) != nil {
+			stepResult.Attempts = startedAttempts
+			return stepResult
+		}
+		if stepResult.Status == StatusCompleted && len(step.OnSuccess) > 0 {
+			stepResult.Attempts = startedAttempts
+			if e.hasUnresolvedCommandExecutionForOutcome(step, &stepResult) || e.hasUnresolvedCommandEvaluation(step) {
+				return unsettledProcessStepFailure(stepResult, fmt.Errorf("%w for %q", errStepProcessUnsettled, step.ID))
+			}
+			// Save the observed body before cancellation, another worker's
+			// admission failure, or a success-hook effect can interrupt its tail.
+			if err := e.prepareSuccessHooks(ctx, step, stepResult); err != nil {
+				return successHookExecutionFailure(stepResult, err)
+			}
+		}
+		if err := e.stepAdmissionFailure(ctx); err != nil {
+			// A sibling or descendant can exhaust capacity after this body
+			// finishes. Preserve its original completion/uncertainty evidence;
+			// the sticky attempt error stops scheduling and fails the run.
+			stepResult.Attempts = startedAttempts
+			if stepResult.Status == StatusCompleted && len(step.OnSuccess) > 0 {
+				return stepAdmissionExecutionFailure(stepResult, err)
+			}
+			return stepResult
+		}
 
 		if stepResult.Status == StatusCompleted {
 			result = stepResult
 			result.Attempts = attempt
 			result.FinishedAt = time.Now()
+			if e.hasUnresolvedCommandExecutionForOutcome(step, &result) || e.hasUnresolvedCommandEvaluation(step) {
+				return unsettledProcessStepFailure(result, fmt.Errorf("%w for %q", errStepProcessUnsettled, step.ID))
+			}
 			// Publish canonical outputs before success hooks for every kind.
 			// Named output_var merging remains the containing scheduler's job.
 			e.varMu.Lock()
@@ -1032,16 +1274,20 @@ func (e *Executor) executeStep(ctx context.Context, step *Step, workflow *Workfl
 			e.emitProgress("step_complete", step.ID,
 				stepProgressMessage("Step completed", step, ""), e.calculateProgress())
 			// bd-w6nth.7: run OnSuccess steps after a successful parent.
-			// Failures here are logged but do NOT flip the parent's
-			// Status (matching post_pipeline_steps semantics). Depth is
-			// tracked in ctx so recursive OnSuccess chains can be capped.
-			e.runOnSuccessSteps(ctx, step, workflow)
+			// Ordinary hook failures are logged without changing its status.
+			// Interruption keeps the completed body and consumed hooks durable
+			// so a later attempt finishes the tail without repeating effects.
+			// Context depth bounds recursive OnSuccess chains.
+			if err := e.runOnSuccessSteps(ctx, step, workflow); err != nil {
+				return successHookExecutionFailure(result, err)
+			}
+			result.FinishedAt = time.Now()
 			return result
 		}
 
 		if stepResult.Status == StatusCancelled {
 			result = stepResult
-			result.Attempts = attempt
+			result.Attempts = startedAttempts
 			if result.FinishedAt.IsZero() {
 				result.FinishedAt = time.Now()
 			}
@@ -1066,9 +1312,20 @@ func (e *Executor) executeStep(ctx context.Context, step *Step, workflow *Workfl
 		// metadata survive retry exhaustion and on_failure recovery.
 		result = stepResult
 		result.Attempts = attempt
+		if e.hasUnresolvedCommandEvaluation(step) || e.hasAcceptedCommandEvaluationFailure(step) {
+			// Selector uncertainty also fences its containers. An operator's
+			// accepted final failure cannot change through another automatic
+			// attempt; proceed directly to the normal failure policy.
+			break
+		}
 		if delivery, ok := e.loadAgentDelivery(step.ID); ok && delivery.Status == agentDeliverySending {
 			// A transport error is not proof of non-delivery. Automatic retry
 			// cannot resolve this uncertainty by submitting the request again.
+			break
+		}
+		if _, pending := e.pendingOnFailureDelivery(step); pending {
+			// Recovery already crossed the delivery boundary for this failure.
+			// Re-enter it without spending retries on the original command.
 			break
 		}
 		if command, ok := e.loadCommandExecution(step.ID); ok && (command.Status != commandExecutionSettled || command.ResolutionAction != "") {
@@ -1141,7 +1398,7 @@ func (e *Executor) executeStep(ctx context.Context, step *Step, workflow *Workfl
 }
 
 func (e *Executor) finalizeFailedStep(ctx context.Context, step *Step, workflow *Workflow, result StepResult) StepResult {
-	if result.Status != StatusFailed {
+	if result.Status != StatusFailed || findStepAdmissionError(result.Error) != nil {
 		return result
 	}
 	if e.stopBeforeDispatch(ctx, &result) {
@@ -1176,6 +1433,9 @@ func (e *Executor) executeStepOnce(ctx context.Context, step *Step, workflow *Wo
 		StartedAt: time.Now(),
 	}
 	if e.stopBeforeDispatch(ctx, &result) {
+		if result.Status == StatusCancelled {
+			result.SkipKind = SkipKindCancelledBeforeDispatch
+		}
 		return result
 	}
 
@@ -1373,7 +1633,46 @@ func (e *Executor) executeCommand(ctx context.Context, step *Step, workflow *Wor
 		if prior.Result.Status == StatusCompleted && !prior.Result.RerunOnResume {
 			return prior.Result
 		}
+		if (!prior.Background || prior.ProcessID == 0) && prior.Result.Status == StatusFailed {
+			if delivery, pending := e.pendingOnFailureDelivery(step); pending {
+				if err := e.validateOnFailureDelivery(ctx, step, delivery); err != nil {
+					result.Status, result.FinishedAt = StatusFailed, time.Now()
+					result.Error = stepRuntimeError(step, StepKindCommand, "recovery", err.Error(), "restore the original failure recovery inputs or explicitly reset its replay scope", "")
+					return result
+				}
+				return prior.Result
+			}
+		}
+	} else if !e.config.DryRun {
+		if delivery, exists := e.loadAgentDelivery(onFailureStepID(step.ID)); exists && delivery.Status != agentDeliveryNotSent {
+			result.Status, result.FinishedAt = StatusFailed, time.Now()
+			result.Error = stepRuntimeError(step, StepKindCommand, "recovery", "failure recovery has lost its original command receipt", "restore the original command receipt or explicitly reset its replay scope", "")
+			return result
+		}
 	}
+
+	// Substitution and validation can fail before a launch intent exists. If
+	// this live failure can dispatch a fallback, retain exact proof that this
+	// attempt started no process before recovery crosses its delivery boundary.
+	// Never infer that proof later from an unbound scheduler result.
+	prelaunch := true
+	defer func() {
+		if !prelaunch || e.config.DryRun || len(step.OnFailure.Fallback) == 0 || result.Status != StatusFailed || result.Error == nil {
+			return
+		}
+		switch result.Error.Type {
+		case "substitution", "validation", "limit":
+		default:
+			return
+		}
+		record := CommandExecutionState{
+			Version: commandExecutionVersion, StepID: step.ID, StepHash: stepHash,
+			Status: commandExecutionSettled, StartedAt: result.StartedAt, SettledAt: time.Now(), Result: result,
+		}
+		if err := e.saveCommandExecution(record); err != nil {
+			result.Error = stepRuntimeError(step, StepKindCommand, "checkpoint", err.Error(), "restore durable storage before recovering the failed command", "")
+		}
+	}()
 
 	// bd-2xka8: bind pane metadata before substitution so ${pane.X} in the
 	// command body or args resolves against the step's configured pane.
@@ -1445,6 +1744,7 @@ func (e *Executor) executeCommand(ctx context.Context, step *Step, workflow *Wor
 		result.FinishedAt = time.Now()
 		return result
 	}
+	prelaunch = false
 
 	if e.config.DryRun {
 		// bd-ziavr: surface the substituted Stdin payload alongside the
@@ -1478,11 +1778,16 @@ func (e *Executor) executeCommand(ctx context.Context, step *Step, workflow *Wor
 	if step.Timeout.Duration > 0 {
 		timeout = step.Timeout.Duration
 	}
-	cmdCtx, cmdCancel := context.WithTimeout(ctx, timeout)
-	defer cmdCancel()
+	timeoutCause := fmt.Errorf("command step %q timed out after %s: %w", step.ID, timeout, context.DeadlineExceeded)
+	cmdCtx, cmdCancel := context.WithTimeoutCause(ctx, timeout, timeoutCause)
+	cancelCommandContext := true
+	defer func() {
+		if cancelCommandContext {
+			cmdCancel()
+		}
+	}()
 
 	cmd := exec.Command("/bin/sh", "-c", expandedCmd)
-	configureCommandProcessGroup(cmd)
 
 	if e.config.ProjectDir != "" {
 		cmd.Dir = e.config.ProjectDir
@@ -1515,15 +1820,13 @@ func (e *Executor) executeCommand(ctx context.Context, step *Step, workflow *Wor
 	if expandedStdin != "" {
 		cmd.Stdin = strings.NewReader(expandedStdin)
 	}
+	configureCommandProcessGroup(cmd)
 
 	waitCondition := step.Wait
 	if waitCondition == "" {
 		waitCondition = WaitCompletion
 	}
 
-	if e.stopBeforeDispatch(cmdCtx, &result) {
-		return result
-	}
 	record := CommandExecutionState{
 		Version: commandExecutionVersion, StepID: step.ID, StepHash: stepHash,
 		Status: commandExecutionStarting, Background: waitCondition == WaitNone,
@@ -1545,11 +1848,20 @@ func (e *Executor) executeCommand(ctx context.Context, step *Step, workflow *Wor
 	// owned process-group waiter can prove settlement. Persist that proof
 	// before executeStep clears scheduler bookkeeping or another worker saves.
 	commandSettled := true
+	commandCleanupReturned := false
 	defer func() {
-		if !commandSettled || !journalCommand {
+		if !journalCommand || (!commandSettled && !commandCleanupReturned) {
 			return
 		}
-		record.Status, record.SettledAt, record.Result = commandExecutionSettled, time.Now(), result
+		record.Result = result
+		if commandSettled {
+			record.Status, record.SettledAt = commandExecutionSettled, time.Now()
+		} else {
+			// Supervision ended, but termination was not proved. Persist the
+			// actual failure without leaving a misleading running receipt or
+			// granting the replay permission carried only by settled receipts.
+			record.Status, record.SettledAt = commandExecutionUnresolved, time.Time{}
+		}
 		// A failed save stops the workflow through its sticky checkpoint error,
 		// while retaining the actual command outcome in the returned state.
 		_ = e.saveCommandExecution(record)
@@ -1586,9 +1898,18 @@ func (e *Executor) executeCommand(ctx context.Context, step *Step, workflow *Wor
 			cmdCancel()
 			cleanup := waitCommandWithProcessGroupCleanup(cmdCtx, cmd)
 			commandSettled = cleanup.Settled
+			commandCleanupReturned = true
 			result.Output = e.capturedCommandOutput(step, stdoutBuf, stderrBuf)
 			result.Status, result.FinishedAt = StatusFailed, time.Now()
-			result.Error = stepRuntimeError(step, StepKindCommand, "checkpoint", err.Error(), "inspect the command group and restore durable storage before retrying", "")
+			cleanupErr := cleanup.Err
+			if !cleanup.Settled {
+				cleanupErr = errors.Join(cleanupErr, uncertainCommandExecutionError(step.ID, record.ProcessID))
+			}
+			var details string
+			if cleanupErr != nil {
+				details = cleanupErr.Error()
+			}
+			result.Error = stepRuntimeError(step, StepKindCommand, "checkpoint", err.Error(), "inspect the command group and restore durable storage before retrying", details)
 			return result
 		}
 	}
@@ -1598,31 +1919,99 @@ func (e *Executor) executeCommand(ctx context.Context, step *Step, workflow *Wor
 		stepID := step.ID
 		workflowName := workflow.Name
 		backgroundRecord := record
+		backgroundCtx, backgroundCancel := ctx, context.CancelFunc(func() {})
+		if step.Timeout.Duration > 0 {
+			// An explicit limit belongs to the command's whole lifetime,
+			// including its asynchronous group cleanup. Transfer the cancel
+			// function so the synchronous launch acknowledgement cannot stop
+			// the process. Unbounded sidecars retain the run lifetime instead
+			// of inheriting the configured foreground default.
+			backgroundCtx, backgroundCancel = cmdCtx, cmdCancel
+			cancelCommandContext = false
+		}
+		releaseScopes := retainCommandCancellationScopes(backgroundCtx)
 		e.backgroundCommandWG.Add(1)
 		go func() {
 			defer e.backgroundCommandWG.Done()
-			cleanup := waitCommandWithProcessGroupCleanup(ctx, cmd)
+			defer releaseScopes()
+			defer backgroundCancel()
+			cleanup := waitCommandWithProcessGroupCleanup(backgroundCtx, cmd)
+			// A later workflow cancellation must not erase the deadline that
+			// actually stopped this command. Natural completion is still a
+			// success if its deadline fires only after the waiter returned.
+			// An enclosing container deadline also owns the retained sidecar
+			// lifetime after that container's foreground work has completed.
+			deadlineCause := context.Cause(backgroundCtx)
+			timedOut := cleanup.Cancelled && errors.Is(deadlineCause, context.DeadlineExceeded)
+			cleanupErr := cleanup.Err
 			if !cleanup.Settled {
-				// Keep the launch receipt unresolved, but also carry the
+				// Keep the launch receipt unresolved and also carry the
 				// cleanup failure into the workflow's terminal outcome. A
 				// detached child can still act after this worker returns.
+				cleanupErr = errors.Join(cleanupErr, uncertainCommandExecutionError(stepID, backgroundRecord.ProcessID))
+			}
+			if timedOut {
+				cleanupErr = errors.Join(deadlineCause, cleanupErr)
+			}
+			// Expected workflow shutdown can stop a healthy sidecar. A natural
+			// failure, including one observed before shutdown began signalling,
+			// must still reach the terminal outcome without retrying background
+			// work or changing the already-published launch acknowledgement.
+			if !cleanup.Settled || timedOut || (!cleanup.Cancelled && cleanup.Err != nil) || cleanup.ExitBeforeSignalErr != nil {
+				backgroundErr := cleanupErr
+				if cleanup.Settled && !timedOut && cleanup.ExitBeforeSignalErr != nil {
+					// Routine workflow shutdown must not attach its cancellation
+					// sentinel to a proven earlier execution failure. The receipt
+					// below still preserves every cleanup diagnostic.
+					backgroundErr = cleanup.ExitBeforeSignalErr
+				}
 				e.stateMu.Lock()
 				if e.backgroundCommandErrors == nil {
 					e.backgroundCommandErrors = make(map[string]error)
 				}
-				e.backgroundCommandErrors[stepID] = errors.Join(cleanup.Err, uncertainCommandExecutionError(stepID, backgroundRecord.ProcessID))
+				e.backgroundCommandErrors[stepID] = backgroundErr
 				e.stateMu.Unlock()
 			}
-			if cleanup.Settled && journalCommand {
+			if journalCommand {
 				finished := time.Now()
 				backgroundRecord.Status, backgroundRecord.SettledAt = commandExecutionSettled, finished
 				backgroundRecord.Result = StepResult{StepID: stepID, AgentType: "command", Status: StatusCompleted, StartedAt: startedAt, FinishedAt: finished}
-				if cleanup.Cancelled || cleanup.Err != nil {
+				if !cleanup.Settled {
+					backgroundRecord.Status, backgroundRecord.SettledAt = commandExecutionUnresolved, time.Time{}
+				}
+				if cleanup.Cancelled || cleanupErr != nil {
 					backgroundRecord.Result.Status = StatusFailed
-					if cleanup.Cancelled {
-						backgroundRecord.Result.Status = StatusCancelled
+					errorType := "command"
+					reason := "background command cleanup failed"
+					hint := "inspect the command execution before resuming"
+					if !cleanup.Settled {
+						errorType = "execution_unknown"
 					}
-					backgroundRecord.Result.RerunOnResume = true
+					if cleanup.Cancelled && cleanup.ExitBeforeSignalErr == nil {
+						backgroundRecord.Result.Status = StatusCancelled
+						errorType = "cancelled"
+						if cleanupErr == nil {
+							cleanupErr = context.Canceled
+						}
+					}
+					if timedOut {
+						backgroundRecord.Result.Status = StatusFailed
+						errorType = "timeout"
+						reason = "background command exceeded an enclosing execution deadline"
+						hint = "inspect the enclosing workflow or container timeout"
+						if deadlineCause == timeoutCause {
+							reason = fmt.Sprintf("background command timed out after %s", timeout)
+							hint = "increase step.timeout or reduce command runtime"
+						}
+						if !cleanup.Settled {
+							hint = "inspect the command group before resuming; settlement is uncertain even though its timeout elapsed"
+						}
+					}
+					backgroundStep := &Step{ID: stepID}
+					backgroundRecord.Result.Output = e.capturedCommandOutput(backgroundStep, stdoutBuf, stderrBuf)
+					backgroundRecord.Result.Error = stepRuntimeError(backgroundStep, StepKindCommand, errorType,
+						reason, hint, cleanupErr.Error())
+					backgroundRecord.Result.RerunOnResume = cleanup.Settled
 				}
 				_ = e.saveCommandExecution(backgroundRecord) // Sticky checkpoint failure cancels the run.
 			}
@@ -1637,6 +2026,7 @@ func (e *Executor) executeCommand(ctx context.Context, step *Step, workflow *Wor
 				FieldDurationMS, time.Since(startedAt).Milliseconds(),
 				"bytes_captured", stdoutBuf.Len(),
 				FieldSignalSent, cleanup.SignalSent,
+				"timed_out", timedOut,
 			)
 			// bd-yrnue: the synchronous return below recorded StatusCompleted,
 			// but the background process has now been killed by cancellation
@@ -1688,6 +2078,7 @@ func (e *Executor) executeCommand(ctx context.Context, step *Step, workflow *Wor
 
 	cleanup := waitCommandWithProcessGroupCleanup(cmdCtx, cmd)
 	commandSettled = cleanup.Settled
+	commandCleanupReturned = true
 	close(heartbeatDone)
 	// bd-48ckr: wait for the heartbeat goroutine to fully exit before
 	// returning so test-injected mutations (commandHeartbeatInterval,
@@ -1724,7 +2115,7 @@ func (e *Executor) executeCommand(ctx context.Context, step *Step, workflow *Wor
 			result.Error = stepRuntimeError(step, "command", errorType,
 				reason,
 				"retry the run if cancellation was not intentional",
-				"")
+				waitErr.Error())
 			result.FinishedAt = time.Now()
 			return result
 		}
@@ -1733,7 +2124,7 @@ func (e *Executor) executeCommand(ctx context.Context, step *Step, workflow *Wor
 			result.Error = stepRuntimeError(step, "command", "timeout",
 				fmt.Sprintf("timed out after %s", timeout),
 				"increase step.timeout or reduce command runtime",
-				"")
+				waitErr.Error())
 			slog.Warn("command step timed out",
 				"run_id", e.state.RunID,
 				"step_id", step.ID,
@@ -1743,7 +2134,12 @@ func (e *Executor) executeCommand(ctx context.Context, step *Step, workflow *Wor
 			return result
 		}
 		var exitErr *exec.ExitError
-		if errors.As(waitErr, &exitErr) {
+		if !cleanup.Settled {
+			result.Status = StatusFailed
+			result.Error = stepRuntimeError(step, StepKindCommand, "execution_unknown",
+				"command cleanup could not verify settlement",
+				"inspect the command group and its effects before deliberately replaying it", waitErr.Error())
+		} else if errors.As(waitErr, &exitErr) {
 			result.Status = StatusFailed
 			result.Error = commandExitStepError(step, exitErr.ExitCode())
 			slog.Warn("command step exited non-zero",
@@ -2815,7 +3211,9 @@ func (e *Executor) executeParallel(ctx context.Context, step *Step, workflow *Wo
 	if step.Timeout.Duration > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, step.Timeout.Duration)
-		defer cancel()
+		var finish context.CancelFunc
+		ctx, finish = withCommandCancellationScope(ctx, cancel)
+		defer finish()
 	}
 
 	e.emitProgress("parallel_start", step.ID,
@@ -2828,7 +3226,9 @@ func (e *Executor) executeParallel(ctx context.Context, step *Step, workflow *Wo
 		result.Status = StatusFailed
 		result.FinishedAt = time.Now()
 		errorType := "parallel_dependency"
-		if errors.Is(scheduleErr, ErrCheckpointFailed) {
+		if isStepAdmissionError(scheduleErr) {
+			errorType = "step_limit"
+		} else if errors.Is(scheduleErr, ErrCheckpointFailed) {
 			errorType = "checkpoint"
 		} else if errors.Is(scheduleErr, context.DeadlineExceeded) {
 			errorType = "parallel_timeout"
@@ -2886,6 +3286,19 @@ func (e *Executor) executeParallel(ctx context.Context, step *Step, workflow *Wo
 	}
 	result.ParsedData = groupOutputs
 	e.storeParallelOutputVars(step, results, completionOrder)
+	for _, child := range results {
+		if cause := findStepAdmissionError(child.Error); cause != nil {
+			// A refused descendant is unfinished work. Continue may handle
+			// ordinary failures, but cannot checkpoint this container complete.
+			result.Status = StatusFailed
+			result.Error = aggregateParallelErrors(results, len(results))
+			if result.Error == nil {
+				return stepAdmissionExecutionFailure(result, &stepAdmissionPropagationError{message: cause.Message})
+			}
+			result.Error.Type = "step_limit"
+			return result
+		}
+	}
 
 	// Determine final status based on error mode and results.
 	//
@@ -2978,6 +3391,9 @@ func (e *Executor) executeLoop(ctx context.Context, step *Step, workflow *Workfl
 	// Store collected data as parsed data
 	if len(loopResult.Collected) > 0 {
 		result.ParsedData = loopResult.Collected
+	}
+	if cause := findStepAdmissionError(result.Error); cause != nil {
+		return stepAdmissionExecutionFailure(result, &stepAdmissionPropagationError{message: cause.Message})
 	}
 
 	return result
@@ -3948,6 +4364,11 @@ func (e *Executor) applyResumeState() error {
 		e.stateMu.Unlock()
 		return nil
 	}
+	pendingHooks, consumedHooks, hookOutputs, err := prepareSuccessHookResume(e.graph, e.state)
+	if err != nil {
+		e.stateMu.Unlock()
+		return err
+	}
 	merges, settledChildren, err := prepareCompletedParallelOutputs(e.graph, e.state)
 	if err != nil {
 		e.stateMu.Unlock()
@@ -3963,10 +4384,16 @@ func (e *Executor) applyResumeState() error {
 		}
 	}
 	for stepID, result := range e.state.Steps {
+		// Advisory failures already consumed by a success tail remain part
+		// of its evidence. They are not independent retry work or successful
+		// graph nodes; the hook journal restores any completed output bindings.
+		if consumedHooks[stepID] {
+			continue
+		}
 		// In-flight evidence must win before graph completion and output
 		// retention. Clearing the marker afterward is too late: it leaves
 		// a completed graph node and resurrects an untrusted output alias.
-		if resumeResultInFlight(e.state, stepID, result) || (shouldRerunStep(result) && !settledChildren[stepID]) {
+		if pendingHooks[stepID] || resumeResultInFlight(e.state, stepID, result) || (shouldRerunStep(result) && !settledChildren[stepID]) {
 			rerunStepIDs = append(rerunStepIDs, stepID)
 			continue
 		}
@@ -4003,7 +4430,12 @@ func (e *Executor) applyResumeState() error {
 			finishedAt: result.FinishedAt,
 		}
 		if stepForOutput != nil && !settledChildren[stepID] {
-			entry.outputVar = stepForOutput.OutputVar
+			// The hook body checkpoint owns a foreach collection's shape.
+			// Its summary string cannot replace that captured aggregate.
+			_, hookBody := e.state.SuccessHooks[stepID]
+			if !hookBody || !stepOwnsForeachOutputVar(stepForOutput) {
+				entry.outputVar = stepForOutput.OutputVar
+			}
 		}
 		retained = append(retained, entry)
 	}
@@ -4025,6 +4457,7 @@ func (e *Executor) applyResumeState() error {
 		e.clearStepVariables(stepID)
 	}
 	retained = append(retained, merges...)
+	retained = append(retained, hookOutputs...)
 	if len(retained) > 0 {
 		e.varMu.Lock()
 		restoreResumeOutputEvents(e.state, retained)
@@ -4103,6 +4536,7 @@ func (e *Executor) snapshotState() *ExecutionState {
 	}
 
 	snapshot := *e.state
+	snapshot.StepAdmissions = cloneStepAdmissions(e.state.StepAdmissions)
 	snapshot.Errors = append([]ExecutionError(nil), e.state.Errors...)
 
 	if e.state.Steps != nil {
@@ -4136,6 +4570,12 @@ func (e *Executor) snapshotState() *ExecutionState {
 			snapshot.ParallelState[key] = value
 		}
 	}
+	if e.state.SuccessHooks != nil {
+		snapshot.SuccessHooks = make(map[string]SuccessHookState, len(e.state.SuccessHooks))
+		for key, value := range e.state.SuccessHooks {
+			snapshot.SuccessHooks[key] = cloneSuccessHookState(value)
+		}
+	}
 	if e.state.InFlightSteps != nil {
 		snapshot.InFlightSteps = make(map[string]InFlightStepState, len(e.state.InFlightSteps))
 		for key, value := range e.state.InFlightSteps {
@@ -4149,6 +4589,12 @@ func (e *Executor) snapshotState() *ExecutionState {
 		snapshot.CommandExecutions = make(map[string]CommandExecutionState, len(e.state.CommandExecutions))
 		for key, record := range e.state.CommandExecutions {
 			snapshot.CommandExecutions[key] = cloneCommandExecution(record)
+		}
+	}
+	if e.state.CommandEvaluations != nil {
+		snapshot.CommandEvaluations = make(map[string]CommandEvaluationState, len(e.state.CommandEvaluations))
+		for key, record := range e.state.CommandEvaluations {
+			snapshot.CommandEvaluations[key] = cloneCommandEvaluation(record)
 		}
 	}
 	if e.state.MailSends != nil {

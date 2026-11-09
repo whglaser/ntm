@@ -320,19 +320,21 @@ const (
 	ErrCodeJobPending       = "JOB_PENDING"
 )
 
+// Every body admission and replay check must use the same limit. Hashing only
+// a prefix of an accepted request can acknowledge a different mutation with a
+// cached success, without ever executing the submitted operation.
+const maxRequestBodyBytes = 10 << 20 // 10 MiB
+
 // Idempotency cache bounds (bd-vq37v). The 24h TTL alone left the cache
 // unbounded: a remote-auth caller sending unique keys could grow the map (and
 // full buffered response bodies) for a day. Entries are capped with
-// least-recently-used eviction, and oversized responses are never cached.
+// least-recently-used eviction. Oversized terminal responses retain a small
+// inspection receipt instead of permitting the original operation to run again.
 const (
 	// idempotencyMaxEntries caps the number of cached responses.
 	idempotencyMaxEntries = 4096
 	// idempotencyMaxBodyBytes caps a single cached (and buffered) response body.
 	idempotencyMaxBodyBytes = 1 << 20 // 1 MiB
-	// idempotencyFingerprintLimit bounds how much of a request body is hashed
-	// for replay fingerprinting. Bodies larger than this are fingerprinted by
-	// prefix, which is still deterministic for mismatch detection.
-	idempotencyFingerprintLimit = 8 << 20 // 8 MiB
 )
 
 // IdempotencyStore caches responses by idempotency key.
@@ -463,14 +465,19 @@ func (s *IdempotencyStore) evictLRULocked() {
 	}
 }
 
-// BeginFlight registers the caller as the executor for key if no request with
-// that key is currently in flight. It returns (nil, true) for the leader; a
-// follower receives a channel that closes when the leader finishes, plus
-// false. This closes the Get-miss..Set window in which two concurrent POSTs
-// with the same Idempotency-Key both executed (bd-vq37v).
+// BeginFlight registers the caller as the executor only if key has neither a
+// completed result nor an active request. It returns true for the leader;
+// a follower receives a channel that closes when it must recheck the cache.
+// A completed result gets an already-closed channel: the previous leader may
+// have stored it after this caller's cache miss but before flight acquisition.
 func (s *IdempotencyStore) BeginFlight(key string) (<-chan struct{}, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if entry, ok := s.entries[key]; ok && time.Since(entry.createdAt) <= s.ttl {
+		ready := make(chan struct{})
+		close(ready)
+		return ready, false
+	}
 	if ch, ok := s.flights[key]; ok {
 		return ch, false
 	}
@@ -909,12 +916,23 @@ func (h *WSHub) nextSeq() int64 {
 func (h *WSHub) broadcastEvent(event *WSEvent) {
 	// Apply redaction first so the persisted copy matches the wire form and
 	// replay cannot leak content that live delivery would have redacted.
-	h.redactionMu.RLock()
-	cfg := h.redactionCfg
-	h.redactionMu.RUnlock()
-
-	if cfg != nil && cfg.Enabled && cfg.Config.Mode != redaction.ModeOff {
-		event.Data = redactWSEventData(event.Data, cfg.Config)
+	if err := h.redactEvent(event); err != nil {
+		// No cursor has been allocated and no data has been persisted. Signal
+		// the loss without copying untrusted payload, metadata or errors into
+		// the reset frame or logs.
+		log.Printf("ws redaction: event withheld; stream resynchronization required")
+		cursor := h.currentSeq()
+		if store := h.eventStore(); store != nil {
+			cursor = store.CurrentSeq()
+		}
+		h.clientsMu.RLock()
+		for client := range h.clients {
+			if client.isSubscribed(event.Topic) {
+				h.trySendReset(client, "", "redaction_failed", cursor, 0)
+			}
+		}
+		h.clientsMu.RUnlock()
+		return
 	}
 
 	// Assign the frame cursor. When an event store is attached the persisted
@@ -972,31 +990,60 @@ func (h *WSHub) broadcastEvent(event *WSEvent) {
 	}
 }
 
-// redactWSEventData recursively redacts sensitive content in event data.
-func redactWSEventData(data interface{}, cfg redaction.Config) interface{} {
-	if cfg.Mode == redaction.ModeOff {
-		return data
+// redactEvent protects each publication boundary, including historical replay
+// and attention frames that do not pass through broadcastEvent. Routing keys
+// must retain their identity; refuse a sensitive one instead of rewriting it.
+func (h *WSHub) redactEvent(event *WSEvent) error {
+	h.redactionMu.RLock()
+	cfg := h.redactionCfg
+	h.redactionMu.RUnlock()
+	if cfg == nil || !cfg.Enabled || cfg.Config.Mode == redaction.ModeOff || cfg.Config.Mode == redaction.ModeWarn {
+		return nil
 	}
 
-	switch v := data.(type) {
-	case string:
-		result := redaction.ScanAndRedact(v, cfg)
-		return result.Output
-	case map[string]interface{}:
-		redacted := make(map[string]interface{}, len(v))
-		for key, val := range v {
-			redacted[key] = redactWSEventData(val, cfg)
-		}
-		return redacted
-	case []interface{}:
-		redacted := make([]interface{}, len(v))
-		for i, val := range v {
-			redacted[i] = redactWSEventData(val, cfg)
-		}
-		return redacted
-	default:
-		return data
+	metadata, err := json.Marshal(struct {
+		Topic     string `json:"topic"`
+		EventType string `json:"event_type"`
+	}{Topic: event.Topic, EventType: event.EventType})
+	if err != nil {
+		return errors.New("cannot encode event metadata")
 	}
+	metadataCfg := cfg.Config
+	metadataCfg.Mode = redaction.ModeBlock
+	result := scanServerJSON(string(metadata), metadataCfg)
+	if result.LimitExceeded {
+		return errRedactionInspectionLimit
+	}
+	if result.Blocked {
+		return errors.New("event metadata contains sensitive content")
+	}
+	data, err := redactWSEventData(event.Data, cfg.Config)
+	if err != nil {
+		return err
+	}
+	event.Data = data
+	return nil
+}
+
+// redactWSEventData scans the complete JSON representation, preserving field
+// names as detection context and covering structs, typed maps/slices and raw
+// JSON alike. Freeze the encoded payload once: custom marshalers must not
+// produce different data for persistence and live delivery. Raw JSON also
+// preserves exact numbers without a float64 round trip.
+func redactWSEventData(data interface{}, cfg redaction.Config) (interface{}, error) {
+	if cfg.Mode == redaction.ModeOff || cfg.Mode == redaction.ModeWarn {
+		return data, nil
+	}
+	encoded, err := json.Marshal(data)
+	if err != nil {
+		// MarshalJSON errors may themselves contain credentials.
+		return nil, errors.New("cannot encode event data for redaction")
+	}
+	output, _, err := redactJSONBytes(encoded, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return json.RawMessage(output), nil
 }
 
 // Publish publishes an event to a topic.
@@ -1014,7 +1061,8 @@ func (h *WSHub) Publish(topic, eventType string, data interface{}) {
 	case h.broadcast <- event:
 	default:
 		dropped := h.dropped.Add(1)
-		log.Printf("ws broadcast buffer full, dropping event topic=%s surface=websocket session= pane= queue_depth=%d dropped_count=%d latency_ms=0 decision=coalesce reason_codes=queue_depth,dropped_output", topic, len(h.broadcast), dropped)
+		// The queue overflow occurs before redactEvent can inspect metadata.
+		log.Printf("ws broadcast buffer full, dropping event surface=websocket session= pane= queue_depth=%d dropped_count=%d latency_ms=0 decision=coalesce reason_codes=queue_depth,dropped_output", len(h.broadcast), dropped)
 	}
 }
 
@@ -1086,7 +1134,7 @@ func (c *WSClient) Subscribe(topics []string) {
 	for _, topic := range topics {
 		c.topics[topic] = struct{}{}
 	}
-	log.Printf("ws client subscribed id=%s topics=%v", c.id, topics)
+	log.Printf("ws client subscribed id=%s topic_count=%d", c.id, len(topics))
 }
 
 // Unsubscribe removes topics from the client's subscription.
@@ -1096,7 +1144,7 @@ func (c *WSClient) Unsubscribe(topics []string) {
 	for _, topic := range topics {
 		delete(c.topics, topic)
 	}
-	log.Printf("ws client unsubscribed id=%s topics=%v", c.id, topics)
+	log.Printf("ws client unsubscribed id=%s topic_count=%d", c.id, len(topics))
 }
 
 // Topics returns the client's subscribed topics.
@@ -1351,14 +1399,14 @@ func (s *Server) buildRouter() chi.Router {
 	// Jobs select their effective destination from the eventual JSON body.
 	// Pin configuration and cwd before redaction can wait on that body.
 	r.Use(s.jobProjectSelectionMiddleware)
-	// Redact sensitive content in requests/responses. Inert unless Config.Redaction
-	// was supplied (see that field): the middleware is always mounted, but it
-	// passes through untouched when no redaction config reached New.
+	// Reject sensitive JSON input before any handler or replay can act on it;
+	// redact response content. Inert unless Config.Redaction was supplied (see
+	// that field): no redaction config means untouched request/response bytes.
 	r.Use(s.redactionMiddleware)
 	// Freeze mail and reservation requests' projects before replay lookup.
 	// Validation errors follow each route's permission check.
 	r.Use(s.mailProjectScopeMiddleware)
-	// Classify the canonical post-redaction job request before cache lookup.
+	// Classify the unchanged, admitted job request before cache lookup.
 	// Admission later uses the same captured selection and project resolver.
 	r.Use(s.jobHTTPReplayScopeMiddleware)
 	// Idempotency-Key replay for EVERY mutating route — the single mount point
@@ -1745,7 +1793,7 @@ func (s *Server) buildMTLSConfig() (*tls.Config, error) {
 func (s *Server) maxBytesMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Limit to 10MB default
-		r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 		next.ServeHTTP(w, r)
 	})
 }
@@ -1753,12 +1801,24 @@ func (s *Server) maxBytesMiddleware(next http.Handler) http.Handler {
 // requestIDMiddlewareFunc is the chi middleware version of requestIDMiddleware.
 func (s *Server) requestIDMiddlewareFunc(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		reqID := sanitizeRequestID(r.Header.Get(requestIDHeader))
+		cfg := s.redactionConfigSnapshot()
+		originalID := r.Header.Get(requestIDHeader)
+		reqID := ""
+		// Screen the complete supplied value before sanitizing/truncating it:
+		// a truncated token can still disclose credential material in headers,
+		// early refusal bodies, and every downstream log or audit record.
+		if !scanRequestMetadata(originalID, cfg).Blocked {
+			reqID = sanitizeRequestID(originalID)
+			if scanRequestMetadata(reqID, cfg).Blocked {
+				reqID = ""
+			}
+		}
 		if reqID == "" {
 			reqID = generateRequestID()
 		}
 		w.Header().Set(requestIDHeader, reqID)
-		ctx := context.WithValue(r.Context(), requestIDKey, reqID)
+		ctx := context.WithValue(r.Context(), requestRedactionConfigKey{}, cfg)
+		ctx = context.WithValue(ctx, requestIDKey, reqID)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
@@ -1769,8 +1829,10 @@ func (s *Server) recovererMiddleware(next http.Handler) http.Handler {
 		defer func() {
 			if rec := recover(); rec != nil {
 				reqID := requestIDFromContext(r.Context())
+				cfg := s.requestRedactionConfig(r)
 				stack := string(debug.Stack())
-				log.Printf("PANIC recovered: %v request_id=%s\n%s", rec, reqID, stack)
+				log.Printf("PANIC recovered: %s request_id=%s\n%s",
+					redactRequestDiagnostic(fmt.Sprint(rec), cfg), reqID, redactRequestDiagnostic(stack, cfg))
 				writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, "internal server error", nil, reqID)
 			}
 		}()
@@ -1782,10 +1844,12 @@ func (s *Server) recovererMiddleware(next http.Handler) http.Handler {
 func (s *Server) loggingMiddlewareFunc(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
+		cfg := s.requestRedactionConfig(r)
 		ww := chimw.NewWrapResponseWriter(w, r.ProtoMajor)
 		next.ServeHTTP(ww, r)
 		reqID := requestIDFromContext(r.Context())
-		log.Printf("%s %s %d %s request_id=%s", r.Method, r.URL.Path, ww.Status(), time.Since(start), reqID)
+		log.Printf("%s %s %d %s request_id=%s", redactRequestDiagnostic(r.Method, cfg),
+			redactRequestDiagnostic(r.URL.Path, cfg), ww.Status(), time.Since(start), reqID)
 	})
 }
 
@@ -1794,6 +1858,16 @@ func (s *Server) corsMiddlewareFunc(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
 		if origin != "" {
+			inspection := scanRequestMetadata(origin, s.requestRedactionConfig(r))
+			if inspection.Blocked {
+				message := "origin contains sensitive content"
+				if inspection.LimitExceeded {
+					message = "origin could not be completely inspected within redaction limits"
+				}
+				writeErrorResponse(w, http.StatusForbidden, ErrCodeForbidden,
+					message, nil, requestIDFromContext(r.Context()))
+				return
+			}
 			s.mu.RLock()
 			allowed := originAllowed(origin, s.corsAllowedOrigins)
 			s.mu.RUnlock()
@@ -1828,7 +1902,10 @@ func (s *Server) authMiddlewareFunc(next http.Handler) http.Handler {
 		claims, err := s.authenticateRequest(r)
 		if err != nil {
 			reqID := requestIDFromContext(r.Context())
-			log.Printf("auth failed mode=%s path=%s remote=%s request_id=%s err=%v", s.auth.Mode, r.URL.Path, r.RemoteAddr, reqID, err)
+			cfg := s.requestRedactionConfig(r)
+			log.Printf("auth failed mode=%s path=%s remote=%s request_id=%s err=%s", s.auth.Mode,
+				redactRequestDiagnostic(r.URL.Path, cfg), redactRequestDiagnostic(r.RemoteAddr, cfg),
+				reqID, redactRequestDiagnostic(err.Error(), cfg))
 			writeErrorResponse(w, http.StatusUnauthorized, ErrCodeUnauthorized, "unauthorized", nil, reqID)
 			return
 		}
@@ -1849,6 +1926,22 @@ func (s *Server) authMiddlewareFunc(next http.Handler) http.Handler {
 type idempotencyHandledKeyType struct{}
 
 var idempotencyHandledKey idempotencyHandledKeyType
+
+type idempotencyResultKey struct{}
+
+type idempotencyResultState struct {
+	retain atomic.Bool
+}
+
+// markIdempotencyResultRetained keeps a terminal outcome even when it is not a
+// successful HTTP response. A handler that has published work, or cannot prove
+// publication did not occur, must not let a same-key retry execute it again.
+// Only server code can mark this request; no client header selects this policy.
+func markIdempotencyResultRetained(r *http.Request) {
+	if result, ok := r.Context().Value(idempotencyResultKey{}).(*idempotencyResultState); ok {
+		result.retain.Store(true)
+	}
+}
 
 // idempotencyMiddleware handles Idempotency-Key header for mutating requests.
 func (s *Server) idempotencyMiddleware(next http.Handler) http.Handler {
@@ -1875,7 +1968,25 @@ func (s *Server) idempotencyMiddleware(next http.Handler) http.Handler {
 		// Fingerprint the request body so a replay with the same key but a
 		// DIFFERENT payload is rejected instead of silently echoing the first
 		// response (bd-vq37v).
-		fingerprint := idempotencyRequestFingerprint(r)
+		fingerprint, err := idempotencyRequestFingerprint(r)
+		if err != nil {
+			reqID := requestIDFromContext(r.Context())
+			var tooLarge *http.MaxBytesError
+			switch {
+			case errors.As(err, &tooLarge):
+				writeErrorResponse(w, http.StatusRequestEntityTooLarge, "REQUEST_TOO_LARGE",
+					"request body exceeds the 10 MiB limit", nil, reqID)
+			case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+				writeErrorResponse(w, http.StatusRequestTimeout, ErrCodeTimeout,
+					"request canceled before its body could be verified", nil, reqID)
+			default:
+				// Reader errors can contain source credentials. Neither a cached
+				// response nor a handler may hide an incomplete read.
+				writeErrorResponse(w, http.StatusBadRequest, ErrCodeBadRequest,
+					"failed to read complete request body", nil, reqID)
+			}
+			return
+		}
 
 		// Single-flight per scoped key: concurrent duplicates wait for the
 		// first request instead of double-executing (bd-vq37v). The loop
@@ -1883,12 +1994,13 @@ func (s *Server) idempotencyMiddleware(next http.Handler) http.Handler {
 		// (nothing cached), the woken follower becomes the new leader.
 		for {
 			if cached, status, replayHeader, storedFP, ok := s.idempotencyStore.GetWithFingerprint(key); ok {
-				if storedFP != "" && fingerprint != "" && storedFP != fingerprint {
+				if storedFP != "" && storedFP != fingerprint {
 					reqID := requestIDFromContext(r.Context())
 					writeErrorResponse(w, http.StatusUnprocessableEntity, ErrCodeIdempotentReplay,
 						"Idempotency-Key reused with a different request body", nil, reqID)
 					return
 				}
+				protectReplayMetadata(replayHeader, s.requestRedactionConfig(r))
 				applyReplayHeaders(w.Header(), replayHeader)
 				w.Header().Set("X-Idempotent-Replay", "true")
 				w.WriteHeader(status)
@@ -1912,39 +2024,79 @@ func (s *Server) idempotencyMiddleware(next http.Handler) http.Handler {
 		defer s.idempotencyStore.EndFlight(key)
 
 		// Capture response
+		result := &idempotencyResultState{}
+		r = r.WithContext(context.WithValue(r.Context(), idempotencyResultKey{}, result))
 		rec := &responseRecorder{ResponseWriter: w, statusCode: http.StatusOK}
 		next.ServeHTTP(rec, r)
 
-		// Cache successful, non-hijacked, bounded responses
-		if rec.statusCode >= 200 && rec.statusCode < 300 && !rec.hijacked && !rec.overflow {
-			s.idempotencyStore.SetWithFingerprint(key, fingerprint, rec.body, rec.statusCode, rec.Header())
+		// A failure after publication is a terminal result too: replay the
+		// receipt instead of repeating work that may already have completed.
+		// Ordinary failures remain retryable. When the original representation
+		// exceeds the cache bound, retain a small receipt instead: discarding
+		// the result would let a retry repeat an already completed mutation.
+		if (rec.statusCode >= 200 && rec.statusCode < 300 || result.retain.Load()) && !rec.hijacked {
+			body, status, header := rec.body, rec.statusCode, rec.Header()
+			if rec.overflow {
+				receipt := APIError{
+					APIResponse: APIResponse{
+						Success: false, Timestamp: time.Now().UTC().Format(time.RFC3339),
+						RequestID: requestIDFromContext(r.Context()),
+					},
+					Error:     "The original request was handled, but its response is too large to replay",
+					ErrorCode: "IDEMPOTENCY_RESULT_UNAVAILABLE",
+					Details: map[string]interface{}{
+						"original_status":      rec.statusCode,
+						"response_unavailable": true,
+						"inspection_required":  true,
+						"retry_safe":           false,
+					},
+					Hint: "The handler has already run. Inspect the affected state before sending a new request; this retry did not repeat the operation.",
+				}
+				// Only fixed strings, booleans, and an HTTP status are encoded.
+				body, _ = json.Marshal(receipt)
+				body = append(body, '\n')
+				status = http.StatusConflict
+				header = cloneReplayHeaders(header)
+				if header == nil {
+					header = make(http.Header)
+				}
+				header.Set("Content-Type", "application/json")
+			}
+			s.idempotencyStore.SetWithFingerprint(key, fingerprint, body, status, header)
 		}
 	})
 }
 
-// idempotencyRequestFingerprint hashes the request body (bounded by
-// idempotencyFingerprintLimit) and restores r.Body for downstream handlers.
-// Returns a non-empty hash even for empty bodies so mismatch detection always
-// has something to compare.
-func idempotencyRequestFingerprint(r *http.Request) string {
+// idempotencyRequestFingerprint verifies and hashes the complete admitted body,
+// then restores its exact bytes for the handler. A read failure must never turn
+// into an empty fingerprint that authorizes an unrelated cached success.
+func idempotencyRequestFingerprint(r *http.Request) (string, error) {
+	if err := r.Context().Err(); err != nil {
+		return "", err
+	}
 	if scope, ok := r.Context().Value(jobHTTPReplayScopeKey{}).(jobHTTPReplayScope); ok {
-		// Job bodies were read completely within the HTTP limit. A changed
-		// command after the generic 8 MiB prefix must still conflict.
-		return scope.fingerprint
+		// Jobs already verified the full body before binding its project. Keep
+		// that captured identity and canonical decoder's error semantics.
+		return scope.fingerprint, scope.requestErr
 	}
-	h := sha256.New()
+	var data []byte
 	if r.Body != nil && r.Body != http.NoBody {
-		data, err := io.ReadAll(io.LimitReader(r.Body, idempotencyFingerprintLimit))
-		if err != nil {
-			// Body unreadable; hand the bytes read so far plus the original
-			// reader back to the handler, which will surface the read error.
-			r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(data), r.Body))
-			return ""
+		var err error
+		data, err = io.ReadAll(io.LimitReader(r.Body, maxRequestBodyBytes+1))
+		_ = r.Body.Close()
+		if len(data) > maxRequestBodyBytes {
+			return "", &http.MaxBytesError{Limit: maxRequestBodyBytes}
 		}
-		h.Write(data)
-		r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(data), r.Body))
+		if err != nil {
+			return "", err
+		}
+		r.Body = io.NopCloser(bytes.NewReader(data))
 	}
-	return hex.EncodeToString(h.Sum(nil))
+	if err := r.Context().Err(); err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(data)
+	return hex.EncodeToString(digest[:]), nil
 }
 
 // responseRecorder captures the response for idempotency caching.
@@ -1952,8 +2104,8 @@ type responseRecorder struct {
 	http.ResponseWriter
 	statusCode int
 	body       []byte
-	// overflow is set when the response exceeds idempotencyMaxBodyBytes; the
-	// buffer stops growing and the response is not cached (bd-vq37v).
+	// overflow is set when the response exceeds idempotencyMaxBodyBytes. The
+	// full body is discarded; terminal results retain a small inspection receipt.
 	overflow bool
 	// hijacked is set when the handler took over the connection; nothing
 	// meaningful can be cached afterwards.
@@ -2520,6 +2672,74 @@ func (s *Server) handleRobotHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+const sseMaxFrameBytes = 10 << 20
+
+// writeSSEEvent protects a complete frame before writing any of its bytes.
+// Streaming middleware cannot safely scan arbitrary Write/Flush fragments, and
+// mutating the shared feed would corrupt replay for other subscribers. Snapshot
+// configuration for each frame so a long-lived stream observes policy changes.
+func (s *Server) writeSSEEvent(w io.Writer, eventType string, payload any) (err error) {
+	defer func() {
+		if err != nil {
+			// All errors below are static: marshaler and transport errors can
+			// contain source data and must not be copied into server logs.
+			log.Printf("SSE: terminating stream: %v", err)
+		}
+	}()
+
+	if len(eventType) > sseMaxFrameBytes || strings.ContainsAny(eventType, "\r\n\x00") {
+		return errors.New("invalid SSE event type")
+	}
+	s.mu.RLock()
+	rcfg := s.redactionCfg
+	s.mu.RUnlock()
+	cfg := redaction.Config{Mode: redaction.ModeOff}
+	if rcfg != nil && rcfg.Enabled {
+		cfg = rcfg.Config
+	}
+
+	// The event type is routing metadata. Replacing it would silently route
+	// the event elsewhere; refuse a sensitive type in either enforcing mode.
+	metadataCfg := cfg
+	if metadataCfg.Mode == redaction.ModeRedact {
+		metadataCfg.Mode = redaction.ModeBlock
+	}
+	metadata := scanServerText(eventType, metadataCfg)
+	if metadata.LimitExceeded {
+		return errRedactionInspectionLimit
+	}
+	if metadata.Blocked {
+		return errors.New("sensitive SSE routing metadata")
+	}
+
+	data, marshalErr := json.Marshal(payload)
+	if marshalErr != nil {
+		return errors.New("failed to encode SSE event")
+	}
+	frameOverhead := len("event: \ndata: \n\n") + len(eventType)
+	if len(data) > sseMaxFrameBytes-frameOverhead {
+		return errors.New("SSE event exceeds the frame size limit")
+	}
+	data, result, redactErr := redactJSONBytes(data, cfg)
+	if redactErr != nil {
+		return redactErr
+	}
+	if len(data) > sseMaxFrameBytes-frameOverhead || bytes.ContainsAny(data, "\r\n") {
+		return errors.New("unsafe SSE event frame")
+	}
+	if len(metadata.Findings) > 0 || len(result.Findings) > 0 {
+		log.Printf("SSE redaction: metadata_findings=%d payload_findings=%d",
+			len(metadata.Findings), len(result.Findings))
+	}
+	// A frame is one write, with the JSON payload and routing label already
+	// protected. Preserve caller-controlled replay batching and flush timing.
+	n, writeErr := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventType, data)
+	if writeErr != nil || n != frameOverhead+len(data) {
+		return errors.New("failed to write SSE event")
+	}
+	return nil
+}
+
 // handleEventStream handles SSE event streaming at /events.
 func (s *Server) handleEventStream(w http.ResponseWriter, r *http.Request) {
 	// Set SSE headers
@@ -2541,8 +2761,10 @@ func (s *Server) handleEventStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Send initial connection event
-	if _, err := fmt.Fprintf(w, "event: connected\ndata: {\"status\":\"connected\",\"time\":\"%s\"}\n\n",
-		time.Now().UTC().Format(time.RFC3339)); err != nil {
+	if err := s.writeSSEEvent(w, "connected", map[string]string{
+		"status": "connected",
+		"time":   time.Now().UTC().Format(time.RFC3339),
+	}); err != nil {
 		return
 	}
 	flusher.Flush()
@@ -2554,16 +2776,12 @@ func (s *Server) handleEventStream(w http.ResponseWriter, r *http.Request) {
 		case <-ctx.Done():
 			return
 		case event := <-clientCh:
-			data, err := json.Marshal(map[string]interface{}{
+			if err := s.writeSSEEvent(w, event.EventType(), map[string]interface{}{
 				"type":      event.EventType(),
 				"timestamp": event.EventTimestamp().Format(time.RFC3339),
 				"session":   event.EventSession(),
-			})
-			if err != nil {
-				continue
-			}
-			if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event.EventType(), data); err != nil {
-				return // Client disconnected
+			}); err != nil {
+				return
 			}
 			flusher.Flush()
 		}
@@ -4154,9 +4372,9 @@ func (s *Server) handlePaneInputV1(w http.ResponseWriter, r *http.Request) {
 	if !refresh() {
 		return
 	}
-	// The REST redaction middleware already processed this text. Keep its bytes
-	// intact, including whitespace and stage-only input, while sharing the live
-	// quarantine, trust/composer, agent transport, and submission checks.
+	// The REST redaction middleware already admitted this text without rewriting
+	// it. Keep its bytes intact, including whitespace and stage-only input, while
+	// sharing the live quarantine, trust/composer, transport, and submission checks.
 	service, err := dispatch.NewService(dispatch.Ports{
 		Redactor: dispatch.AllowAllRedactor{}, Deliverer: dispatch.TMUXDeliverer{},
 	})
@@ -5747,6 +5965,7 @@ func (c *WSClient) handleSubscribe(msg WSMessage) {
 	// complete request (or partially subscribe its regular topics) as though it
 	// had succeeded.
 	var attentionResult map[string]interface{}
+	var attentionSub *WSAttentionSub
 	if len(attentionTopics) > 0 {
 		attentionResult = c.handleAttentionSubscribe(msg, attentionTopics)
 		if errorCode, failed := attentionResult["error_code"].(string); failed {
@@ -5757,11 +5976,28 @@ func (c *WSClient) handleSubscribe(msg WSMessage) {
 			c.sendError(msg.RequestID, errorCode, message)
 			return
 		}
+		c.attentionSubMu.Lock()
+		attentionSub = c.attentionSub
+		c.attentionSubMu.Unlock()
 	}
 
 	response := map[string]interface{}{"subscribed": topics}
 	if attentionResult != nil {
 		response["attention"] = attentionResult
+	}
+	sendSubscriptionAck := func() bool {
+		if len(attentionTopics) == 0 {
+			return c.sendAck(msg.RequestID, response)
+		}
+		// A live callback can fail while replay or the regular-topic
+		// subscription is being prepared. Commit the acknowledgment under the
+		// same lock as delivery so no failed subscription is acknowledged.
+		c.attentionSubMu.Lock()
+		defer c.attentionSubMu.Unlock()
+		if attentionSub == nil || c.attentionSub != attentionSub || !attentionSub.Active {
+			return c.sendError(msg.RequestID, "REDACTION_FAILED", "attention subscription is no longer active; resynchronize the subscription")
+		}
+		return c.sendAck(msg.RequestID, response)
 	}
 
 	// Regular topics are only committed after any durable attention request has
@@ -5778,7 +6014,7 @@ func (c *WSClient) handleSubscribe(msg WSMessage) {
 					"reset":    res.reset,
 					"cursor":   res.cursor,
 				}
-				return c.sendAck(msg.RequestID, response)
+				return sendSubscriptionAck()
 			})
 			return
 		} else {
@@ -5787,7 +6023,7 @@ func (c *WSClient) handleSubscribe(msg WSMessage) {
 	}
 
 	response["total"] = len(c.Topics())
-	c.sendAck(msg.RequestID, response)
+	sendSubscriptionAck()
 }
 
 // handleUnsubscribe processes an unsubscribe request.
@@ -6029,7 +6265,28 @@ func (c *WSClient) handleAttentionSubscribeWithFeed(feed attentionStreamFeed, ms
 			}
 		} else {
 			// Deliver replayed events
-			replayCount = c.deliverAttentionReplay(events, topics, sub)
+			var replayErr error
+			replayCount, replayErr = c.deliverAttentionReplay(events, topics, sub)
+			if replayErr != nil {
+				c.cancelAttentionSubscription()
+				return map[string]interface{}{
+					"error":      "attention replay could not be disclosed safely; resynchronize the subscription",
+					"error_code": "REDACTION_FAILED",
+				}
+			}
+		}
+	}
+
+	// Live delivery may have failed while replay was in progress, including
+	// an empty replay. Never report that inactive subscription as accepted.
+	c.attentionSubMu.Lock()
+	active := c.attentionSub == sub && sub.Active
+	c.attentionSubMu.Unlock()
+	if !active {
+		c.cancelAttentionSubscription()
+		return map[string]interface{}{
+			"error":      "attention subscription is no longer active; resynchronize the subscription",
+			"error_code": "REDACTION_FAILED",
 		}
 	}
 
@@ -6158,41 +6415,54 @@ func (c *WSClient) deliverAttentionEvent(event robot.AttentionEvent, expected *W
 		Data:      event,
 	}
 
+	if c.hub != nil {
+		if err := c.hub.redactEvent(wsEvent); err != nil {
+			// Do not let a later cursor conceal the withheld event. The next
+			// subscribe replaces this inactive subscription and releases its
+			// feed callback; an in-flight callback for a replaced subscription
+			// must not stop the new one.
+			c.attentionSubMu.Lock()
+			current := c.attentionSub == expected && expected.Active
+			if current {
+				expected.Active = false
+				c.sendError("", "REDACTION_FAILED", "attention event could not be disclosed safely; resynchronize the subscription")
+			}
+			c.attentionSubMu.Unlock()
+			return
+		}
+	}
 	data, err := json.Marshal(wsEvent)
 	if err != nil {
 		return
 	}
 
-	// Send with backpressure tracking
-	sent := c.trySend(data, func() {
-		c.attentionSubMu.Lock()
-		if c.attentionSub != nil {
-			c.attentionSub.DroppedCount++
-		}
+	// Redaction can take time, so a replay failure or replacement may have
+	// invalidated the snapshot. Sending and committing the cursor must be one
+	// operation with respect to those changes.
+	c.attentionSubMu.Lock()
+	if c.attentionSub != expected || !expected.Active || event.Cursor <= expected.Cursor {
 		c.attentionSubMu.Unlock()
-		log.Printf("ws attention: dropped event cursor=%d client=%s", event.Cursor, c.id)
-	})
-
+		return
+	}
+	sent := c.trySend(data, nil)
 	if sent {
-		c.attentionSubMu.Lock()
-		if c.attentionSub != nil {
-			// Monotonic, like the replay path: a live event and a replayed one
-			// can commit in either order, and the cursor is what "resume from
-			// here" means to the client. Never move it backwards.
-			if event.Cursor > c.attentionSub.Cursor {
-				c.attentionSub.Cursor = event.Cursor
-			}
-			c.attentionSub.EventCount++
-		}
-		c.attentionSubMu.Unlock()
+		expected.Cursor = event.Cursor
+		expected.EventCount++
+	} else {
+		expected.DroppedCount++
+	}
+	c.attentionSubMu.Unlock()
+	if !sent {
+		log.Printf("ws attention: dropped event cursor=%d client=%s", event.Cursor, c.id)
 	}
 }
 
 // deliverAttentionReplay delivers replayed attention events to the client.
-// Returns the count of events delivered.
-func (c *WSClient) deliverAttentionReplay(events []robot.AttentionEvent, topics []string, sub *WSAttentionSub) int {
+// Returns the count of events delivered and refuses an unsafe replay so the
+// caller cannot acknowledge a partial subscription as successful.
+func (c *WSClient) deliverAttentionReplay(events []robot.AttentionEvent, topics []string, sub *WSAttentionSub) (int, error) {
 	if sub == nil {
-		return 0
+		return 0, nil
 	}
 
 	delivered := 0
@@ -6238,22 +6508,36 @@ func (c *WSClient) deliverAttentionReplay(events []robot.AttentionEvent, topics 
 			Data:      event,
 		}
 
+		if c.hub != nil {
+			if err := c.hub.redactEvent(wsEvent); err != nil {
+				c.attentionSubMu.Lock()
+				if c.attentionSub == sub {
+					sub.Active = false
+				}
+				c.attentionSubMu.Unlock()
+				return delivered, err
+			}
+		}
 		data, err := json.Marshal(wsEvent)
 		if err != nil {
 			continue
 		}
 
+		c.attentionSubMu.Lock()
+		if c.attentionSub != sub || !sub.Active {
+			c.attentionSubMu.Unlock()
+			return delivered, errors.New("attention subscription changed during replay")
+		}
 		if c.trySend(data, nil) {
 			delivered++
-			c.attentionSubMu.Lock()
-			if c.attentionSub != nil && event.Cursor > c.attentionSub.Cursor {
-				c.attentionSub.Cursor = event.Cursor
+			if event.Cursor > sub.Cursor {
+				sub.Cursor = event.Cursor
 			}
-			c.attentionSubMu.Unlock()
 		}
+		c.attentionSubMu.Unlock()
 	}
 
-	return delivered
+	return delivered, nil
 }
 
 // extractStringSlice extracts a string slice from an interface{}.
@@ -6294,7 +6578,7 @@ func (c *WSClient) trySend(data []byte, onDrop func()) (ok bool) {
 }
 
 // sendError sends a WebSocket error frame.
-func (c *WSClient) sendError(requestID, code, message string) {
+func (c *WSClient) sendError(requestID, code, message string) bool {
 	errMsg := WSError{
 		Type:      WSMsgError,
 		Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
@@ -6304,9 +6588,9 @@ func (c *WSClient) sendError(requestID, code, message string) {
 	}
 	data, err := json.Marshal(errMsg)
 	if err != nil {
-		return
+		return false
 	}
-	c.trySend(data, func() {
+	return c.trySend(data, func() {
 		log.Printf("ws client buffer full, dropping error id=%s", c.id)
 	})
 }
@@ -6445,7 +6729,7 @@ func filterAttentionReplayBoundary(events []robot.AttentionEvent, maxCursor int6
 	return filtered
 }
 
-func writeAttentionReplay(
+func (s *Server) writeAttentionReplay(
 	w io.Writer,
 	flusher http.Flusher,
 	events []robot.AttentionEvent,
@@ -6456,23 +6740,16 @@ func writeAttentionReplay(
 ) (int64, int, error) {
 	delivered := 0
 	for _, event := range events {
-		if event.Cursor > replayCursor {
-			replayCursor = event.Cursor
-		}
-		if event.Type == robot.EventType(robot.DefaultTransportLiveness.HeartbeatType) {
+		if event.Type == robot.EventType(robot.DefaultTransportLiveness.HeartbeatType) ||
+			!matchesAttentionFilters(event, categoryFilter, sessionFilter, actionabilityFilter) {
 			// Match the live stream path: transport heartbeat events are not emitted as attention items.
+			replayCursor = max(replayCursor, event.Cursor)
 			continue
 		}
-		if !matchesAttentionFilters(event, categoryFilter, sessionFilter, actionabilityFilter) {
-			continue
-		}
-		data, err := json.Marshal(event)
-		if err != nil {
-			continue
-		}
-		if _, err := fmt.Fprintf(w, "event: attention\ndata: %s\n\n", data); err != nil {
+		if err := s.writeSSEEvent(w, "attention", event); err != nil {
 			return replayCursor, delivered, err
 		}
+		replayCursor = max(replayCursor, event.Cursor)
 		delivered++
 	}
 	if flusher != nil {
@@ -6537,12 +6814,7 @@ func (s *Server) handleAttentionStreamV1(w http.ResponseWriter, r *http.Request)
 		}
 
 		cursorExpiredEvent := attentionCursorExpiredPayload(cursorErr, feed.Stats().NewestCursor)
-		data, marshalErr := json.Marshal(cursorExpiredEvent)
-		if marshalErr != nil {
-			log.Printf("SSE: failed to marshal cursor expired event: %v", marshalErr)
-			return
-		}
-		if _, err := fmt.Fprintf(w, "event: error\ndata: %s\n\n", data); err != nil {
+		if err := s.writeSSEEvent(w, "error", cursorExpiredEvent); err != nil {
 			return
 		}
 		flusher.Flush()
@@ -6570,12 +6842,7 @@ func (s *Server) handleAttentionStreamV1(w http.ResponseWriter, r *http.Request)
 		"oldest_cursor": attentionReplayEarliestCursor(prepared.stats),
 		"newest_cursor": prepared.stats.NewestCursor,
 	}
-	connData, marshalErr := json.Marshal(connEvent)
-	if marshalErr != nil {
-		log.Printf("SSE: failed to marshal connection event: %v", marshalErr)
-		return
-	}
-	if _, err := fmt.Fprintf(w, "event: connected\ndata: %s\n\n", connData); err != nil {
+	if err := s.writeSSEEvent(w, "connected", connEvent); err != nil {
 		return
 	}
 	flusher.Flush()
@@ -6586,7 +6853,7 @@ func (s *Server) handleAttentionStreamV1(w http.ResponseWriter, r *http.Request)
 
 	// Replay events from cursor if requested
 	replayCursor := prepared.replayBoundary
-	replayCursor, eventsSinceStart, err := writeAttentionReplay(
+	replayCursor, eventsSinceStart, err := s.writeAttentionReplay(
 		w,
 		flusher,
 		prepared.replayEvents,
@@ -6648,11 +6915,7 @@ func (s *Server) handleAttentionStreamV1(w http.ResponseWriter, r *http.Request)
 				filteredSinceHeartbeat++
 				continue
 			}
-			data, err := json.Marshal(event)
-			if err != nil {
-				continue
-			}
-			if _, err := fmt.Fprintf(w, "event: attention\ndata: %s\n\n", data); err != nil {
+			if err := s.writeSSEEvent(w, "attention", event); err != nil {
 				return
 			}
 			flusher.Flush()
@@ -6708,12 +6971,7 @@ func (s *Server) handleAttentionStreamV1(w http.ResponseWriter, r *http.Request)
 				heartbeat["last_event_time"] = lastEventTime.Format(time.RFC3339Nano)
 				heartbeat["idle_ms"] = time.Since(lastEventTime).Milliseconds()
 			}
-			data, marshalErr := json.Marshal(heartbeat)
-			if marshalErr != nil {
-				log.Printf("SSE: failed to marshal heartbeat: %v", marshalErr)
-				return
-			}
-			if _, err := fmt.Fprintf(w, "event: heartbeat\ndata: %s\n\n", data); err != nil {
+			if err := s.writeSSEEvent(w, "heartbeat", heartbeat); err != nil {
 				return
 			}
 			flusher.Flush()
