@@ -55,15 +55,16 @@ type backgroundExecutorConfig struct {
 	GlobalTimeout    time.Duration `json:"global_timeout"`
 	ProgressInterval time.Duration `json:"progress_interval"`
 	PaneLockWait     time.Duration `json:"pane_lock_wait"`
-	// IdleStablePolls and OutputStabilityWindow carry the completion-wait
-	// robustness knobs (ntm-l6cuz.3) across the background re-exec; zero means
-	// the package defaults.
-	IdleStablePolls       int             `json:"idle_stable_polls,omitempty"`
-	OutputStabilityWindow time.Duration   `json:"output_stability_window,omitempty"`
-	Verbose               bool            `json:"verbose,omitempty"`
-	StartFromStep         string          `json:"start_from_step,omitempty"`
-	StartFromState        *ExecutionState `json:"start_from_state,omitempty"`
-	ResumeOptions         ResumeOptions   `json:"resume_options,omitempty"`
+	// IdleStablePolls, OutputStabilityWindow, and MissingDeliverableNudges
+	// carry the completion-wait robustness knobs (ntm-l6cuz.3, ntm-zbql4)
+	// across the background re-exec; zero means the package defaults.
+	IdleStablePolls          int             `json:"idle_stable_polls,omitempty"`
+	OutputStabilityWindow    time.Duration   `json:"output_stability_window,omitempty"`
+	MissingDeliverableNudges int             `json:"missing_deliverable_nudges,omitempty"`
+	Verbose                  bool            `json:"verbose,omitempty"`
+	StartFromStep            string          `json:"start_from_step,omitempty"`
+	StartFromState           *ExecutionState `json:"start_from_state,omitempty"`
+	ResumeOptions            ResumeOptions   `json:"resume_options,omitempty"`
 }
 
 func (c backgroundExecutorConfig) executorConfig() ExecutorConfig {
@@ -72,7 +73,8 @@ func (c backgroundExecutorConfig) executorConfig() ExecutorConfig {
 		DefaultTimeout: c.DefaultTimeout, GlobalTimeout: c.GlobalTimeout,
 		ProgressInterval: c.ProgressInterval, PaneLockWait: c.PaneLockWait,
 		IdleStablePolls: c.IdleStablePolls, OutputStabilityWindow: c.OutputStabilityWindow,
-		Verbose: c.Verbose, StartFromStep: c.StartFromStep, StartFromState: c.StartFromState,
+		MissingDeliverableNudges: c.MissingDeliverableNudges,
+		Verbose:                  c.Verbose, StartFromStep: c.StartFromStep, StartFromState: c.StartFromState,
 		ResumeOptions: c.ResumeOptions,
 	}
 }
@@ -154,7 +156,8 @@ func startDetachedPipeline(workflow *Workflow, vars map[string]interface{}, cfg 
 			DefaultTimeout: cfg.DefaultTimeout, GlobalTimeout: cfg.GlobalTimeout,
 			ProgressInterval: cfg.ProgressInterval, PaneLockWait: cfg.PaneLockWait,
 			IdleStablePolls: cfg.IdleStablePolls, OutputStabilityWindow: cfg.OutputStabilityWindow,
-			Verbose: cfg.Verbose, StartFromStep: cfg.StartFromStep, StartFromState: cfg.StartFromState,
+			MissingDeliverableNudges: cfg.MissingDeliverableNudges,
+			Verbose:                  cfg.Verbose, StartFromStep: cfg.StartFromStep, StartFromState: cfg.StartFromState,
 			ResumeOptions: cfg.ResumeOptions,
 		}, Variables: prepared,
 	}

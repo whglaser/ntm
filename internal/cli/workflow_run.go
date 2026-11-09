@@ -1329,6 +1329,40 @@ func workflowNewEvidence(before, after string) (string, error) {
 	return "", errors.New("the saved output boundary is no longer visible (scrollback loss or screen redraw); inspect the stage before a deliberate --restart")
 }
 
+// workflowProviderRejection reports a fresh provider/API rejection frame seen
+// while collecting stage evidence. It carries only the provider's own
+// code/label and bounded message — never the raw payload — and stops the error
+// frame from being attributed as an answer or a stage verdict (ntm-5pva1).
+type workflowProviderRejection struct {
+	agentID string
+	label   string
+	message string
+}
+
+func (e *workflowProviderRejection) Error() string {
+	return fmt.Sprintf("workflow pane %s: provider rejected the turn (%s): %s", e.agentID, e.label, e.message)
+}
+
+func newWorkflowProviderRejection(agentID string, rejection status.ProviderRejection) error {
+	code, name := strings.TrimSpace(rejection.Code), strings.TrimSpace(rejection.Label)
+	var label string
+	switch {
+	case code != "" && name != "" && !strings.EqualFold(code, name):
+		label = code + "/" + name
+	case name != "":
+		label = name
+	case code != "":
+		label = code
+	default:
+		label = "provider rejection"
+	}
+	message := strings.TrimSpace(rejection.Message)
+	if message == "" {
+		message = "the provider rejected the turn"
+	}
+	return &workflowProviderRejection{agentID: agentID, label: label, message: message}
+}
+
 // recoverPiWorkflowEvidence is called under r.mu. A repaint can only adopt
 // this stage's delivered prompt, never an arbitrary idle replacement screen.
 // The fingerprint comes from the final prepared delivery, never a newly
@@ -1481,6 +1515,15 @@ func (r *workflowRunner) observe(ctx context.Context) (*workflowObservation, err
 			if err != nil {
 				r.mu.Unlock()
 				return nil, fmt.Errorf("workflow pane %s: %w", agent.ID, err)
+			}
+			// A provider/API rejection in this turn's fresh evidence is a
+			// terminal verdict about the turn, never an answer: surface the
+			// provider's own reason and keep the frame out of raw evidence so
+			// no agent_says pattern can match it (ntm-5pva1). Recovery has
+			// already run, so a repaint that hid the prompt echo is included.
+			if rejection, rejected := status.DetectProviderRejection(delta); rejected {
+				r.mu.Unlock()
+				return nil, newWorkflowProviderRejection(agent.ID, rejection)
 			}
 		}
 		if prior.Capture != frame.Capture || prior.ScreenHash != frame.ScreenHash || frame.Working {

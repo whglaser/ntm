@@ -771,6 +771,17 @@ the detector must report idle for the configured number of consecutive polls
 (`ExecutorConfig.IdleStablePolls`, default 3), and the executor resets a
 pane's cached classification history when it starts a new step on it.
 
+When a `pi` turn ends (a lost boundary, or an attributed idle turn) with only
+some declared outputs written, the executor sends up to
+`ExecutorConfig.MissingDeliverableNudges` (default 2) bounded continuation
+nudges naming the missing paths — a new message to the same pane, never a
+resend of the delivered prompt — and the stability window completes the step
+once the files appear. If the budget is spent, or the step deadline is too
+close to nudge (under 30s), the step fails with the distinct
+`deliverable_missing` error carrying the missing paths, never the
+saved-boundary wording. A pane that still reads working is never nudged; a
+negative `MissingDeliverableNudges` disables nudging.
+
 
 ## Error Handling
 

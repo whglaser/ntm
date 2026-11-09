@@ -104,6 +104,22 @@ func (a *artifactStability) allPresent() bool {
 	return ok
 }
 
+// missingPaths returns the watched paths that do not currently exist or are
+// unreadable, preserving declaration order. It names the deliverables for the
+// deliverable_missing verdict and the bounded continuation nudge (ntm-zbql4).
+func (a *artifactStability) missingPaths() []string {
+	if a == nil || len(a.paths) == 0 {
+		return nil
+	}
+	var missing []string
+	for _, path := range a.paths {
+		if _, err := os.Stat(path); err != nil {
+			missing = append(missing, path)
+		}
+	}
+	return missing
+}
+
 // watchedPaths returns the resolved paths for logging. The slice is a copy;
 // callers cannot mutate the watcher's state.
 func (a *artifactStability) watchedPaths() []string {

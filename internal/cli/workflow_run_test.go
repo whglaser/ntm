@@ -2388,3 +2388,91 @@ func TestWorkflowRunnerPiLegacyReceiptRefusesResume(t *testing.T) {
 		t.Fatalf("legacy receipt authorized resume: result=%+v sends=%v error=%v", result, fake.dispatchedPanes(), err)
 	}
 }
+
+// wrappedProviderRejectionFrame is the terminal-wrapped provider error frame
+// the SDR rig produced: the JSON split mid-token by the pane width.
+func wrappedProviderRejectionFrame() string {
+	payload := `Error: 400 data: {"error":{"code":"content_filter","message":"Response content blocked by label 'Jailbreak'."}}`
+	var wrapped strings.Builder
+	for len(payload) > 24 {
+		wrapped.WriteString(payload[:24])
+		wrapped.WriteString("\n")
+		payload = payload[24:]
+	}
+	wrapped.WriteString(payload)
+	return wrapped.String()
+}
+
+// TestWorkflowRunnerPiProviderRejectionSurfacesInsteadOfBoundaryLoss pins
+// ntm-5pva1: a pi turn that repaints away the pre-send boundary and ends on a
+// provider/API error frame must surface the provider's own value-safe verdict
+// instead of the boundary-loss wording, and the error frame must never be
+// adopted as a stage answer.
+func TestWorkflowRunnerPiProviderRejectionSurfacesInsteadOfBoundaryLoss(t *testing.T) {
+	fake := newFakeWorkflowSession()
+	fake.outputs["%1"] = piWorkflowCapture("previous red work\nRED-HANDOFF", "", false)
+	fake.outputs["%2"] = piWorkflowCapture("previous green work\nGREEN-HANDOFF", "", false)
+	fake.onDispatch = func(pane, prompt string) {
+		if pane != "%1" {
+			return
+		}
+		// The turn repaints away the pre-send boundary and ends on the
+		// provider's error frame — which even carries the stage's verdict
+		// token, to prove the error frame can never satisfy the trigger.
+		frame := piWorkflowCapture("Pi v1.3.0\n"+prompt+"\n"+wrappedProviderRejectionFrame()+"\nRED-HANDOFF", "", false)
+		fake.mu.Lock()
+		fake.outputs[pane] = frame
+		fake.mu.Unlock()
+	}
+	runner, err := newWorkflowRunner(pingPongTemplate(), []workflow.CoordinatorAgent{{ID: "%1", Role: "red"}, {ID: "%2", Role: "green"}},
+		workflowRunOptions{Session: "pi-provider-reject", ProjectRoot: t.TempDir(), StateDir: filepath.Join(t.TempDir(), "state"),
+			PanePIDs: map[string]int{"%1": 101, "%2": 202}, PaneTypes: map[string]string{"%1": "pi", "%2": "pi"},
+			MaxTransitions: 2, Interval: time.Millisecond}, fake.ports())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	result, err := runner.Run(ctx)
+	if err == nil || !strings.Contains(err.Error(), "content_filter") || strings.Contains(err.Error(), "boundary is no longer visible") {
+		t.Fatalf("provider rejection surfaced as %v (result=%+v); want the provider verdict without boundary-loss wording", err, result)
+	}
+	if result.Transitions != 0 || len(fake.dispatchedPanes()) != 1 {
+		t.Fatalf("provider rejection advanced the workflow: transitions=%d sends=%v", result.Transitions, fake.dispatchedPanes())
+	}
+}
+
+// TestWorkflowRunnerPiStaleProviderErrorDoesNotSuppressFreshVerdict pins the
+// other direction of ntm-5pva1: only this turn's fresh evidence may decide the
+// provider verdict, so a stale error frame already in scrollback must not
+// suppress a clean answer (or be re-reported as if it were new).
+func TestWorkflowRunnerPiStaleProviderErrorDoesNotSuppressFreshVerdict(t *testing.T) {
+	fake := newFakeWorkflowSession()
+	fake.outputs["%1"] = piWorkflowCapture("old turn ended on "+wrappedProviderRejectionFrame(), "", false)
+	fake.outputs["%2"] = piWorkflowCapture("previous green work", "", false)
+	fake.onDispatch = func(pane, prompt string) {
+		// A fresh repaint: the stale error stays above, and the new turn
+		// answers cleanly after the prompt echo.
+		verdict := "RED-HANDOFF"
+		if pane == "%2" {
+			verdict = "GREEN-HANDOFF"
+		}
+		frame := piWorkflowCapture("Pi v1.3.0\nold turn ended on "+wrappedProviderRejectionFrame()+"\n"+prompt+"\n"+verdict, "", false)
+		fake.mu.Lock()
+		fake.outputs[pane] = frame
+		fake.mu.Unlock()
+	}
+	runner, err := newWorkflowRunner(pingPongTemplate(), []workflow.CoordinatorAgent{{ID: "%1", Role: "red"}, {ID: "%2", Role: "green"}},
+		workflowRunOptions{Session: "pi-stale-provider", ProjectRoot: t.TempDir(), StateDir: filepath.Join(t.TempDir(), "state"),
+			PanePIDs: map[string]int{"%1": 101, "%2": 202}, PaneTypes: map[string]string{"%1": "pi", "%2": "pi"},
+			MaxTransitions: 1, Interval: time.Millisecond}, fake.ports())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	result, err := runner.Run(ctx)
+	if err != nil || result.Transitions < 1 {
+		t.Fatalf("stale provider error suppressed a fresh verdict: %v (result=%+v)", err, result)
+	}
+}

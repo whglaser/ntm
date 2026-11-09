@@ -1630,6 +1630,12 @@ type AgentDeliveryState struct {
 	StartedAt          time.Time `json:"started_at"`
 	DeliveredAt        time.Time `json:"delivered_at,omitempty"`
 	CompletedAt        time.Time `json:"completed_at,omitempty"`
+	// Nudges counts bounded continuation nudges sent because the delivered
+	// turn ended with declared step outputs still missing (ntm-zbql4). It is
+	// persisted so retries and resumes share one budget per delivery.
+	Nudges int `json:"nudges,omitempty"`
+	// LastNudgeAt records when the most recent nudge was sent.
+	LastNudgeAt time.Time `json:"last_nudge_at,omitempty"`
 	// recoveredTurn is process-local (never persisted): it marks a turn whose
 	// completion was attributed by the OSC recovery path when the pre-send
 	// boundary and prompt echo had both scrolled away (ntm-l6cuz.5). It keeps

@@ -173,6 +173,13 @@ type ExecutorConfig struct {
 	// byte-identical before the artifact fallback completes a step. Zero uses
 	// DefaultOutputStabilityWindow. See Step.Outputs.
 	OutputStabilityWindow time.Duration
+
+	// MissingDeliverableNudges is how many bounded continuation nudges a pi
+	// step may receive after its turn ended with declared outputs still
+	// missing (ntm-zbql4). Zero uses defaultMissingDeliverableNudges (2); a
+	// negative value disables nudging, so the step fails with the distinct
+	// deliverable_missing verdict instead.
+	MissingDeliverableNudges int
 }
 
 // MinProgressInterval is the minimum allowed progress interval to prevent ticker panics.
@@ -2689,6 +2696,23 @@ func (e *Executor) executeAgentDelivery(ctx context.Context, step *Step, workflo
 					)
 					return fail("provider_rejected", rejection)
 				}
+				// A pi turn can end silently with declared outputs still
+				// missing (ntm-zbql4): nudge to continue on a bounded budget,
+				// then fail with the distinct deliverable_missing verdict
+				// instead of the misleading boundary-loss wording.
+				outcome, stalled := e.recoverStalledDeliverables(ctx, step, &record, opts, deadline, errors.Is(err, errAgentDeliveryBoundaryLost))
+				switch outcome {
+				case stalledNudged:
+					remaining = time.Until(deadline)
+					if remaining <= 0 {
+						return fail("deliverable_missing", &missingDeliverableError{paths: opts.Artifacts.missingPaths()})
+					}
+					continue
+				case stalledMissingDeliverable:
+					return fail("deliverable_missing", stalled)
+				case stalledNudgeFailed:
+					return fail("nudge", stalled)
+				}
 				return fail("timeout", fmt.Errorf("waiting for the original agent delivery: %w", err))
 			}
 			if !strings.EqualFold(strings.TrimSpace(record.AgentType), "pi") {
@@ -2707,9 +2731,52 @@ func (e *Executor) executeAgentDelivery(ctx context.Context, step *Step, workflo
 			// original deadline, rather than extending the caller's timeout.
 			ready, err := collect()
 			if err != nil {
+				if rejection, rejected := status.ProviderRejectionIn(err); rejected {
+					slog.Warn("pipeline.agent_delivery.provider_rejected",
+						"pane_id", paneID,
+						"agent_type", record.AgentType,
+						"provider_code", rejection.Code,
+						"provider_label", rejection.Label,
+						"reason", "provider rejected the turn while attributing the idle frame",
+					)
+					return fail("provider_rejected", rejection)
+				}
+				outcome, stalled := e.recoverStalledDeliverables(ctx, step, &record, opts, deadline, errors.Is(err, errAgentDeliveryBoundaryLost))
+				switch outcome {
+				case stalledNudged:
+					remaining = time.Until(deadline)
+					if remaining <= 0 {
+						return fail("deliverable_missing", &missingDeliverableError{paths: opts.Artifacts.missingPaths()})
+					}
+					continue
+				case stalledMissingDeliverable:
+					return fail("deliverable_missing", stalled)
+				case stalledNudgeFailed:
+					return fail("nudge", stalled)
+				}
 				return fail("capture", err)
 			}
 			if ready {
+				// A turn attributed as complete without its declared outputs
+				// would otherwise finish the step silently. The turn is over,
+				// so nudge on the remaining budget or report the missing
+				// deliverable explicitly (ntm-zbql4).
+				if missing := opts.Artifacts.missingPaths(); len(missing) > 0 {
+					outcome, stalled := e.recoverStalledDeliverables(ctx, step, &record, opts, deadline, true)
+					switch outcome {
+					case stalledNudged:
+						remaining = time.Until(deadline)
+						if remaining <= 0 {
+							return fail("deliverable_missing", &missingDeliverableError{paths: missing})
+						}
+						continue
+					case stalledMissingDeliverable:
+						return fail("deliverable_missing", stalled)
+					case stalledNudgeFailed:
+						return fail("nudge", stalled)
+					}
+					return fail("deliverable_missing", &missingDeliverableError{paths: missing})
+				}
 				break
 			}
 			remaining = time.Until(deadline)
@@ -2737,6 +2804,171 @@ func (e *Executor) completedAgentDelivery(step *Step, result StepResult, finishe
 	}
 	result.Status, result.FinishedAt = StatusCompleted, finished
 	return result
+}
+
+// Bounded continuation nudges for a pi turn that ended with declared step
+// outputs still missing (ntm-zbql4). A nudge is a new message to the same
+// pane — never a resend of the delivered prompt — and every send is recorded
+// on the delivery receipt so retries and resumes share one budget.
+const (
+	defaultMissingDeliverableNudges     = 2
+	missingDeliverableNudgeMinRemaining = 30 * time.Second
+)
+
+type stalledDeliverableOutcome int
+
+const (
+	// stalledNotApplicable keeps the caller's existing failure behavior: the
+	// stall policy has nothing it can safely do (no declared outputs, no
+	// missing path, a non-pi agent, an unverifiable or busy pane, or a
+	// cancelled/failed checkpoint).
+	stalledNotApplicable stalledDeliverableOutcome = iota
+	// stalledNudged means a bounded continuation nudge was delivered; the
+	// caller keeps waiting on the same step deadline.
+	stalledNudged
+	// stalledMissingDeliverable means the turn ended and declared outputs are
+	// still missing after the nudge budget was spent: the distinct terminal
+	// verdict, never boundary loss.
+	stalledMissingDeliverable
+	// stalledNudgeFailed means the nudge could not be delivered or recorded;
+	// the receipt is left in flight so nothing retries it automatically.
+	stalledNudgeFailed
+)
+
+// missingDeliverableError names the declared step outputs that never appeared.
+type missingDeliverableError struct{ paths []string }
+
+func (e *missingDeliverableError) Error() string {
+	return fmt.Sprintf("agent turn ended without writing declared outputs: %s", strings.Join(e.paths, ", "))
+}
+
+func (e *Executor) missingDeliverableNudgeBudget() int {
+	if e == nil {
+		return 0
+	}
+	switch {
+	case e.config.MissingDeliverableNudges < 0:
+		return 0
+	case e.config.MissingDeliverableNudges == 0:
+		return defaultMissingDeliverableNudges
+	default:
+		return e.config.MissingDeliverableNudges
+	}
+}
+
+// deliverableNudgePrompt is deterministic and value-safe: it names only the
+// step ID and declared output paths, and carries the incremental-write
+// instruction that recovered the SDR stall on the first nudge.
+func deliverableNudgePrompt(step *Step, missing []string) string {
+	var b strings.Builder
+	b.WriteString("Continue this step now: the previous turn ended before the declared outputs were written.\n")
+	if step != nil && strings.TrimSpace(step.ID) != "" {
+		fmt.Fprintf(&b, "Step: %s\n", step.ID)
+	}
+	b.WriteString("Still missing:\n")
+	for _, path := range missing {
+		fmt.Fprintf(&b, "- %s\n", path)
+	}
+	b.WriteString("Write each missing file now. For large artifacts, write incrementally (append in chunks) so a long response is not lost, and do not restart files that already exist.")
+	return b.String()
+}
+
+// recoverStalledDeliverables reacts to a pi delivery whose declared outputs are
+// incomplete when the turn evidence is gone (boundary loss) or the turn was
+// attributed anyway. It nudges while the budget lasts and the pane is
+// verifiably idle, then returns the deliverable_missing verdict.
+func (e *Executor) recoverStalledDeliverables(ctx context.Context, step *Step, record *AgentDeliveryState, opts waitIdleOptions, deadline time.Time, turnEnded bool) (stalledDeliverableOutcome, error) {
+	if e == nil || step == nil || record == nil || !turnEnded {
+		return stalledNotApplicable, nil
+	}
+	if !strings.EqualFold(strings.TrimSpace(record.AgentType), "pi") {
+		return stalledNotApplicable, nil
+	}
+	if ctx.Err() != nil || e.checkpointFailure() != nil {
+		return stalledNotApplicable, nil
+	}
+	missing := opts.Artifacts.missingPaths()
+	if len(missing) == 0 {
+		return stalledNotApplicable, nil
+	}
+	if time.Until(deadline) < missingDeliverableNudgeMinRemaining || record.Nudges >= e.missingDeliverableNudgeBudget() {
+		return stalledMissingDeliverable, &missingDeliverableError{paths: missing}
+	}
+	state, ok := e.agentDeliveryPaneStatus(record.PaneID)
+	if !ok || state.State != status.StateIdle {
+		return stalledNotApplicable, nil
+	}
+	if err := e.sendDeliverableNudge(ctx, step, record, missing); err != nil {
+		return stalledNudgeFailed, err
+	}
+	return stalledNudged, nil
+}
+
+// sendDeliverableNudge delivers the continuation prompt as a fresh message on
+// the recorded pane and updates the receipt's boundary and echo anchors so the
+// next turn is attributed normally. The receipt is marked sending across the
+// transport, so a crash or resume can never deliver the nudge twice.
+func (e *Executor) sendDeliverableNudge(ctx context.Context, step *Step, record *AgentDeliveryState, missing []string) error {
+	prompt := deliverableNudgePrompt(step, missing)
+	boundary, err := e.captureAgentDelivery(ctx, *record)
+	if err != nil {
+		return fmt.Errorf("capture pane before nudge: %w", err)
+	}
+	pane, err := e.agentDeliveryPane(ctx, record.PaneID, record.PanePID, record.Endpoint)
+	if err != nil {
+		return err
+	}
+	if err := e.tmuxClient().PrepareDelivery(ctx, pane, record.AgentType); err != nil {
+		return fmt.Errorf("nudge preflight did not prove the pane can receive it: %w", err)
+	}
+	sum := sha256.Sum256([]byte(prompt))
+	normalizedPrompt := status.NormalizeAgentEcho(prompt)
+	echoSum := sha256.Sum256([]byte(normalizedPrompt))
+	echoLength := len(normalizedPrompt)
+	if echoLength > agentDeliveryMaxCaptureBytes {
+		echoLength = 0
+	}
+	var piEcho status.PromptEchoFingerprint
+	if strings.EqualFold(strings.TrimSpace(record.AgentType), "pi") {
+		piEcho, _, _ = status.PiPromptEcho(prompt)
+	}
+	record.PromptHash = hex.EncodeToString(sum[:])
+	record.PromptEchoHash = hex.EncodeToString(echoSum[:])
+	record.PromptEchoLength = echoLength
+	record.PiPromptEchoHash, record.PiPromptEchoLength = piEcho.Hash, piEcho.Length
+	record.BeforeOutput = boundary
+	// The receipt stays delivered: a nudge is an idempotent continuation
+	// instruction for work that was already dispatched, not a second dispatch
+	// of the prompt, so an interrupted nudge must not strand the step behind
+	// the uncertain-send policy. Persisting the newest anchors before
+	// transport lets a landed nudge be attributed normally after a crash.
+	if err := e.saveAgentDelivery(*record); err != nil {
+		return fmt.Errorf("record nudge intent: %w", err)
+	}
+	if err := e.tmuxClient().PasteKeys(record.PaneID, prompt, true); err != nil {
+		return fmt.Errorf("nudge delivery outcome is unknown: %w", err)
+	}
+	if err := e.confirmSubmission(ctx, record.PaneID, prompt, record.AgentType); err != nil {
+		return fmt.Errorf("%s; nudge delivery outcome is unknown", submissionFailureMessage(err))
+	}
+	if _, err := e.agentDeliveryPane(ctx, record.PaneID, record.PanePID, record.Endpoint); err != nil {
+		return err
+	}
+	record.Nudges++
+	record.LastNudgeAt = time.Now()
+	if err := e.saveAgentDelivery(*record); err != nil {
+		return fmt.Errorf("record nudge delivery: %w", err)
+	}
+	slog.Warn("pipeline.agent_delivery.nudged",
+		"pane_id", record.PaneID,
+		"step_id", record.StepID,
+		"agent_type", record.AgentType,
+		"nudge", record.Nudges,
+		"budget", e.missingDeliverableNudgeBudget(),
+		"missing", missing,
+		"reason", "agent turn ended with declared outputs missing; sent a bounded continuation nudge",
+	)
+	return nil
 }
 
 func (e *Executor) agentDeliveryEndpoint() string {

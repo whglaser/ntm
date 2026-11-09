@@ -355,10 +355,13 @@ func TestAgentDeliveryCompletesOnStableArtifactsWithoutPiFrame(t *testing.T) {
 	assertNotResent(t, mock)
 }
 
-// TestAgentDeliveryMissingArtifactsStillFailClosedOnBoundaryLoss pins that the
+// TestAgentDeliveryMissingArtifactsFailsWithDeliverableMissing pins that the
 // parking rule did not weaken the receipt: a lost boundary while idle with no
-// declared deliverable on disk still fails closed and never re-sends.
-func TestAgentDeliveryMissingArtifactsStillFailClosedOnBoundaryLoss(t *testing.T) {
+// declared deliverable on disk still fails closed, and the verdict names the
+// missing deliverable instead of the misleading boundary-loss wording
+// (ntm-zbql4). The 5s deadline is below the nudge floor, so no nudge is sent
+// and the original prompt is never re-sent.
+func TestAgentDeliveryMissingArtifactsFailsWithDeliverableMissing(t *testing.T) {
 	executor, mock := submittingExecutor(t, "pi-missing-artifacts")
 	executor.config.ProjectDir = t.TempDir()
 	executor.config.OutputStabilityWindow = 100 * time.Millisecond
@@ -384,8 +387,8 @@ func TestAgentDeliveryMissingArtifactsStillFailClosedOnBoundaryLoss(t *testing.T
 		t.Fatalf("missing deliverable completed on an unattributable frame: state=%+v err=%v", state.Status, err)
 	}
 	got := state.Steps["work"]
-	if got.Error == nil || !strings.Contains(got.Error.Message, "boundary is no longer visible") {
-		t.Fatalf("missing deliverable did not fail closed on the boundary error: %+v", got.Error)
+	if got.Error == nil || got.Error.Type != "deliverable_missing" || !strings.Contains(got.Error.Message, artifact) {
+		t.Fatalf("missing deliverable verdict = %+v, want deliverable_missing naming %s", got.Error, artifact)
 	}
 	assertNotResent(t, mock)
 }
@@ -666,6 +669,197 @@ func TestAgentDeliveryTerminalFailureSettlesProgramStatus(t *testing.T) {
 	}
 	if _, ok := tap.Observer().Latest("%1"); ok {
 		t.Fatal("terminal failure left the pane's stale OSC report behind")
+	}
+	assertNotResent(t, mock)
+}
+
+// TestAgentDeliveryNudgesSilentTurnEndAndCompletes pins the ntm-zbql4
+// acceptance: the boundary is gone, the pane is idle, and a declared output is
+// missing, so the executor sends one bounded continuation nudge naming the
+// path (a new message, never a resend of the delivered prompt); the artifact
+// then appears and the stability window completes the step.
+func TestAgentDeliveryNudgesSilentTurnEndAndCompletes(t *testing.T) {
+	executor, mock := submittingExecutor(t, "pi-nudge-complete")
+	executor.config.ProjectDir = t.TempDir()
+	executor.config.OutputStabilityWindow = 100 * time.Millisecond
+	mock.AddPane("", tmux.Pane{ID: "%1", Index: 1, PID: 4141, Type: tmux.AgentType("pi"), Width: 100})
+	if err := mock.SetPaneOutput("%1", piStagePane("Pi v1.3.0\nPrevious turn context that will scroll away.", "")); err != nil {
+		t.Fatal(err)
+	}
+	artifact := filepath.Join(executor.config.ProjectDir, "lane-note.md")
+	verifications := 0
+	mock.SetSubmissionVerifier(func(target, _, _ string) error {
+		verifications++
+		if verifications >= 2 {
+			if err := os.WriteFile(artifact, []byte("lane note complete\n"), 0o600); err != nil {
+				return err
+			}
+		}
+		// The turn repaints away the pre-send boundary; the frame is never
+		// attributable from here on.
+		return mock.SetPaneOutput(target, piStagePane("Pi v1.3.0\n\n"+strings.Repeat("lane output line\n", 400)+"unattributed", ""))
+	})
+
+	workflow := singleStepWorkflow("pi-nudge-complete", Step{
+		ID:      "work",
+		Pane:    PaneSpec{Index: 1},
+		Prompt:  "Run the lane.",
+		Wait:    WaitCompletion,
+		Timeout: Duration{Duration: 90 * time.Second},
+		Outputs: []OutputDecl{{Name: "lane-note", Path: artifact}},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	state, err := executor.Run(ctx, workflow, nil, nil)
+	if err != nil || state.Status != StatusCompleted {
+		t.Fatalf("silent turn end did not recover via nudge: state=%+v err=%v", state.Status, err)
+	}
+	history, historyErr := mock.PasteHistory("%1")
+	if historyErr != nil || len(history) != 2 {
+		t.Fatalf("pane received %d pastes (%v), want the original plus exactly one nudge", len(history), historyErr)
+	}
+	if !strings.Contains(history[1].Content, artifact) || !strings.Contains(history[1].Content, "incrementally") {
+		t.Fatalf("nudge prompt did not name the missing path and the incremental-write instruction: %q", history[1].Content)
+	}
+	if nudges := state.AgentDeliveries["work"].Nudges; nudges != 1 {
+		t.Fatalf("delivery nudges = %d, want 1", nudges)
+	}
+}
+
+// TestAgentDeliveryNudgeBudgetExhaustionFailsDeliverableMissing pins the bound:
+// a pane that keeps ending without writing the artifact gets at most the
+// configured nudges, then the distinct deliverable_missing verdict.
+func TestAgentDeliveryNudgeBudgetExhaustionFailsDeliverableMissing(t *testing.T) {
+	executor, mock := submittingExecutor(t, "pi-nudge-budget")
+	executor.config.ProjectDir = t.TempDir()
+	executor.config.OutputStabilityWindow = 100 * time.Millisecond
+	mock.AddPane("", tmux.Pane{ID: "%1", Index: 1, PID: 4141, Type: tmux.AgentType("pi"), Width: 100})
+	if err := mock.SetPaneOutput("%1", piStagePane("Pi v1.3.0\nPrevious turn context that will scroll away.", "")); err != nil {
+		t.Fatal(err)
+	}
+	artifact := filepath.Join(executor.config.ProjectDir, "never-written.md")
+	attempt := 0
+	mock.SetSubmissionVerifier(func(target, _, _ string) error {
+		attempt++
+		// Each continuation is a new turn that still never writes the
+		// artifact: the frame is a full repaint that does not extend the
+		// previous one, so the boundary stays lost and the nudge budget is
+		// the only bound.
+		header := "Pi v1.3.0\n" + strings.Repeat("new turn\n", attempt)
+		return mock.SetPaneOutput(target, piStagePane(header+"\n"+strings.Repeat("lane output line\n", 400)+"still running", ""))
+	})
+
+	workflow := singleStepWorkflow("pi-nudge-budget", Step{
+		ID:      "work",
+		Pane:    PaneSpec{Index: 1},
+		Prompt:  "Run the lane.",
+		Wait:    WaitCompletion,
+		Timeout: Duration{Duration: 120 * time.Second},
+		Outputs: []OutputDecl{{Name: "lane-note", Path: artifact}},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	state, err := executor.Run(ctx, workflow, nil, nil)
+	if err == nil || state.Status == StatusCompleted {
+		t.Fatalf("unfinished silent turn completed: state=%+v err=%v", state.Status, err)
+	}
+	got := state.Steps["work"]
+	if got.Error == nil || got.Error.Type != "deliverable_missing" || !strings.Contains(got.Error.Message, artifact) {
+		t.Fatalf("step error = %+v, want deliverable_missing naming %s", got.Error, artifact)
+	}
+	history, historyErr := mock.PasteHistory("%1")
+	if historyErr != nil || len(history) != 3 {
+		t.Fatalf("pane received %d pastes (%v), want the original plus the two-nudge default budget", len(history), historyErr)
+	}
+	if nudges := state.AgentDeliveries["work"].Nudges; nudges != 2 {
+		t.Fatalf("delivery nudges = %d, want the default budget 2", nudges)
+	}
+}
+
+// TestAgentDeliveryWorkingPaneIsNeverNudged pins the safety half of
+// ntm-zbql4: a lost boundary with declared outputs missing while the pane
+// reports working keeps the park behavior — no continuation nudge is ever
+// pasted at a working agent — and the step ends at its timeout.
+func TestAgentDeliveryWorkingPaneIsNeverNudged(t *testing.T) {
+	executor, mock := submittingExecutor(t, "pi-nudge-working")
+	executor.config.ProjectDir = t.TempDir()
+	executor.config.OutputStabilityWindow = 100 * time.Millisecond
+	mock.AddPane("", tmux.Pane{ID: "%1", Index: 1, PID: 4141, Type: tmux.AgentType("pi"), Width: 100})
+	if err := mock.SetPaneOutput("%1", piStagePane("Pi v1.3.0\nPrevious turn context that will scroll away.", "")); err != nil {
+		t.Fatal(err)
+	}
+	artifact := filepath.Join(executor.config.ProjectDir, "never-written.md")
+	source := newFakeOSCSource()
+	executor.SetDetector(&stageIdleDetector{}) // scrape never idles; only OSC decides
+	executor.SetProgramStatusSource(source)
+	mock.SetSubmissionVerifier(func(target, _, _ string) error {
+		source.emit(target, programstatus.StateWorking)
+		return mock.SetPaneOutput(target, piStagePane("Pi v1.3.0\n\n"+strings.Repeat("lane output line\n", 400)+"still working", ""))
+	})
+
+	workflow := singleStepWorkflow("pi-nudge-working", Step{
+		ID:      "work",
+		Pane:    PaneSpec{Index: 1},
+		Prompt:  "Run the lane.",
+		Wait:    WaitCompletion,
+		Timeout: Duration{Duration: 5 * time.Second},
+		Outputs: []OutputDecl{{Name: "lane-note", Path: artifact}},
+	})
+	state, err := executor.Run(context.Background(), workflow, nil, nil)
+	if err == nil || state.Status != StatusFailed {
+		t.Fatalf("working turn did not end at its timeout: state=%+v err=%v", state.Status, err)
+	}
+	got := state.Steps["work"]
+	if got.Error == nil || got.Error.Type != "timeout" {
+		t.Fatalf("working-pane verdict = %+v, want the step timeout without a nudge verdict", got.Error)
+	}
+	assertNotResent(t, mock)
+}
+
+// TestAgentDeliveryOSCSettleWithMissingOutputsDoesNotCompleteSilently pins the
+// attributed-turn half of ntm-zbql4: when pi's own report settles the turn but
+// a declared output never appeared, the step must not report success. The 5s
+// deadline is below the nudge floor, so the verdict is deliverable_missing.
+func TestAgentDeliveryOSCSettleWithMissingOutputsDoesNotCompleteSilently(t *testing.T) {
+	executor, mock := submittingExecutor(t, "pi-osc-missing-output")
+	executor.config.ProjectDir = t.TempDir()
+	executor.config.OutputStabilityWindow = 100 * time.Millisecond
+	mock.AddPane("", tmux.Pane{ID: "%1", Index: 1, PID: 4141, Type: tmux.AgentType("pi"), Width: 100})
+	if err := mock.SetPaneOutput("%1", piStagePane("Pi v1.3.0\nPrevious turn context that will scroll away.", "")); err != nil {
+		t.Fatal(err)
+	}
+	artifact := filepath.Join(executor.config.ProjectDir, "never-written.md")
+	source := newFakeOSCSource()
+	detector := &stageIdleDetector{} // scrape never idles; only OSC decides
+	executor.SetDetector(detector)
+	executor.SetProgramStatusSource(source)
+	mock.SetSubmissionVerifier(func(target, _, _ string) error {
+		source.emit(target, programstatus.StateWorking)
+		return mock.SetPaneOutput(target, piStagePane("Pi v1.3.0\n\n"+strings.Repeat("lane output line\n", 400)+"unattributed", ""))
+	})
+	detector.onIdle = func(call int) {
+		if call == 3 {
+			source.emit("%1", programstatus.StateDone)
+		}
+	}
+
+	workflow := singleStepWorkflow("pi-osc-missing-output", Step{
+		ID:      "work",
+		Pane:    PaneSpec{Index: 1},
+		Prompt:  "Run the lane.",
+		Wait:    WaitCompletion,
+		Timeout: Duration{Duration: 5 * time.Second},
+		Outputs: []OutputDecl{{Name: "lane-note", Path: artifact}},
+	})
+	state, err := executor.Run(context.Background(), workflow, nil, nil)
+	if err == nil || state.Status == StatusCompleted {
+		t.Fatalf("OSC-settled turn completed without its declared output: state=%+v err=%v", state.Status, err)
+	}
+	got := state.Steps["work"]
+	if got.Error == nil || got.Error.Type != "deliverable_missing" || !strings.Contains(got.Error.Message, artifact) {
+		t.Fatalf("attributed-turn verdict = %+v, want deliverable_missing naming %s", got.Error, artifact)
 	}
 	assertNotResent(t, mock)
 }
