@@ -519,6 +519,11 @@ Beads provides a lightweight, dependency-aware issue database and CLI (`br` - be
 
 **Important:** `br` is non-invasive—it NEVER runs git commands automatically. You must manually commit changes after `br sync --flush-only`.
 
+**Work-graph scope (this fork):** this fork's actionable issues are the `ntm-*`
+ones. The tracker file is inherited from upstream, so it also carries upstream's
+`bd-*` issue history; those are upstream's to manage. Do not open, claim, or act
+on `bd-*` issues unless explicitly asked.
+
 ### Conventions
 
 - **Single source of truth:** Beads for task status/priority/dependencies; Agent Mail for conversation and audit
