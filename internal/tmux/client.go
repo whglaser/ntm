@@ -468,9 +468,17 @@ var ambientTmuxSocketPath = func() string {
 // provably targets a private server or the operator opted in. The socket
 // resolution mirrors the tmux client: explicit -S wins, then -L under the
 // TMUX_TMPDIR root, then the ambient TMUX socket, then the default socket.
+//
+// The operator opt-in cannot authorize killing the server that hosts this
+// process (guardHostServerSelfKill): doing so from inside a pane takes down
+// the session holding the caller plus every other session on that server
+// (2026-11-09 recurrence, ntm-bz969).
 func guardAmbientKillServer(args []string) error {
 	if !isKillServerCommand(args) {
 		return nil
+	}
+	if err := guardHostServerSelfKill(args); err != nil {
+		return err
 	}
 	if os.Getenv(AllowKillServerEnv) == "1" {
 		return nil
@@ -481,6 +489,26 @@ func guardAmbientKillServer(args []string) error {
 	return fmt.Errorf(
 		"%w; set %s=1 to override, or isolate with TMUX_TMPDIR/-S before retrying",
 		ErrKillServerRefused, AllowKillServerEnv,
+	)
+}
+
+// guardHostServerSelfKill refuses a kill-server whose resolved socket is the
+// server that hosts this process, regardless of the operator opt-in. The
+// opt-in remains available for killing a server this process is not inside;
+// a process running under a tmux server must never end that server, because
+// the kill takes its own session and every other session with it.
+func guardHostServerSelfKill(args []string) error {
+	host := strings.TrimSpace(ambientTmuxSocketPath)
+	if host == "" {
+		return nil
+	}
+	target := strings.TrimSpace(killServerSocketPath(args, os.Getenv))
+	if target == "" || filepath.Clean(target) != filepath.Clean(host) {
+		return nil
+	}
+	return fmt.Errorf(
+		"%w: %s hosts this process; %s=1 cannot authorize killing the server it is running under",
+		ErrKillServerRefused, host, AllowKillServerEnv,
 	)
 }
 

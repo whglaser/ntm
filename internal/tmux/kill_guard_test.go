@@ -143,13 +143,76 @@ func TestGuardAmbientKillServerRefusesAndExplainsOptIn(t *testing.T) {
 	}
 }
 
+// withAmbientSocket overrides the socket captured as the process's host
+// server for one test, restoring it afterward. Tests that exercise the
+// operator opt-in must use it: the host-server self-kill refusal deliberately
+// ignores the opt-in, so a test binary launched from inside tmux would
+// otherwise refuse its own default-socket kill (ntm-bz969).
+func withAmbientSocket(t *testing.T, path string) {
+	t.Helper()
+	old := ambientTmuxSocketPath
+	ambientTmuxSocketPath = path
+	t.Cleanup(func() { ambientTmuxSocketPath = old })
+}
+
 func TestGuardAmbientKillServerHonorsOperatorOptIn(t *testing.T) {
+	withAmbientSocket(t, "") // bare operator shell, not hosted by a server
 	t.Setenv(AllowKillServerEnv, "1")
 	t.Setenv("TMUX", "")
 	t.Setenv("TMUX_TMPDIR", "")
 
 	if err := guardAmbientKillServer([]string{"kill-server"}); err != nil {
 		t.Fatalf("explicit operator opt-in must allow kill-server: %v", err)
+	}
+}
+
+// TestGuardAmbientKillServerRefusesHostServerDespiteOptIn pins the 2026-11-09
+// recurrence (ntm-bz969): the operator opt-in must never authorize killing
+// the server this process runs under, because that takes down the caller's
+// own session and every other session on the server.
+func TestGuardAmbientKillServerRefusesHostServerDespiteOptIn(t *testing.T) {
+	host := filepath.Join(t.TempDir(), "host-socket")
+	withAmbientSocket(t, host)
+	t.Setenv(AllowKillServerEnv, "1")
+	t.Setenv("TMUX", "")
+	t.Setenv("TMUX_TMPDIR", "")
+
+	err := guardAmbientKillServer([]string{"-S", host, "kill-server"})
+	if !errors.Is(err, ErrKillServerRefused) {
+		t.Fatalf("kill-server against the host socket with opt-in error = %v, want ErrKillServerRefused", err)
+	}
+	if !strings.Contains(err.Error(), AllowKillServerEnv) {
+		t.Fatalf("refusal %q does not name the %s opt-in", err, AllowKillServerEnv)
+	}
+}
+
+// TestGuardAmbientKillServerRefusesHostDefaultDespiteOptIn covers the default
+// resolution path: clearing TMUX/TMUX_TMPDIR while hosted resolves to the
+// default per-user socket, which is the host's own socket.
+func TestGuardAmbientKillServerRefusesHostDefaultDespiteOptIn(t *testing.T) {
+	withAmbientSocket(t, defaultTmuxSocketPath())
+	t.Setenv(AllowKillServerEnv, "1")
+	t.Setenv("TMUX", "")
+	t.Setenv("TMUX_TMPDIR", "")
+
+	if err := guardAmbientKillServer([]string{"kill-server"}); !errors.Is(err, ErrKillServerRefused) {
+		t.Fatalf("default kill-server while hosted error = %v, want ErrKillServerRefused", err)
+	}
+}
+
+// TestGuardAmbientKillServerOptInStillAllowsOtherServers keeps the operator
+// escape hatch usable: a server this process is not hosted by can still be
+// killed with the opt-in set.
+func TestGuardAmbientKillServerOptInStillAllowsOtherServers(t *testing.T) {
+	host := filepath.Join(t.TempDir(), "host-socket")
+	other := filepath.Join(t.TempDir(), "other-socket")
+	withAmbientSocket(t, host)
+	t.Setenv(AllowKillServerEnv, "1")
+	t.Setenv("TMUX", "")
+	t.Setenv("TMUX_TMPDIR", "")
+
+	if err := guardAmbientKillServer([]string{"-S", other, "kill-server"}); err != nil {
+		t.Fatalf("opt-in must still allow killing a non-host server: %v", err)
 	}
 }
 

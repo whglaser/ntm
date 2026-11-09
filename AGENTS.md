@@ -240,14 +240,33 @@ go test -v -run TestUpgradeAsset ./internal/cli/
 ### Tmux Test Isolation (never kill the operator's server)
 
 A real-tmux test that acts on the ambient server can end every live session at once
-(ntm-6c7of: the host's tmux server died repeatedly while tests ran). Two invariants
-keep that impossible: package `TestMain`s call `testutil.IsolateTmuxTestProcess()`
-to run behind a private `TMUX_TMPDIR`, and `internal/tmux` refuses `kill-server`
-against the ambient/default socket unless `NTM_ALLOW_KILL_SERVER=1` is explicitly set
-(do not set it to make a test pass — isolate instead). New real-tmux packages must
-isolate the same way.
+(ntm-6c7of). It recurred on 2026-11-09 (ntm-bz969): an agent ran suites with
+`NTM_ALLOW_KILL_SERVER=1` set, the ambient server died, and every live session —
+including the agent's own — was lost. Three invariants keep that impossible:
 
-Before running tmux-touching suites locally, prove the walls hold:
+1. Package `TestMain`s call `testutil.IsolateTmuxTestProcess()` to run behind a
+   private `TMUX_TMPDIR`. New real-tmux packages must isolate the same way.
+2. `internal/tmux` refuses `kill-server` against the ambient/default socket, and
+   the host-server self-kill clause refuses **even with the opt-in set** when the
+   resolved target is the server hosting this process.
+3. **Never set `NTM_ALLOW_KILL_SERVER=1` in an agent or test run, ever.** It is an
+   operator-at-a-bare-shell escape hatch, not a test knob; a test that needs it is
+   reaching a server it does not own. Do not "make a test pass" with it — isolate.
+
+**Mandatory pre-flight before any suite that can touch tmux** (anything importing
+`internal/tmux`, `internal/cli`, `internal/pipeline`, `internal/robot`,
+`internal/serve`, `internal/session`, or any `./...` run):
+
+```bash
+ntm --robot-status        # list live sessions; the operator's work is in there
+ntm --robot-terse         # one-line state when quickly checking before a suite
+echo "$TMUX"              # if set, you are inside a pane: a wrong kill ends your own run
+make tmux-canary          # prove the walls hold before the suite (strips the opt-in)
+```
+
+If live sessions exist, prefer scoped tests for non-tmux packages; when a broad
+suite is genuinely needed, run it through the canary harness or from an
+environment with `TMUX` and `NTM_ALLOW_KILL_SERVER` stripped.
 
 ```bash
 make tmux-canary         # sentinel survives; loud warning on test failures, fails only on ambient kills
