@@ -863,3 +863,98 @@ func TestAgentDeliveryOSCSettleWithMissingOutputsDoesNotCompleteSilently(t *test
 	}
 	assertNotResent(t, mock)
 }
+
+// TestAgentDeliveryWorkingOSCBlocksSkeletonCompletion pins ntm-dvele: a
+// declared output that exists as a stable mid-write skeleton must not complete
+// the step while a fresh authoritative OSC report says the pane is still
+// working. The step ends at its timeout, not completed.
+func TestAgentDeliveryWorkingOSCBlocksSkeletonCompletion(t *testing.T) {
+	executor, mock := submittingExecutor(t, "pi-osc-skeleton-blocked")
+	executor.config.ProjectDir = t.TempDir()
+	executor.config.OutputStabilityWindow = 100 * time.Millisecond
+	mock.AddPane("", tmux.Pane{ID: "%1", Index: 1, PID: 4141, Type: tmux.AgentType("pi"), Width: 100})
+	if err := mock.SetPaneOutput("%1", piStagePane("Pi v1.3.0\nPrevious turn context that will scroll away.", "")); err != nil {
+		t.Fatal(err)
+	}
+	artifact := filepath.Join(executor.config.ProjectDir, "skeleton.md")
+	source := newFakeOSCSource()
+	executor.SetDetector(&stageIdleDetector{})
+	executor.SetProgramStatusSource(source)
+	mock.SetSubmissionVerifier(func(target, _, _ string) error {
+		// The agent writes its skeleton, then keeps working on later batches.
+		if err := os.WriteFile(artifact, []byte("skeleton with pending stubs\n"), 0o600); err != nil {
+			return err
+		}
+		source.emit(target, programstatus.StateWorking)
+		return mock.SetPaneOutput(target, piStagePane("Pi v1.3.0\n\n"+strings.Repeat("lane output line\n", 400)+"working on batch 1", ""))
+	})
+
+	workflow := singleStepWorkflow("pi-osc-skeleton-blocked", Step{
+		ID:      "work",
+		Pane:    PaneSpec{Index: 1},
+		Prompt:  "Run the lane.",
+		Wait:    WaitCompletion,
+		Timeout: Duration{Duration: 5 * time.Second},
+		Outputs: []OutputDecl{{Name: "skeleton", Path: artifact}},
+	})
+	state, err := executor.Run(context.Background(), workflow, nil, nil)
+	if err == nil || state.Status != StatusFailed {
+		t.Fatalf("stable skeleton completed while the pane reported working: state=%+v err=%v", state.Status, err)
+	}
+	got := state.Steps["work"]
+	if got.Error == nil || got.Error.Type != "timeout" {
+		t.Fatalf("skeleton verdict = %+v, want the step timeout", got.Error)
+	}
+	if _, err := os.Stat(artifact); err != nil {
+		t.Fatalf("skeleton disappeared: %v", err)
+	}
+	assertNotResent(t, mock)
+}
+
+// TestAgentDeliveryArtifactWindowCompletesAfterOSCSettle pins the recovery
+// half of ntm-dvele: the blocked window completes once pi reports the turn
+// settled, even though the frame is never attributable.
+func TestAgentDeliveryArtifactWindowCompletesAfterOSCSettle(t *testing.T) {
+	executor, mock := submittingExecutor(t, "pi-osc-skeleton-settled")
+	executor.config.ProjectDir = t.TempDir()
+	executor.config.OutputStabilityWindow = 100 * time.Millisecond
+	mock.AddPane("", tmux.Pane{ID: "%1", Index: 1, PID: 4141, Type: tmux.AgentType("pi"), Width: 100})
+	if err := mock.SetPaneOutput("%1", piStagePane("Pi v1.3.0\nPrevious turn context that will scroll away.", "")); err != nil {
+		t.Fatal(err)
+	}
+	artifact := filepath.Join(executor.config.ProjectDir, "answer.md")
+	source := newFakeOSCSource()
+	executor.SetDetector(&stageIdleDetector{})
+	executor.SetProgramStatusSource(source)
+	settled := make(chan time.Time, 1)
+	mock.SetSubmissionVerifier(func(target, _, _ string) error {
+		if err := os.WriteFile(artifact, []byte("complete answer\n"), 0o600); err != nil {
+			return err
+		}
+		source.emit(target, programstatus.StateWorking)
+		time.AfterFunc(600*time.Millisecond, func() {
+			settled <- time.Now()
+			source.emit(target, programstatus.StateDone)
+		})
+		return mock.SetPaneOutput(target, piStagePane("Pi v1.3.0\n\n"+strings.Repeat("lane output line\n", 400)+"working", ""))
+	})
+
+	workflow := singleStepWorkflow("pi-osc-skeleton-settled", Step{
+		ID:      "work",
+		Pane:    PaneSpec{Index: 1},
+		Prompt:  "Run the lane.",
+		Wait:    WaitCompletion,
+		Timeout: Duration{Duration: 10 * time.Second},
+		Outputs: []OutputDecl{{Name: "answer", Path: artifact}},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	state, err := executor.Run(ctx, workflow, nil, nil)
+	if err != nil || state.Status != StatusCompleted {
+		t.Fatalf("settled skeleton did not complete: state=%+v err=%v", state.Status, err)
+	}
+	doneAt := <-settled
+	if finished := state.Steps["work"].FinishedAt; finished.Before(doneAt) {
+		t.Fatalf("step completed at %s before the OSC settle at %s", finished, doneAt)
+	}
+}

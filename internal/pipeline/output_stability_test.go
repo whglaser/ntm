@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/programstatus"
 	"github.com/Dicklesworthstone/ntm/internal/status"
 )
 
@@ -253,5 +254,36 @@ steps:
 	}
 	if workflow.Steps[0].Outputs[0].Path != "out/result.md" || workflow.Steps[0].Outputs[1].Path != "out/report.md" {
 		t.Fatalf("step outputs = %+v", workflow.Steps[0].Outputs)
+	}
+}
+
+// TestWaitIdleArtifactFallbackEscapesStaleOSCWorking pins the ntm-l6cuz.3
+// escape that the ntm-dvele gate must not break: once the OSC working report
+// ages out of its TTL, a stable deliverable completes the wait again instead
+// of waiting forever for a settle that will never come.
+func TestWaitIdleArtifactFallbackEscapesStaleOSCWorking(t *testing.T) {
+	output := filepath.Join(t.TempDir(), "answer.md")
+	if err := os.WriteFile(output, []byte("final answer"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := DefaultExecutorConfig("test")
+	cfg.ProgressInterval = MinProgressInterval
+	e := NewExecutor(cfg)
+	source := newFakeOSCSource()
+	source.emit("%7", programstatus.StateWorking)
+	// A 2.5s TTL outlives waitForIdle's 2s start debounce so the report is
+	// still fresh on the first poll; production uses DefaultOSCStatusTTL.
+	e.SetDetector(status.NewOSCDetector(&stageIdleDetector{}, source, 2500*time.Millisecond))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	opts := waitIdleOptions{Artifacts: newArtifactStability([]string{output}, 50*time.Millisecond)}
+	started := time.Now()
+	if err := e.waitForIdle(ctx, "%7", 6*time.Second, opts); err != nil {
+		t.Fatalf("stale OSC working report blocked the artifact fallback: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed < 2500*time.Millisecond {
+		t.Fatalf("fallback completed in %v; want it to wait out the OSC TTL", elapsed)
 	}
 }

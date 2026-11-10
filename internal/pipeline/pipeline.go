@@ -300,8 +300,15 @@ func waitForIdle(ctx context.Context, detector status.Detector, paneID string, o
 			if err := ctx.Err(); err != nil {
 				return err
 			}
+			s, detectErr := detector.Detect(paneID)
+			// Keep in sync with Executor.waitForIdle: a stable deliverable
+			// completes the wait, except while a fresh authoritative OSC
+			// report says the turn is still working (ntm-dvele). A stale
+			// report ages out of the TTL and the window still completes.
 			if opts.Artifacts != nil && opts.Artifacts.satisfiedAt(time.Now()) {
-				return nil
+				if detectErr != nil || !authoritativeWorking(s) {
+					return nil
+				}
 			}
 			fresh := true
 			for _, observe := range evidence {
@@ -311,11 +318,10 @@ func waitForIdle(ctx context.Context, detector status.Detector, paneID string, o
 				}
 				fresh = fresh && ready
 			}
-			s, err := detector.Detect(paneID)
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			if err != nil {
+			if detectErr != nil {
 				idleStreak = 0
 				continue
 			}

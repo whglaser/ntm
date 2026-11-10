@@ -782,6 +782,15 @@ close to nudge (under 30s), the step fails with the distinct
 saved-boundary wording. A pane that still reads working is never nudged; a
 negative `MissingDeliverableNudges` disables nudging.
 
+The stability window completes a step only while no fresh OSC 7501 report
+says the pane is still working: a mid-write skeleton that sits unchanged
+through a thinking gap can no longer complete the step (ntm-dvele). Once the
+report ages out of its TTL, the window applies again, so a pane whose agent
+died without a final report still completes — the answers-style stall escape
+(ntm-l6cuz.3) is preserved. `ntm pipeline run` and `ntm pipeline resume`
+accept `--output-stability-window` and `--idle-stable-polls` to tune the
+window and hysteresis as a stopgap.
+
 
 ## Error Handling
 

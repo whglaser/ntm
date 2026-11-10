@@ -244,6 +244,9 @@ func newPipelineRunCmd() *cobra.Command {
 		startFromStep string
 		fromState     string
 		provision     bool
+
+		idleStablePolls       int
+		outputStabilityWindow time.Duration
 	)
 
 	cmd := &cobra.Command{
@@ -427,6 +430,8 @@ Examples:
 			execCfg.DryRun = dryRun
 			execCfg.ProjectDir = projectDir
 			execCfg.WorkflowFile = workflowPath
+			execCfg.IdleStablePolls = idleStablePolls
+			execCfg.OutputStabilityWindow = outputStabilityWindow
 			if startFromStep != "" {
 				execCfg.StartFromStep = startFromStep
 				if fromState != "" {
@@ -524,6 +529,8 @@ Examples:
 	cmd.Flags().StringVar(&startFromStep, "start-from", "", "Begin execution at the given step ID; transitive dependencies are marked Skipped")
 	cmd.Flags().StringVar(&fromState, "from-state", "", "Run ID whose persisted outputs should be reused for steps skipped by --start-from")
 	cmd.Flags().BoolVar(&provision, "provision", false, "Create/verify the session and agent panes declared by the workflow's provision block before running")
+	cmd.Flags().IntVar(&idleStablePolls, "idle-stable-polls", 0, "Consecutive idle detections required before a completion wait ends (0 uses the default 3)")
+	cmd.Flags().DurationVar(&outputStabilityWindow, "output-stability-window", 0, "How long declared outputs must be byte-identical before the artifact fallback completes (0 uses the default 15s)")
 
 	return cmd
 }
@@ -671,6 +678,9 @@ func newPipelineResumeCmd() *cobra.Command {
 		maxSelectorOutputBytesTotal int64
 		maxStepCountTotal           int
 		maxMaterializedStepNodes    int
+
+		idleStablePolls       int
+		outputStabilityWindow time.Duration
 	)
 
 	cmd := &cobra.Command{
@@ -896,6 +906,8 @@ Examples:
 			execCfg.ProjectDir = projectDir
 			execCfg.WorkflowFile = workflowFile
 			execCfg.ResumeOptions = resumeOpts
+			execCfg.IdleStablePolls = idleStablePolls
+			execCfg.OutputStabilityWindow = outputStabilityWindow
 			executor := pipeline.NewExecutor(execCfg)
 
 			state.WorkflowFile = workflowFile
@@ -1003,6 +1015,8 @@ Examples:
 	cmd.Flags().StringVar(&onRosterChange, "on-roster-change", string(pipeline.ResumeRosterAbort), "Roster-change policy: abort or proceed")
 	cmd.Flags().StringVar(&stepID, "step-id", "", "Step ID used with --mode=force-iter")
 	cmd.Flags().IntVar(&iteration, "iteration", 0, "Iteration index used with --mode=force-iter")
+	cmd.Flags().IntVar(&idleStablePolls, "idle-stable-polls", 0, "Consecutive idle detections required before a completion wait ends (0 uses the default 3)")
+	cmd.Flags().DurationVar(&outputStabilityWindow, "output-stability-window", 0, "How long declared outputs must be byte-identical before the artifact fallback completes (0 uses the default 15s)")
 
 	return cmd
 }

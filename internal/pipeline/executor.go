@@ -2722,8 +2722,13 @@ func (e *Executor) executeAgentDelivery(ctx context.Context, step *Step, workflo
 			// returned because the declared outputs matured, the redraw that
 			// hid the pane frame is exactly the case the fallback exists for,
 			// so another attributed frame is not required (ntm-l6cuz.11).
+			// A fresh OSC working report still blocks it: a mid-write skeleton
+			// must not complete the step (ntm-dvele). A detector error keeps
+			// the fallback's fail-open completion.
 			if opts.Artifacts != nil && opts.Artifacts.satisfiedAt(time.Now()) {
-				break
+				if state, err := e.detector.Detect(paneID); err != nil || !authoritativeWorking(state) {
+					break
+				}
 			}
 			// The last idle observation can itself race a pi redraw. Require
 			// one more complete, attributed frame before persisting success;
@@ -4197,6 +4202,15 @@ func submissionFailureMessage(err error) string {
 // This is only ever reached for a dispatch whose submission was confirmed:
 // idleness is meaningful evidence of completion for a prompt that is actually
 // running, and meaningless for one still sitting in the composer (ntm#320).
+// authoritativeWorking reports whether a fresh OSC 7501 report says the pane
+// is still mid-turn. Only pi's own report qualifies: the artifact fallback
+// exists for panes whose chrome misreads as working (ntm-l6cuz.3), and a
+// scrape reading must never block a stable deliverable, while a mid-write
+// skeleton must not override the agent's own working report (ntm-dvele).
+func authoritativeWorking(state status.AgentStatus) bool {
+	return state.StateSource == status.StateSourceOSC && state.State == status.StateWorking
+}
+
 func (e *Executor) waitForIdle(ctx context.Context, paneID string, timeout time.Duration, opts waitIdleOptions, evidence ...func() (bool, error)) error {
 	stablePolls := opts.StablePolls
 	if stablePolls <= 0 {
@@ -4228,16 +4242,37 @@ func (e *Executor) waitForIdle(ctx context.Context, paneID string, timeout time.
 		case <-deadline.C:
 			return fmt.Errorf("timeout after %s", timeout)
 		case <-ticker.C:
+			state, detectErr := e.detector.Detect(paneID)
 			// Artifact stability outranks pane state: the declared deliverable
 			// exists and stopped changing, so the step is complete even if the
-			// TUI still reads working (the answers-style stall).
+			// TUI still reads working (the answers-style stall). The one
+			// exception is a fresh authoritative OSC 7501 report that the
+			// delivered turn is still working: completing on a mid-write
+			// skeleton poisons downstream steps (ntm-dvele). A stale report
+			// ages out of the OSC TTL, so a genuinely stuck pane still
+			// completes on the window alone (ntm-l6cuz.3), and a detector
+			// error keeps the fallback's fail-open completion.
 			if opts.Artifacts != nil && opts.Artifacts.satisfiedAt(time.Now()) {
-				slog.Info("pipeline.completion.artifact_stable",
-					"pane_id", paneID,
-					"paths", opts.Artifacts.watchedPaths(),
-					"window", opts.Artifacts.window,
-				)
-				return nil
+				if detectErr == nil && authoritativeWorking(state) {
+					slog.Debug("pipeline.completion.artifact_stable_blocked",
+						"pane_id", paneID,
+						"paths", opts.Artifacts.watchedPaths(),
+						"window", opts.Artifacts.window,
+						"report_age_seconds", state.ReportAgeSeconds,
+						"reason", "authoritative OSC report says the delivered turn is still working",
+					)
+				} else {
+					slog.Info("pipeline.completion.artifact_stable",
+						"pane_id", paneID,
+						"paths", opts.Artifacts.watchedPaths(),
+						"window", opts.Artifacts.window,
+					)
+					return nil
+				}
+			}
+			if detectErr != nil {
+				idleStreak = 0
+				continue
 			}
 			fresh := true
 			for _, observe := range evidence {
@@ -4246,11 +4281,6 @@ func (e *Executor) waitForIdle(ctx context.Context, paneID string, timeout time.
 					return err
 				}
 				fresh = fresh && ready
-			}
-			state, err := e.detector.Detect(paneID)
-			if err != nil {
-				idleStreak = 0
-				continue
 			}
 			if state.State == status.StateIdle && fresh {
 				idleStreak++
