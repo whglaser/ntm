@@ -659,6 +659,31 @@ func runSSHContext(ctx context.Context, args ...string) (string, error) {
 	return strings.TrimSpace(stdout.String()), nil
 }
 
+// ValidateRemoteDirectoryContext checks the filesystem on this client's SSH
+// target. It does not consult or create a same-named local directory, and it
+// also works before a remote tmux server exists.
+func (c *Client) ValidateRemoteDirectoryContext(ctx context.Context, directory string) error {
+	if c.Remote == "" {
+		return errors.New("remote directory validation requires an SSH target")
+	}
+	if !strings.HasPrefix(directory, "/") {
+		return fmt.Errorf("saved remote working directory must be absolute: %q", directory)
+	}
+	if _, err := SanitizePaneCommand(directory); err != nil {
+		return fmt.Errorf("invalid saved remote working directory: %w", err)
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, DefaultCommandTimeout)
+	defer cancel()
+	command := buildRemoteShellCommand("test", "-d", directory) + " && " + buildRemoteShellCommand("test", "-x", directory)
+	if _, err := runSSHContext(ctx, "--", c.Remote, command); err != nil {
+		return fmt.Errorf("saved working directory %q is unavailable on SSH host %q: %w", directory, c.Remote, err)
+	}
+	return nil
+}
+
 // RunSilent executes a tmux command ignoring output
 func (c *Client) RunSilent(args ...string) error {
 	_, err := c.Run(args...)
@@ -693,25 +718,52 @@ func (c *Client) RunSilentContext(ctx context.Context, args ...string) error {
 type paneMutationGuardContextKey struct{}
 
 type paneMutationGuard struct {
-	target string
-	pid    int
+	target      string
+	pid         int
+	beforeInput func(context.Context) error
 }
 
 // WithPaneMutationGuard fences shared agent delivery helpers without changing
 // their protocols. Composer cleanup, ordinary sends, and verification/rescue
 // keys all retain the same pane process and live-agent requirement. The scope
 // covers pane input only; buffer loading and read-only observation are unchanged.
-func WithPaneMutationGuard(ctx context.Context, target string, expectedPID int) (context.Context, error) {
+// An optional beforeInput check runs immediately before each queued input. A
+// nested guard retains earlier checks and cannot weaken the existing binding.
+func WithPaneMutationGuard(ctx context.Context, target string, expectedPID int, beforeInput ...func(context.Context) error) (context.Context, error) {
 	if err := validatePhysicalPaneTarget(ctx, target); err != nil {
 		return nil, err
 	}
 	if expectedPID <= 0 {
 		return nil, errors.New("guarded pane input requires a positive expected PID")
 	}
-	if existing := paneMutationGuardFromContext(ctx); existing != nil && (existing.target != target || existing.pid != expectedPID) {
-		return nil, errors.New("guarded pane input cannot replace an existing pane binding")
+	if len(beforeInput) > 1 {
+		return nil, errors.New("guarded pane input accepts at most one observation check")
 	}
-	return context.WithValue(ctx, paneMutationGuardContextKey{}, &paneMutationGuard{target: target, pid: expectedPID}), nil
+	var check func(context.Context) error
+	if existing := paneMutationGuardFromContext(ctx); existing != nil {
+		if existing.target != target || existing.pid != expectedPID {
+			return nil, errors.New("guarded pane input cannot replace an existing pane binding")
+		}
+		check = existing.beforeInput
+	}
+	if len(beforeInput) == 1 && beforeInput[0] != nil {
+		next := beforeInput[0]
+		if check == nil {
+			check = next
+		} else {
+			previous := check
+			check = func(ctx context.Context) error {
+				if err := previous(ctx); err != nil {
+					return err
+				}
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				return next(ctx)
+			}
+		}
+	}
+	return context.WithValue(ctx, paneMutationGuardContextKey{}, &paneMutationGuard{target: target, pid: expectedPID, beforeInput: check}), nil
 }
 
 func paneMutationGuardFromContext(ctx context.Context) *paneMutationGuard {
@@ -734,15 +786,6 @@ func (c *Client) IsInstalled() bool {
 	// Check remote
 	err := c.RunSilent("-V")
 	return err == nil
-}
-
-// RespawnPaneContext respawns a pane with cancellation support
-func (c *Client) RespawnPaneContext(ctx context.Context, target string, kill bool) error {
-	args := []string{"respawn-pane", "-t", ExactTarget(target)}
-	if kill {
-		args = append(args, "-k")
-	}
-	return c.RunSilentContext(ctx, args...)
 }
 
 // PreflightRestartShellContext checks the fixed shell used for a two-stage
@@ -843,7 +886,8 @@ func (c *Client) runPaneMutationIfCurrentContext(ctx context.Context, target str
 	if len(args) == 0 {
 		return errors.New("guarded pane mutation requires a command")
 	}
-	if guard := paneMutationGuardFromContext(ctx); guard != nil && isPaneInputCommand(args) {
+	guard := paneMutationGuardFromContext(ctx)
+	if guard != nil && isPaneInputCommand(args) {
 		if target != guard.target || expectedPID != guard.pid || mode == paneMutationShell {
 			return fmt.Errorf("guarded pane input cannot override its agent binding: %w", ErrPaneIdentityChanged)
 		}
@@ -901,6 +945,17 @@ func (c *Client) runPaneMutationIfCurrentContext(ctx context.Context, target str
 	for i, arg := range args {
 		quoted[i] = ShellQuote(arg)
 	}
+	if guard != nil && isPaneInputCommand(args) && guard.beforeInput != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := guard.beforeInput(ctx); err != nil {
+			return err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	out, err := c.RunContext(ctx, "if-shell", "-F", "-t", target, condition,
 		strings.Join(quoted, " "), "display-message -p ntm_pane_identity_changed")
 	if err != nil {
@@ -915,11 +970,6 @@ func (c *Client) runPaneMutationIfCurrentContext(ctx context.Context, target str
 		return fmt.Errorf("pane %s: %w", target, ErrPaneIdentityChanged)
 	}
 	return nil
-}
-
-// RespawnPaneContext respawns a pane with cancellation support (default client)
-func RespawnPaneContext(ctx context.Context, target string, kill bool) error {
-	return DefaultClient.RespawnPaneContext(ctx, target, kill)
 }
 
 // ApplyTiledLayout applies tiled layout to all windows

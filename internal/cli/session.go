@@ -147,7 +147,7 @@ func init() {
 		},
 		REST: &kernel.RESTBinding{
 			Method: "GET",
-			Path:   "/sessions",
+			Path:   "/api/v1/sessions",
 		},
 		Examples: []kernel.Example{
 			{
@@ -165,14 +165,9 @@ func init() {
 		Idempotent:  true,
 	})
 	kernel.MustRegisterHandler("sessions.list", func(ctx context.Context, input any) (any, error) {
-		opts := SessionListInput{}
-		switch value := input.(type) {
-		case SessionListInput:
-			opts = value
-		case *SessionListInput:
-			if value != nil {
-				opts = *value
-			}
+		opts, err := decodeKernelInput[SessionListInput]("sessions.list", input)
+		if err != nil {
+			return nil, err
 		}
 		resp, err := buildSessionListResponse(opts.Tags, opts.Project)
 		if err != nil {
@@ -196,7 +191,7 @@ func init() {
 		},
 		REST: &kernel.RESTBinding{
 			Method: "GET",
-			Path:   "/sessions/{sessionId}/status",
+			Path:   "/api/v1/sessions/{id}/status",
 		},
 		Examples: []kernel.Example{
 			{
@@ -214,14 +209,9 @@ func init() {
 		Idempotent:  true,
 	})
 	kernel.MustRegisterHandler("sessions.status", func(ctx context.Context, input any) (any, error) {
-		opts := SessionStatusInput{}
-		switch value := input.(type) {
-		case SessionStatusInput:
-			opts = value
-		case *SessionStatusInput:
-			if value != nil {
-				opts = *value
-			}
+		opts, err := decodeKernelInput[SessionStatusInput]("sessions.status", input)
+		if err != nil {
+			return nil, err
 		}
 		if strings.TrimSpace(opts.Session) == "" {
 			return nil, fmt.Errorf("session is required")
@@ -255,7 +245,7 @@ func init() {
 		},
 		REST: &kernel.RESTBinding{
 			Method: "POST",
-			Path:   "/sessions/{sessionId}/attach",
+			Path:   "/api/v1/sessions/{id}/attach",
 		},
 		Examples: []kernel.Example{
 			{
@@ -268,14 +258,9 @@ func init() {
 		Idempotent:  false,
 	})
 	kernel.MustRegisterHandler("sessions.attach", func(ctx context.Context, input any) (any, error) {
-		opts := SessionAttachInput{}
-		switch value := input.(type) {
-		case SessionAttachInput:
-			opts = value
-		case *SessionAttachInput:
-			if value != nil {
-				opts = *value
-			}
+		opts, err := decodeKernelInput[SessionAttachInput]("sessions.attach", input)
+		if err != nil {
+			return nil, err
 		}
 		if strings.TrimSpace(opts.Session) == "" {
 			return nil, fmt.Errorf("session is required")
@@ -1915,11 +1900,13 @@ func modelNameForPane(p tmux.Pane) string {
 			if cfg.Models.DefaultCodex != "" {
 				return cfg.Models.DefaultCodex
 			}
-		case tmux.AgentGemini, tmux.AgentAntigravity:
-			// agy (Antigravity) shares Gemini-class models, so it mirrors
-			// Gemini's default model selection.
+		case tmux.AgentGemini:
 			if cfg.Models.DefaultGemini != "" {
 				return cfg.Models.DefaultGemini
+			}
+		case tmux.AgentAntigravity:
+			if cfg.Models.DefaultAntigravity != "" {
+				return cfg.Models.DefaultAntigravity
 			}
 		case tmux.AgentGrok:
 			if cfg.Models.DefaultGrok != "" {
@@ -1952,10 +1939,14 @@ func modelNameForPane(p tmux.Pane) string {
 		return config.ClaudeEstimationModel
 	case tmux.AgentCodex:
 		return defaults.DefaultCodex
-	case tmux.AgentGemini, tmux.AgentAntigravity:
+	case tmux.AgentGemini:
 		return defaults.DefaultGemini
+	case tmux.AgentAntigravity:
+		return defaults.DefaultAntigravity
 	case tmux.AgentGrok:
 		return defaults.DefaultGrok
+	case tmux.AgentOpencode:
+		return defaults.DefaultOpencode
 	case tmux.AgentOmp:
 		return defaults.DefaultOmp
 	case tmux.AgentOllama:

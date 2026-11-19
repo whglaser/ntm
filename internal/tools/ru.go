@@ -112,24 +112,24 @@ func (a *RUAdapter) Info(ctx context.Context) (*ToolInfo, error) {
 	return a.BaseAdapter.Info(ctx, a)
 }
 
-// RU-specific methods
+// Doctor runs ru doctor diagnostics
+func (a *RUAdapter) Doctor(ctx context.Context) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, a.Timeout())
+	defer cancel()
 
-// RUStatus represents the current ru status output
-type RUStatus struct {
-	Repos      []RURepoStatus `json:"repos,omitempty"`
-	TotalRepos int            `json:"total_repos"`
-	NeedsSync  int            `json:"needs_sync"`
-	UpToDate   int            `json:"up_to_date"`
-	HasChanges int            `json:"has_changes"`
-}
+	cmd := exec.CommandContext(ctx, a.BinaryName(), "doctor")
+	cmd.WaitDelay = time.Second
+	stdout := NewLimitedBuffer(10 * 1024 * 1024)
+	var stderr bytes.Buffer
+	cmd.Stdout = stdout
+	cmd.Stderr = &stderr
 
-// RURepoStatus represents the status of a single repo
-type RURepoStatus struct {
-	Name       string `json:"name"`
-	Path       string `json:"path"`
-	Status     string `json:"status"`
-	Branch     string `json:"branch,omitempty"`
-	Ahead      int    `json:"ahead,omitempty"`
-	Behind     int    `json:"behind,omitempty"`
-	HasChanges bool   `json:"has_changes,omitempty"`
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return "", ErrTimeout
+		}
+		return "", fmt.Errorf("ru doctor failed: %w: %s", err, stderr.String())
+	}
+
+	return stdout.String(), nil
 }

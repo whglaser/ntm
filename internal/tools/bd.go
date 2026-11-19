@@ -175,5 +175,3 @@ func (a *BDAdapter) Health(ctx context.Context) (*HealthStatus, error) {
 func (a *BDAdapter) Info(ctx context.Context) (*ToolInfo, error) {
 	return a.BaseAdapter.Info(ctx, a)
 }
-
-// BD-specific methods

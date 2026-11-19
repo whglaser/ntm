@@ -6,9 +6,11 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -18,7 +20,7 @@ import (
 
 func TestLifecycleRelaunchPreservesSavedLaunch(t *testing.T) {
 	for _, verb := range []string{"exit", "kill"} {
-		for _, mode := range []string{"saved", "legacy", "corrupt", "batch-corrupt", "omitted-env", "changed-prompt", "metadata-failure", "shell-replaced", "shell-busy", "lookup-failure", "provider-changed", "service", "dead", "post-provider-changed", "post-service", "post-dead", "delivery-failure"} {
+		for _, mode := range []string{"saved", "shell-wrapper", "legacy", "corrupt", "batch-corrupt", "omitted-env", "changed-prompt", "metadata-failure", "metadata-race", "delivery-race", "enter-race", "shell-replaced", "shell-busy", "lookup-failure", "provider-changed", "service", "dead", "post-provider-changed", "post-service", "post-dead", "delivery-failure"} {
 			t.Run(verb+"/"+mode, func(t *testing.T) {
 				root := t.TempDir()
 				path := filepath.Join(root, "tmux")
@@ -27,11 +29,31 @@ set -eu
 root="$NTM_LIFECYCLE_SPEC_TEST_ROOT"
 mode="$NTM_LIFECYCLE_SPEC_TEST_MODE"
 printf '%s\n' "$1" >> "$root/calls"
+if [ "$1" = if-shell ]; then
+  [ "$2" = '-F' ] && [ "$4" = '%7' ] || exit 64
+  case "$5" in
+    *"#{==:#{pane_pid},$NTM_LIFECYCLE_SPEC_TEST_SHELL_PID}"*) ;;
+    *) exit 65 ;;
+  esac
+  eval "set -- $6"
+  printf '%s\n' "$1" >> "$root/calls"
+  case "$1" in
+    set-option)
+      if [ "$mode" = metadata-race ]; then printf 'ntm_pane_identity_changed\n'; exit 0; fi
+      ;;
+    send-keys)
+      if [ "$4" = C-c ] && [ -f "$root/exited" ]; then printf 'ntm_pane_identity_changed\n'; exit 0; fi
+      if [ "$4" = '-l' ] && [ "$mode" = delivery-race ]; then printf 'ntm_pane_identity_changed\n'; exit 0; fi
+      if [ "$4" = Enter ] && [ "$mode" = enter-race ]; then printf 'ntm_pane_identity_changed\n'; exit 0; fi
+      ;;
+    *) exit 66 ;;
+  esac
+fi
 case "$1" in
   has-session) ;;
   list-panes)
     command=claude
-    pid=2000000001
+    pid="$NTM_LIFECYCLE_SPEC_TEST_SHELL_PID"
     agent=cc
     service=''
     dead=0
@@ -49,13 +71,14 @@ case "$1" in
     fi
     if [ -f "$root/launched" ]; then
       command=claude
+      if [ "$mode" = shell-wrapper ]; then command=sh; fi
       if [ "$mode" = post-provider-changed ]; then agent=cod; fi
       if [ "$mode" = post-service ]; then agent=''; service=cass; fi
       if [ "$mode" = post-dead ]; then dead=1; fi
     fi
     printf '%%7_NTM_SEP_1_NTM_SEP_session__cc_1_NTM_SEP_%s_NTM_SEP_80_NTM_SEP_24_NTM_SEP_1_NTM_SEP_%s_NTM_SEP_0_NTM_SEP_%s_NTM_SEP__NTM_SEP_%s_NTM_SEP_%s\n' "$command" "$pid" "$agent" "$service" "$dead"
     if [ "$mode" = batch-corrupt ]; then
-      printf '%%8_NTM_SEP_2_NTM_SEP_session__cc_2_NTM_SEP_claude_NTM_SEP_80_NTM_SEP_24_NTM_SEP_0_NTM_SEP_2000000002_NTM_SEP_0_NTM_SEP_cc_NTM_SEP__NTM_SEP__NTM_SEP_0\n'
+      printf '%%8_NTM_SEP_2_NTM_SEP_session__cc_2_NTM_SEP_claude_NTM_SEP_80_NTM_SEP_24_NTM_SEP_0_NTM_SEP_%s_NTM_SEP_0_NTM_SEP_cc_NTM_SEP__NTM_SEP__NTM_SEP_0\n' "$NTM_LIFECYCLE_SPEC_TEST_SHELL_PID"
     fi
     ;;
   show-options)
@@ -66,7 +89,9 @@ case "$1" in
     cat "$root/original"
     ;;
   display-message)
-    [ "$4" = '%7' ] && [ "$5" = '[#{pane_current_path}]' ] || exit 53
+    [ "$4" = '%7' ] || exit 53
+    if [ "$5" = '[#{@ntm_agent_type}]' ]; then printf '[cc]\n'; exit 0; fi
+    [ "$5" = '[#{pane_current_path}]' ] || exit 53
     printf '[%s]\n' "$root"
     ;;
   set-option)
@@ -80,6 +105,13 @@ case "$1" in
     case "${4:-}" in
       C-c)
         [ -f "$root/preflighted" ] || exit 58
+        kill -INT "$NTM_LIFECYCLE_SPEC_TEST_AGENT_PID"
+        tries=0
+        while kill -0 "$NTM_LIFECYCLE_SPEC_TEST_AGENT_PID" 2>/dev/null; do
+          tries=$((tries + 1))
+          [ "$tries" -lt 200 ] || exit 67
+          sleep 0.01
+        done
         : > "$root/exited"
         ;;
       -l)
@@ -90,6 +122,12 @@ case "$1" in
       Enter)
         [ -f "$root/delivered" ] || exit 61
         : > "$root/launched"
+        tries=0
+        while [ ! -s "$root/next-agent-ready" ]; do
+          tries=$((tries + 1))
+          [ "$tries" -lt 200 ] || exit 68
+          sleep 0.01
+        done
         ;;
       *) exit 62 ;;
     esac
@@ -121,6 +159,13 @@ func TestLifecycleLaunchSpecTransportHelper(t *testing.T) {
 		return
 	}
 	mode, verb := os.Getenv("NTM_LIFECYCLE_SPEC_TEST_MODE"), os.Getenv("NTM_LIFECYCLE_SPEC_TEST_VERB")
+	fixture := startLifecycleShellProcess(t, root, "single", true)
+	t.Setenv("NTM_LIFECYCLE_SPEC_TEST_SHELL_PID", strconv.Itoa(fixture.PID))
+	t.Setenv("NTM_LIFECYCLE_SPEC_TEST_AGENT_PID", strconv.Itoa(fixture.AgentPID))
+	modelLifecycleForeground(t, root, "spec-"+mode, fixture.PID)
+	afterLifecycleFile(t, filepath.Join(root, "launched"), func() {
+		_, _ = fmt.Fprintln(fixture.input, lifecycleAgentCommand(filepath.Join(root, "next-agent-ready"), "still-running"))
+	})
 	if err := os.WriteFile(filepath.Join(root, "config.toml"), []byte("[agents]\nclaude = \"claude --model CURRENT_WRONG\"\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -134,6 +179,9 @@ func TestLifecycleLaunchSpecTransportHelper(t *testing.T) {
 		Version: tmux.AgentLaunchSpecVersion, AgentType: tmux.AgentClaude,
 		Command: "claude --model 'ORIGINAL_PIN' --effort high --custom 'private fixture argument' --append-system-prompt-file " + tmux.ShellQuote(promptPath),
 		Model:   "ORIGINAL_PIN", Persona: "architect", ReasoningEffort: "high", SystemPromptFile: promptPath, SystemPromptSHA256: hex.EncodeToString(digest[:]),
+	}
+	if mode == "shell-wrapper" {
+		saved.Command = "sh -c " + tmux.ShellQuote(saved.Command)
 	}
 	if mode == "omitted-env" {
 		saved.OmittedEnv = []string{"PRIVATE_TOKEN"}
@@ -194,9 +242,15 @@ func TestLifecycleLaunchSpecTransportHelper(t *testing.T) {
 		}
 		return
 	}
-	if mode == "metadata-failure" || mode == "shell-replaced" || mode == "shell-busy" || mode == "lookup-failure" || mode == "provider-changed" || mode == "service" || mode == "dead" {
+	if mode == "metadata-failure" || mode == "metadata-race" || mode == "shell-replaced" || mode == "shell-busy" || mode == "lookup-failure" || mode == "provider-changed" || mode == "service" || mode == "dead" {
 		if success || len(recorded) != 0 || len(delivered) != 0 {
 			t.Fatalf("unverified shell or failed metadata permitted relaunch: success=%t results=%+v calls=%s", success, results, calls)
+		}
+		return
+	}
+	if mode == "delivery-race" {
+		if success || len(recorded) == 0 || len(delivered) != 0 || len(results) != 1 || results[0].Relaunched {
+			t.Fatalf("replaced shell received launch text: success=%t results=%+v calls=%s", success, results, calls)
 		}
 		return
 	}
@@ -225,7 +279,7 @@ func TestLifecycleLaunchSpecTransportHelper(t *testing.T) {
 	} else if record.Spec.Command != saved.Command || record.Spec.SystemPromptSHA256 != saved.SystemPromptSHA256 || record.Spec.Persona != saved.Persona || !strings.Contains(string(delivered), saved.Command) || strings.Contains(string(delivered), "CURRENT_WRONG") {
 		t.Fatal("relaunch lost the saved command, prepared persona, or model pin")
 	}
-	if mode == "delivery-failure" || strings.HasPrefix(mode, "post-") {
+	if mode == "delivery-failure" || mode == "enter-race" || strings.HasPrefix(mode, "post-") {
 		if success || len(results) != 1 || results[0].Relaunched || strings.Contains(results[0].Detail, "private fixture argument") {
 			t.Fatalf("failed delivery lost failure evidence or exposed command arguments: success=%t results=%+v", success, results)
 		}

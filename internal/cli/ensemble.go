@@ -223,15 +223,16 @@ type ensembleStopOptions struct {
 }
 
 type ensembleStopOutput struct {
-	GeneratedAt time.Time `json:"generated_at" yaml:"generated_at"`
-	Session     string    `json:"session" yaml:"session"`
-	Success     bool      `json:"success" yaml:"success"`
-	Message     string    `json:"message,omitempty" yaml:"message,omitempty"`
-	Captured    int       `json:"captured,omitempty" yaml:"captured,omitempty"`
-	Stopped     int       `json:"stopped" yaml:"stopped"`
-	Errors      int       `json:"errors,omitempty" yaml:"errors,omitempty"`
-	FinalStatus string    `json:"final_status" yaml:"final_status"`
-	Error       string    `json:"error,omitempty" yaml:"error,omitempty"`
+	GeneratedAt      time.Time `json:"generated_at" yaml:"generated_at"`
+	Session          string    `json:"session" yaml:"session"`
+	Success          bool      `json:"success" yaml:"success"`
+	Message          string    `json:"message,omitempty" yaml:"message,omitempty"`
+	Captured         int       `json:"captured,omitempty" yaml:"captured,omitempty"`
+	SavedOutputPaths []string  `json:"saved_output_paths,omitempty" yaml:"saved_output_paths,omitempty"`
+	Stopped          int       `json:"stopped" yaml:"stopped"`
+	Errors           int       `json:"errors,omitempty" yaml:"errors,omitempty"`
+	FinalStatus      string    `json:"final_status" yaml:"final_status"`
+	Error            string    `json:"error,omitempty" yaml:"error,omitempty"`
 }
 
 func newEnsembleStopCmd() *cobra.Command {
@@ -245,12 +246,12 @@ func newEnsembleStopCmd() *cobra.Command {
 		Long: `Stop all agents in an ensemble run and save partial state.
 
 Behavior:
-  1. Signal all ensemble agents to stop (SIGTERM)
-  2. Wait for graceful shutdown (5s timeout)
-  3. Force kill remaining agents
-  4. Collect any partial outputs available
+  1. Save available agent output before interrupting work
+  2. Send each agent its interrupt key
+  3. Wait for graceful shutdown (5s timeout) and save final output
+  4. Terminate the tmux session only after output is saved
   5. Update ensemble state to 'stopped'
-  6. Show summary of what was captured
+  6. Show the capture summary (JSON/YAML includes saved_output_paths)
 
 Flags:
   --force        Skip graceful shutdown, force kill immediately
@@ -315,8 +316,8 @@ func runEnsembleStop(w io.Writer, session string, opts ensembleStopOptions) erro
 		return fmt.Errorf("load session: %w", err)
 	}
 
-	// Check if already stopped
-	if state.Status.IsTerminal() {
+	// A terminal record can still have live agents after an interrupted spawn.
+	if state.Status.IsTerminal() && !sessionLive {
 		result := ensembleStopOutput{
 			GeneratedAt: output.Timestamp(),
 			Session:     session,
@@ -370,28 +371,31 @@ func runEnsembleStop(w io.Writer, session string, opts ensembleStopOptions) erro
 	}
 
 	var captured int
-	var collectErrors []error
+	var savedOutputPaths []string
 
-	// Collect partial outputs if requested
+	// Capture is a precondition for a destructive stop. Otherwise a failed
+	// snapshot would silently destroy the only remaining partial output.
 	if !opts.NoCollect {
 		capture := ensemble.NewOutputCapture(tmux.DefaultClient)
-		capturedOutputs, err := capture.CaptureAll(state)
+		capturedOutputs, err := capture.CaptureAndSave(state)
 		if err != nil {
-			slog.Default().Warn("failed to capture partial outputs", "error", err)
-			collectErrors = append(collectErrors, err)
-		} else {
-			captured = len(capturedOutputs)
-			slog.Default().Info("captured partial outputs",
-				"session", session,
-				"count", captured,
-			)
+			return fmt.Errorf("capture partial ensemble outputs before stopping %q: %w", session, err)
 		}
+		captured = len(capturedOutputs)
+		for _, capturedOutput := range capturedOutputs {
+			savedOutputPaths = append(savedOutputPaths, capturedOutput.OutputPath)
+		}
+		slog.Default().Info("captured partial outputs",
+			"session", session,
+			"count", captured,
+		)
 	}
 
-	// Get all panes for the session
+	// A failed pane query is not evidence of zero panes. Do not send
+	// interrupts or kill a session when its targets cannot be observed.
 	panes, err := tmux.GetPanes(session)
 	if err != nil {
-		slog.Default().Warn("failed to get panes", "error", err)
+		return fmt.Errorf("inspect ensemble panes before stopping %q: %w", session, err)
 	}
 
 	stoppedCount := 0
@@ -412,18 +416,36 @@ func runEnsembleStop(w io.Writer, session string, opts ensembleStopOptions) erro
 
 		// Wait for graceful shutdown
 		time.Sleep(5 * time.Second)
+
+		if !opts.NoCollect {
+			capture := ensemble.NewOutputCapture(tmux.DefaultClient)
+			capturedOutputs, err := capture.CaptureAndSave(state)
+			if err != nil {
+				return fmt.Errorf("save final ensemble outputs before stopping %q: %w", session, err)
+			}
+			captured = len(capturedOutputs)
+			for _, capturedOutput := range capturedOutputs {
+				savedOutputPaths = append(savedOutputPaths, capturedOutput.OutputPath)
+			}
+		}
 	}
 
-	// Kill the session (force or after graceful timeout)
+	// Kill must succeed before the durable state can say "stopped".
+	// A failed kill leaves the original status for retry/reconciliation.
 	if err := tmux.KillSession(session); err != nil {
-		slog.Default().Warn("failed to kill session", "session", session, "error", err)
-		stopErrors = append(stopErrors, err)
-	} else {
-		stoppedCount = len(panes)
-		slog.Default().Info("killed session", "session", session, "panes", stoppedCount)
+		return fmt.Errorf("kill ensemble session %q: %w", session, err)
 	}
+	stoppedCount = len(panes)
+	slog.Default().Info("killed session", "session", session, "panes", stoppedCount)
 
-	// Update ensemble state to stopped
+	// Stopped agents cannot finish pending work. Preserve valid completed
+	// outputs, and make unfinished assignments explicit for recovery.
+	for i := range state.Assignments {
+		if !state.Assignments[i].Status.IsTerminal() {
+			state.Assignments[i].Status = ensemble.AssignmentError
+			state.Assignments[i].Error = "ensemble stopped before a valid mode output was collected"
+		}
+	}
 	state.Status = ensemble.EnsembleStopped
 	if err := ensemble.SaveSession(session, state); err != nil {
 		slog.Default().Warn("failed to save stopped state", "error", err)
@@ -432,13 +454,14 @@ func runEnsembleStop(w io.Writer, session string, opts ensembleStopOptions) erro
 
 	// Build result
 	result := ensembleStopOutput{
-		GeneratedAt: output.Timestamp(),
-		Session:     session,
-		Success:     len(stopErrors) == 0,
-		Captured:    captured,
-		Stopped:     stoppedCount,
-		Errors:      len(stopErrors) + len(collectErrors),
-		FinalStatus: ensemble.EnsembleStopped.String(),
+		GeneratedAt:      output.Timestamp(),
+		Session:          session,
+		Success:          len(stopErrors) == 0,
+		Captured:         captured,
+		SavedOutputPaths: savedOutputPaths,
+		Stopped:          stoppedCount,
+		Errors:           len(stopErrors),
+		FinalStatus:      ensemble.EnsembleStopped.String(),
 	}
 
 	if len(stopErrors) > 0 {
@@ -456,7 +479,7 @@ func runEnsembleStop(w io.Writer, session string, opts ensembleStopOptions) erro
 		"session", session,
 		"stopped", stoppedCount,
 		"captured", captured,
-		"errors", len(stopErrors)+len(collectErrors),
+		"errors", len(stopErrors),
 	)
 
 	if !result.Success {
@@ -729,7 +752,7 @@ func resolveEnsembleBudget(state *ensemble.EnsembleSession) (string, ensemble.Bu
 
 	registry, err := ensemble.GlobalEnsembleRegistry()
 	if err != nil || registry == nil {
-		return name, budget
+		return name, state.EffectiveBudget(budget)
 	}
 
 	if preset := registry.Get(state.PresetUsed); preset != nil {
@@ -740,7 +763,7 @@ func resolveEnsembleBudget(state *ensemble.EnsembleSession) (string, ensemble.Bu
 		budget = mergeBudgetDefaults(preset.Budget, budget)
 	}
 
-	return name, budget
+	return name, state.EffectiveBudget(budget)
 }
 
 func mergeBudgetDefaults(current, defaults ensemble.BudgetConfig) ensemble.BudgetConfig {
@@ -901,17 +924,30 @@ func renderEnsembleStatus(w io.Writer, payload ensembleStatusOutput, format stri
 }
 
 type synthesizeOptions struct {
-	Strategy string
-	Output   string
-	Format   string
-	Force    bool
-	Verbose  bool
-	Explain  bool
-	Stream   bool
-	RunID    string
-	Resume   bool
-	UseCache bool
-	NoCache  bool
+	Strategy              string
+	Output                string
+	Format                string
+	Force                 bool
+	Verbose               bool
+	Explain               bool
+	ExplainSet            bool
+	Stream                bool
+	RunID                 string
+	Resume                bool
+	UseCache              bool
+	NoCache               bool
+	MinConfidence         float64
+	MinConfidenceSet      bool
+	MaxFindings           int
+	MaxFindingsSet        bool
+	IncludeRawOutputs     bool
+	IncludeRawOutputsSet  bool
+	ConflictResolution    string
+	ConflictResolutionSet bool
+	BudgetSynthesis       int
+	BudgetSynthesisSet    bool
+	BudgetContextPack     int
+	BudgetContextPackSet  bool
 }
 
 func newEnsembleSynthesizeCmd() *cobra.Command {
@@ -940,6 +976,14 @@ Streaming:
 Use --force to synthesize even if some agents haven't completed.`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			opts.MinConfidenceSet = cmd.Flags().Changed("min-confidence")
+			opts.MaxFindingsSet = cmd.Flags().Changed("max-findings")
+			opts.IncludeRawOutputsSet = cmd.Flags().Changed("include-raw-outputs")
+			opts.ExplainSet = cmd.Flags().Changed("explain")
+			opts.ConflictResolutionSet = cmd.Flags().Changed("conflict-resolution")
+			opts.BudgetSynthesisSet = cmd.Flags().Changed("budget-synthesis")
+			opts.BudgetContextPackSet = cmd.Flags().Changed("budget-context-pack")
+
 			if err := validateSynthesizeOptions(opts); err != nil {
 				return err
 			}
@@ -968,6 +1012,12 @@ Use --force to synthesize even if some agents haven't completed.`,
 	}
 
 	cmd.Flags().StringVar(&opts.Strategy, "strategy", "", "Override synthesis strategy")
+	cmd.Flags().Float64Var(&opts.MinConfidence, "min-confidence", 0, "Override minimum confidence threshold [0.0-1.0]")
+	cmd.Flags().IntVar(&opts.MaxFindings, "max-findings", 0, "Override maximum synthesized findings")
+	cmd.Flags().BoolVar(&opts.IncludeRawOutputs, "include-raw-outputs", false, "Include raw mode outputs in synthesized output")
+	cmd.Flags().StringVar(&opts.ConflictResolution, "conflict-resolution", "", "Override conflict resolution policy (highlight, consensus, confidence, drop)")
+	cmd.Flags().IntVar(&opts.BudgetSynthesis, "budget-synthesis", 0, "Override synthesis token budget")
+	cmd.Flags().IntVar(&opts.BudgetContextPack, "budget-context-pack", 0, "Override context pack token budget")
 	cmd.Flags().StringVarP(&opts.Output, "output", "o", "", "Output file path (default: stdout)")
 	cmd.Flags().StringVarP(&opts.Format, "format", "f", "markdown", "Output format: markdown, json, yaml")
 	cmd.Flags().BoolVar(&opts.Force, "force", false, "Synthesize even if some agents incomplete")
@@ -993,11 +1043,23 @@ func validateSynthesizeOptions(opts synthesizeOptions) error {
 	if !opts.Stream && runID != "" {
 		return fmt.Errorf("--run-id requires --stream")
 	}
+	if (opts.MinConfidenceSet || opts.MinConfidence != 0) && (opts.MinConfidence < 0 || opts.MinConfidence > 1) {
+		return fmt.Errorf("--min-confidence must be between 0.0 and 1.0")
+	}
+	if opts.MaxFindings < 0 {
+		return fmt.Errorf("--max-findings must be non-negative")
+	}
+	if opts.BudgetSynthesis < 0 || opts.BudgetContextPack < 0 {
+		return fmt.Errorf("budget overrides must be non-negative")
+	}
 	return nil
 }
 
 func runEnsembleSynthesize(ctx context.Context, w io.Writer, session string, opts synthesizeOptions) error {
 	if err := validateSynthesizeOptions(opts); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 
@@ -1012,7 +1074,29 @@ func runEnsembleSynthesize(ctx context.Context, w io.Writer, session string, opt
 		return fmt.Errorf("load session: %w", err)
 	}
 
-	// Check if agents are ready
+	// Reconcile finished live agents before inspecting their durable status.
+	// Spawn leaves assignments active until a validated, idle response is saved.
+	var captured []ensemble.CapturedOutput
+	var refreshFailure error
+	if sessionLive {
+		captured, err = ensemble.NewOutputCapture(tmux.DefaultClient).CaptureForSynthesis(ctx, state)
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return fmt.Errorf("refresh ensemble outputs: %w", ctxErr)
+			}
+			if !opts.Force || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return fmt.Errorf("refresh ensemble outputs: %w", err)
+			}
+			// Force may recover durable completed work, but a failed capture
+			// cannot authorize using partial output or repurposing a live pane.
+			refreshFailure = err
+			captured = nil
+			slog.Warn("ensemble live output refresh failed; forcing mechanical synthesis from saved outputs",
+				"session", session, "error", err)
+		}
+	}
+
+	// Check if agents are ready.
 	ready, pending, working := countAgentStates(state)
 	if !opts.Force && (pending > 0 || working > 0) {
 		return fmt.Errorf("synthesis not ready: %d pending, %d working (use --force to override)", pending, working)
@@ -1039,13 +1123,26 @@ func runEnsembleSynthesize(ctx context.Context, w io.Writer, session string, opt
 		"force", opts.Force,
 	)
 
+	ensCfg := config.Default().Ensemble
+	if cfg != nil {
+		ensCfg = cfg.Ensemble
+	}
+	budgetCfg := state.EffectiveBudget(ensemble.BudgetConfigFromTOML(ensemble.DefaultBudgetConfig(), ensCfg.Budget))
+	if opts.BudgetSynthesisSet || opts.BudgetSynthesis > 0 {
+		budgetCfg.SynthesisReserveTokens = opts.BudgetSynthesis
+	}
+	if opts.BudgetContextPackSet || opts.BudgetContextPack > 0 {
+		budgetCfg.ContextReserveTokens = opts.BudgetContextPack
+	}
+
 	collector := ensemble.NewOutputCollector(ensemble.DefaultOutputCollectorConfig())
 
-	cacheEnabled := sessionLive && opts.UseCache && !opts.NoCache
+	cacheEnabled := sessionLive && refreshFailure == nil && opts.UseCache && !opts.NoCache
 	collectedModes := make(map[string]bool)
 	cacheFingerprints := make(map[string]ensemble.ModeOutputFingerprint)
 	var outputCache *ensemble.ModeOutputCache
 	var cacheContextHash string
+	var synthContextPack *ensemble.ContextPack
 
 	if cacheEnabled {
 		projectDir, projErr := resolveEnsembleProjectDirForSessionForOutput(ctx, session, format == "json")
@@ -1070,11 +1167,16 @@ func runEnsembleSynthesize(ctx context.Context, w io.Writer, session string, opt
 					cacheEnabled = false
 				} else {
 					generator := ensemble.NewContextPackGenerator(projectDir, nil, logger)
-					pack, packErr := generator.Generate(state.Question, "", ensemble.CacheConfig{Enabled: false})
+					generator.MaxTokens = budgetCfg.ContextReserveTokens
+					pack, packErr := generator.Generate(ctx, state.Question, "", ensemble.CacheConfig{Enabled: false})
 					if packErr != nil {
 						logger.Warn("context pack generation failed for cache", "error", packErr)
 						cacheEnabled = false
 					} else if pack != nil {
+						if budgetCfg.ContextReserveTokens > 0 {
+							pack = ensemble.CapContextPackTokens(pack, budgetCfg.ContextReserveTokens)
+						}
+						synthContextPack = pack
 						cacheContextHash = pack.Hash
 					}
 
@@ -1124,21 +1226,6 @@ func runEnsembleSynthesize(ctx context.Context, w io.Writer, session string, opt
 		}
 	}
 
-	// Collect outputs from panes for cache misses when the session is still live.
-	var captured []ensemble.CapturedOutput
-	if sessionLive && len(collectedModes) < len(state.Assignments) {
-		capture := ensemble.NewOutputCapture(tmux.DefaultClient)
-		var err error
-		captured, err = capture.CaptureAll(state)
-		if err != nil {
-			if len(collectedModes) == 0 {
-				logger.Warn("capture outputs failed; falling back to saved outputs", "error", err)
-			} else {
-				logger.Warn("capture outputs failed; continuing with cached outputs", "error", err)
-			}
-		}
-	}
-
 	availableOutputs, err := ensemble.CollectModeOutputs(state, captured)
 	if err != nil {
 		return fmt.Errorf("collect outputs: %w", err)
@@ -1184,18 +1271,41 @@ func runEnsembleSynthesize(ctx context.Context, w io.Writer, session string, opt
 		"errors", collector.ErrorCount(),
 	)
 
-	// Determine synthesis strategy
-	strategy := state.SynthesisStrategy
-	if opts.Strategy != "" {
-		strategy = ensemble.SynthesisStrategy(opts.Strategy)
-	}
-
-	// Build synthesis config
-	synthConfig := ensemble.SynthesisConfig{
-		Strategy:           strategy,
+	// Build synthesis config seeded from TOML [ensemble.synthesis] + [ensemble.budget]
+	baseSynth := ensemble.SynthesisConfig{
+		Strategy:           state.SynthesisStrategy,
 		MaxFindings:        20,
 		MinConfidence:      0.3,
 		IncludeExplanation: opts.Explain,
+	}
+	synthConfig := state.EffectiveSynthesis(ensemble.SynthesisConfigFromTOML(baseSynth, ensCfg.Synthesis))
+	if state.SynthesisStrategy != "" && strings.TrimSpace(opts.Strategy) == "" {
+		synthConfig.Strategy = state.SynthesisStrategy
+	}
+	if strings.TrimSpace(opts.Strategy) != "" {
+		synthConfig.Strategy = ensemble.SynthesisStrategy(strings.TrimSpace(opts.Strategy))
+	}
+	if opts.MinConfidenceSet || opts.MinConfidence > 0 {
+		synthConfig.MinConfidence = ensemble.Confidence(opts.MinConfidence)
+	}
+	if opts.MaxFindingsSet || opts.MaxFindings > 0 {
+		synthConfig.MaxFindings = opts.MaxFindings
+	}
+	if opts.IncludeRawOutputsSet {
+		synthConfig.IncludeRawOutputs = opts.IncludeRawOutputs
+	} else if opts.IncludeRawOutputs {
+		synthConfig.IncludeRawOutputs = true
+	}
+	if opts.ConflictResolutionSet || strings.TrimSpace(opts.ConflictResolution) != "" {
+		synthConfig.ConflictResolution = strings.TrimSpace(opts.ConflictResolution)
+	}
+	if opts.BudgetSynthesisSet || opts.BudgetSynthesis > 0 {
+		synthConfig.MaxSynthesisTokens = budgetCfg.SynthesisReserveTokens
+	} else if state.Synthesis == nil && synthConfig.MaxSynthesisTokens <= 0 && budgetCfg.SynthesisReserveTokens > 0 {
+		synthConfig.MaxSynthesisTokens = budgetCfg.SynthesisReserveTokens
+	}
+	if opts.ExplainSet || opts.Explain {
+		synthConfig.IncludeExplanation = opts.Explain
 	}
 
 	// Create synthesizer
@@ -1203,9 +1313,15 @@ func runEnsembleSynthesize(ctx context.Context, w io.Writer, session string, opt
 	if err != nil {
 		return fmt.Errorf("create synthesizer: %w", err)
 	}
+	if sessionLive && refreshFailure == nil {
+		manager := ensemble.NewEnsembleManager()
+		if err := manager.ConfigureSessionSynthesis(ctx, state, synth, budgetCfg.TimeoutPerMode); err != nil {
+			return fmt.Errorf("configure lead synthesis: %w", err)
+		}
+	}
 
 	// Build synthesis input
-	input, err := collector.BuildSynthesisInput(state.Question, nil, synthConfig)
+	input, err := collector.BuildSynthesisInput(state.Question, synthContextPack, synthConfig)
 	if err != nil {
 		return fmt.Errorf("build synthesis input: %w", err)
 	}
@@ -1215,9 +1331,12 @@ func runEnsembleSynthesize(ctx context.Context, w io.Writer, session string, opt
 	}
 
 	// Run synthesis
-	result, err := synth.Synthesize(input)
+	result, err := synth.SynthesizeContext(ctx, input)
 	if err != nil {
 		return fmt.Errorf("synthesis failed: %w", err)
+	}
+	if refreshFailure != nil {
+		result.FallbackReason = fmt.Sprintf("live output refresh failed; used validated saved outputs for mechanical synthesis: %v", refreshFailure)
 	}
 
 	slog.Default().Info("ensemble synthesis completed",
@@ -1239,8 +1358,9 @@ func runEnsembleSynthesize(ctx context.Context, w io.Writer, session string, opt
 
 	formatter := ensemble.NewSynthesisFormatter(outputFormat)
 	formatter.Verbose = opts.Verbose
+	formatter.IncludeRaw = synthConfig.IncludeRawOutputs
 	formatter.IncludeAudit = true
-	formatter.IncludeExplanation = opts.Explain
+	formatter.IncludeExplanation = synthConfig.IncludeExplanation
 
 	// Determine output destination
 	out := io.Writer(w)
@@ -1990,7 +2110,14 @@ func buildExportFindings(ctx *exportFindingsContext) ([]exportFinding, error) {
 		var chain *ensemble.ProvenanceChain
 		if mf.ProvenanceID != "" {
 			if c, ok := tracker.GetChain(mf.ProvenanceID); ok {
-				chain = c
+				if err := c.Validate(); err != nil {
+					slog.Default().Warn("skipping invalid provenance chain during export",
+						"finding_id", mf.ProvenanceID,
+						"error", err,
+					)
+				} else {
+					chain = c
+				}
 			}
 		}
 		results = append(results, exportFinding{
@@ -2360,12 +2487,15 @@ type provenanceOptions struct {
 }
 
 type provenanceOutput struct {
-	GeneratedAt time.Time                   `json:"generated_at" yaml:"generated_at"`
-	FindingID   string                      `json:"finding_id,omitempty" yaml:"finding_id,omitempty"`
-	Chain       *ensemble.ProvenanceChain   `json:"chain,omitempty" yaml:"chain,omitempty"`
-	Stats       *ensemble.ProvenanceStats   `json:"stats,omitempty" yaml:"stats,omitempty"`
-	Chains      []*ensemble.ProvenanceChain `json:"chains,omitempty" yaml:"chains,omitempty"`
-	Error       string                      `json:"error,omitempty" yaml:"error,omitempty"`
+	GeneratedAt      time.Time                   `json:"generated_at" yaml:"generated_at"`
+	FindingID        string                      `json:"finding_id,omitempty" yaml:"finding_id,omitempty"`
+	Valid            *bool                       `json:"valid,omitempty" yaml:"valid,omitempty"`
+	InvalidCount     int                         `json:"invalid_count,omitempty" yaml:"invalid_count,omitempty"`
+	ValidationErrors []string                    `json:"validation_errors,omitempty" yaml:"validation_errors,omitempty"`
+	Chain            *ensemble.ProvenanceChain   `json:"chain,omitempty" yaml:"chain,omitempty"`
+	Stats            *ensemble.ProvenanceStats   `json:"stats,omitempty" yaml:"stats,omitempty"`
+	Chains           []*ensemble.ProvenanceChain `json:"chains,omitempty" yaml:"chains,omitempty"`
+	Error            string                      `json:"error,omitempty" yaml:"error,omitempty"`
 }
 
 func newEnsembleProvenanceCmd() *cobra.Command {
@@ -2634,18 +2764,24 @@ func runEnsembleProvenance(w io.Writer, session, findingID string, opts provenan
 	// Handle stats mode
 	if opts.Stats {
 		stats := tracker.Stats()
+		invalidCount, valErrs := validateProvenanceChains(tracker.ListChains())
 		return renderProvenanceOutput(w, provenanceOutput{
-			GeneratedAt: output.Timestamp(),
-			Stats:       &stats,
+			GeneratedAt:      output.Timestamp(),
+			InvalidCount:     invalidCount,
+			ValidationErrors: valErrs,
+			Stats:            &stats,
 		}, format)
 	}
 
 	// Handle all mode
 	if opts.All {
 		chains := tracker.ListChains()
+		invalidCount, valErrs := validateProvenanceChains(chains)
 		return renderProvenanceOutput(w, provenanceOutput{
-			GeneratedAt: output.Timestamp(),
-			Chains:      chains,
+			GeneratedAt:      output.Timestamp(),
+			InvalidCount:     invalidCount,
+			ValidationErrors: valErrs,
+			Chains:           chains,
 		}, format)
 	}
 
@@ -2675,11 +2811,41 @@ func runEnsembleProvenance(w io.Writer, session, findingID string, opts provenan
 		}, format)
 	}
 
+	valid := true
+	var valErrs []string
+	if valErr := chain.Validate(); valErr != nil {
+		valid = false
+		valErrs = []string{valErr.Error()}
+	}
+
 	return renderProvenanceOutput(w, provenanceOutput{
-		GeneratedAt: output.Timestamp(),
-		FindingID:   findingID,
-		Chain:       chain,
+		GeneratedAt:      output.Timestamp(),
+		FindingID:        findingID,
+		Valid:            &valid,
+		ValidationErrors: valErrs,
+		Chain:            chain,
 	}, format)
+}
+
+func validateProvenanceChains(chains []*ensemble.ProvenanceChain) (int, []string) {
+	invalid := 0
+	var errs []string
+	for _, c := range chains {
+		if c == nil {
+			invalid++
+			errs = append(errs, "nil provenance chain")
+			continue
+		}
+		if err := c.Validate(); err != nil {
+			invalid++
+			id := c.FindingID
+			if id == "" {
+				id = "<missing-id>"
+			}
+			errs = append(errs, fmt.Sprintf("%s: %v", id, err))
+		}
+	}
+	return invalid, errs
 }
 
 func renderProvenanceOutput(w io.Writer, payload provenanceOutput, format string) error {
@@ -2720,6 +2886,12 @@ func renderProvenanceOutput(w io.Writer, payload provenanceOutput, format string
 					fmt.Fprintf(w, "  %-20s %d\n", mode, count)
 				}
 			}
+			if payload.InvalidCount > 0 {
+				fmt.Fprintf(w, "\nInvalid Chains:   %d\n", payload.InvalidCount)
+				for _, verr := range payload.ValidationErrors {
+					fmt.Fprintf(w, "  - %s\n", verr)
+				}
+			}
 			return nil
 		}
 
@@ -2742,11 +2914,20 @@ func renderProvenanceOutput(w io.Writer, payload provenanceOutput, format string
 				)
 			}
 			table.Render()
+			if payload.InvalidCount > 0 {
+				fmt.Fprintf(w, "\nValidation Warnings (%d):\n", payload.InvalidCount)
+				for _, verr := range payload.ValidationErrors {
+					fmt.Fprintf(w, "  - %s\n", verr)
+				}
+			}
 			return nil
 		}
 
 		if payload.Chain != nil {
 			fmt.Fprint(w, ensemble.FormatProvenance(payload.Chain))
+			if payload.Valid != nil && !*payload.Valid {
+				fmt.Fprintf(w, "\nValidation: INVALID (%s)\n", strings.Join(payload.ValidationErrors, "; "))
+			}
 			return nil
 		}
 
@@ -2766,14 +2947,25 @@ type checkpointListOutput struct {
 }
 
 type checkpointResumeOutput struct {
-	GeneratedAt time.Time `json:"generated_at" yaml:"generated_at"`
-	RunID       string    `json:"run_id" yaml:"run_id"`
-	Session     string    `json:"session" yaml:"session"`
-	Success     bool      `json:"success" yaml:"success"`
-	Message     string    `json:"message,omitempty" yaml:"message,omitempty"`
-	Resumed     int       `json:"resumed,omitempty" yaml:"resumed,omitempty"`
-	Skipped     int       `json:"skipped,omitempty" yaml:"skipped,omitempty"`
-	Error       string    `json:"error,omitempty" yaml:"error,omitempty"`
+	GeneratedAt    time.Time                 `json:"generated_at" yaml:"generated_at"`
+	RunID          string                    `json:"run_id" yaml:"run_id"`
+	Session        string                    `json:"session" yaml:"session"`
+	Success        bool                      `json:"success" yaml:"success"`
+	Status         string                    `json:"status,omitempty" yaml:"status,omitempty"`
+	ModeID         string                    `json:"mode_id,omitempty" yaml:"mode_id,omitempty"`
+	AgentType      string                    `json:"agent_type,omitempty" yaml:"agent_type,omitempty"`
+	PaneName       string                    `json:"pane_name,omitempty" yaml:"pane_name,omitempty"`
+	Message        string                    `json:"message,omitempty" yaml:"message,omitempty"`
+	Resumed        int                       `json:"resumed,omitempty" yaml:"resumed,omitempty"`
+	Skipped        int                       `json:"skipped,omitempty" yaml:"skipped,omitempty"`
+	CompletedModes []string                  `json:"completed_modes,omitempty" yaml:"completed_modes,omitempty"`
+	PendingModes   []string                  `json:"pending_modes,omitempty" yaml:"pending_modes,omitempty"`
+	ErrorModes     []string                  `json:"error_modes,omitempty" yaml:"error_modes,omitempty"`
+	ModesToRerun   []string                  `json:"modes_to_rerun,omitempty" yaml:"modes_to_rerun,omitempty"`
+	ModesExecuted  []string                  `json:"modes_executed,omitempty" yaml:"modes_executed,omitempty"`
+	Synthesized    bool                      `json:"synthesized,omitempty" yaml:"synthesized,omitempty"`
+	Synthesis      *ensemble.SynthesisReport `json:"synthesis,omitempty" yaml:"synthesis,omitempty"`
+	Error          string                    `json:"error,omitempty" yaml:"error,omitempty"`
 }
 
 type checkpointCleanOutput struct {
@@ -2782,12 +2974,122 @@ type checkpointCleanOutput struct {
 	Message     string    `json:"message" yaml:"message"`
 }
 
+type ensembleResumeCommandOptions struct {
+	RunID              string
+	Format             string
+	Quiet              bool
+	SkipDone           bool
+	AgentType          string
+	AgentCmd           string
+	Timeout            time.Duration
+	Strategy           string
+	MinConfidence      float64
+	MaxFindings        int
+	IncludeRawOutputs  bool
+	ConflictResolution string
+	BudgetSynthesis    int
+	BudgetContextPack  int
+}
+
+type ensembleRerunCommandOptions struct {
+	RunID              string
+	ModeRef            string
+	Format             string
+	Quiet              bool
+	AgentType          string
+	AgentCmd           string
+	Synthesize         bool
+	Timeout            time.Duration
+	Strategy           string
+	MinConfidence      float64
+	MaxFindings        int
+	IncludeRawOutputs  bool
+	ConflictResolution string
+	BudgetSynthesis    int
+	BudgetContextPack  int
+}
+
+func resolveCheckpointPolicyConfig(
+	cmd *cobra.Command,
+	strategy string,
+	minConfidence float64,
+	maxFindings int,
+	includeRaw bool,
+	conflictResolution string,
+	budgetSynthesis int,
+	budgetContextPack int,
+) (ensemble.SynthesisConfig, ensemble.BudgetConfig, ensemble.CacheConfig, ensemble.EarlyStopConfig, error) {
+	baseSynth := ensemble.DefaultSynthesisConfig()
+	baseSynth.Strategy = ""
+	ensCfg := &ensemble.EnsembleConfig{
+		Synthesis: baseSynth,
+		Budget:    ensemble.DefaultBudgetConfig(),
+		Cache:     ensemble.DefaultCacheConfig(),
+	}
+	effectiveCfg := cfg
+	if effectiveCfg == nil {
+		effectiveCfg = config.Default()
+	}
+	ensemble.ApplyTOMLConfig(ensCfg, effectiveCfg.Ensemble)
+	if cfg == nil && strings.TrimSpace(strategy) == "" {
+		ensCfg.Synthesis.Strategy = ""
+	}
+
+	flagChanged := func(name string) bool {
+		return cmd != nil && cmd.Flags().Lookup(name) != nil && cmd.Flags().Changed(name)
+	}
+
+	if strings.TrimSpace(strategy) != "" {
+		validated, err := ensemble.ValidateOrMigrateStrategy(strings.TrimSpace(strategy))
+		if err != nil {
+			return ensemble.SynthesisConfig{}, ensemble.BudgetConfig{}, ensemble.CacheConfig{}, ensemble.EarlyStopConfig{}, err
+		}
+		ensCfg.Synthesis.Strategy = validated
+	}
+	if flagChanged("min-confidence") || minConfidence > 0 {
+		if minConfidence < 0 || minConfidence > 1 {
+			return ensemble.SynthesisConfig{}, ensemble.BudgetConfig{}, ensemble.CacheConfig{}, ensemble.EarlyStopConfig{}, fmt.Errorf("--min-confidence must be between 0.0 and 1.0")
+		}
+		ensCfg.Synthesis.MinConfidence = ensemble.Confidence(minConfidence)
+	}
+	if flagChanged("max-findings") || maxFindings > 0 {
+		if maxFindings < 0 {
+			return ensemble.SynthesisConfig{}, ensemble.BudgetConfig{}, ensemble.CacheConfig{}, ensemble.EarlyStopConfig{}, fmt.Errorf("--max-findings must be non-negative")
+		}
+		ensCfg.Synthesis.MaxFindings = maxFindings
+	}
+	if flagChanged("include-raw-outputs") {
+		ensCfg.Synthesis.IncludeRawOutputs = includeRaw
+	} else if includeRaw {
+		ensCfg.Synthesis.IncludeRawOutputs = true
+	}
+	if flagChanged("conflict-resolution") || strings.TrimSpace(conflictResolution) != "" {
+		ensCfg.Synthesis.ConflictResolution = strings.TrimSpace(conflictResolution)
+	}
+	if flagChanged("budget-synthesis") || budgetSynthesis > 0 {
+		if budgetSynthesis < 0 {
+			return ensemble.SynthesisConfig{}, ensemble.BudgetConfig{}, ensemble.CacheConfig{}, ensemble.EarlyStopConfig{}, fmt.Errorf("--budget-synthesis must be non-negative")
+		}
+		ensCfg.Budget.SynthesisReserveTokens = budgetSynthesis
+		ensCfg.Synthesis.MaxSynthesisTokens = budgetSynthesis
+	}
+	if flagChanged("budget-context-pack") || budgetContextPack > 0 {
+		if budgetContextPack < 0 {
+			return ensemble.SynthesisConfig{}, ensemble.BudgetConfig{}, ensemble.CacheConfig{}, ensemble.EarlyStopConfig{}, fmt.Errorf("--budget-context-pack must be non-negative")
+		}
+		ensCfg.Budget.ContextReserveTokens = budgetContextPack
+	}
+	if ensCfg.Budget.SynthesisReserveTokens > 0 && ensCfg.Synthesis.MaxSynthesisTokens == 0 {
+		ensCfg.Synthesis.MaxSynthesisTokens = ensCfg.Budget.SynthesisReserveTokens
+	}
+	return ensCfg.Synthesis, ensCfg.Budget, ensCfg.Cache, ensCfg.EarlyStop, nil
+}
+
 func newEnsembleResumeCmd() *cobra.Command {
-	var (
-		format   string
-		quiet    bool
-		skipDone bool
-	)
+	opts := ensembleResumeCommandOptions{
+		Format:   "text",
+		SkipDone: true,
+	}
 
 	cmd := &cobra.Command{
 		Use:   "resume <run-id>",
@@ -2796,8 +3098,8 @@ func newEnsembleResumeCmd() *cobra.Command {
 
 The resume command loads the checkpoint state and:
   1. Identifies which modes completed successfully
-  2. Re-runs any pending or errored modes
-  3. Continues with synthesis when all modes complete
+  2. Re-runs any pending or errored modes in tmux
+  3. Persists captured mode checkpoints and executes Stage 3 synthesis
 
 Use 'ntm ensemble list-checkpoints' to see available runs.`,
 		Example: `  ntm ensemble resume my-ensemble-run
@@ -2805,28 +3107,40 @@ Use 'ntm ensemble list-checkpoints' to see available runs.`,
   ntm ensemble resume my-ensemble-run --format json`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			runID := args[0]
-			return runEnsembleResume(cmd.OutOrStdout(), runID, format, quiet, skipDone)
+			opts.RunID = args[0]
+			return runEnsembleResume(cmd.Context(), cmd, cmd.OutOrStdout(), opts)
 		},
 	}
 
-	cmd.Flags().StringVarP(&format, "format", "f", "text", "Output format: text, json, yaml")
-	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "Minimal output")
-	cmd.Flags().BoolVar(&skipDone, "skip-done", true, "Skip already completed modes (default: true)")
+	cmd.Flags().StringVarP(&opts.Format, "format", "f", "text", "Output format: text, json, yaml")
+	cmd.Flags().BoolVarP(&opts.Quiet, "quiet", "q", false, "Minimal output")
+	cmd.Flags().BoolVar(&opts.SkipDone, "skip-done", true, "Skip already completed modes (default: true)")
+	cmd.Flags().StringVar(&opts.AgentType, "agent-type", "", "Agent type for resumed modes (cc, cod, gmi)")
+	cmd.Flags().StringVar(&opts.AgentCmd, "agent-cmd", "", "Override agent command launched inside resumed panes")
+	cmd.Flags().DurationVar(&opts.Timeout, "timeout", 0, "Timeout for collecting resumed mode outputs")
+	cmd.Flags().StringVar(&opts.Strategy, "strategy", "", "Override synthesis strategy")
+	cmd.Flags().Float64Var(&opts.MinConfidence, "min-confidence", 0, "Override minimum confidence threshold [0.0-1.0]")
+	cmd.Flags().IntVar(&opts.MaxFindings, "max-findings", 0, "Override maximum synthesized findings")
+	cmd.Flags().BoolVar(&opts.IncludeRawOutputs, "include-raw-outputs", false, "Include raw mode outputs in synthesis report")
+	cmd.Flags().StringVar(&opts.ConflictResolution, "conflict-resolution", "", "Override conflict resolution policy")
+	cmd.Flags().IntVar(&opts.BudgetSynthesis, "budget-synthesis", 0, "Override synthesis token budget")
+	cmd.Flags().IntVar(&opts.BudgetContextPack, "budget-context-pack", 0, "Override context pack token budget")
 
 	return cmd
 }
 
-func runEnsembleResume(w io.Writer, runID, format string, quiet, skipDone bool) error {
-	format = strings.ToLower(strings.TrimSpace(format))
+func runEnsembleResume(ctx context.Context, cmd *cobra.Command, w io.Writer, opts ensembleResumeCommandOptions) error {
+	runID := opts.RunID
+	format := strings.ToLower(strings.TrimSpace(opts.Format))
 	if format == "" {
 		format = "text"
 	}
 	if jsonOutput {
 		format = "json"
 	}
+	quiet := opts.Quiet
 
-	store, _, err := resolveEnsembleCheckpointStoreForRunID(runID)
+	store, projectDir, err := resolveEnsembleCheckpointStoreForRunID(runID)
 	if err != nil {
 		result := checkpointResumeOutput{
 			GeneratedAt: output.Timestamp(),
@@ -2861,35 +3175,112 @@ func runEnsembleResume(w io.Writer, runID, format string, quiet, skipDone bool) 
 		return renderCheckpointResumeFailureOutput(w, errPayload, format, quiet, cause)
 	}
 
+	agentType := ""
+	if strings.TrimSpace(opts.AgentType) != "" {
+		agentType = normalizeEnsembleAgentType(opts.AgentType)
+		if agentType == "" {
+			cause := fmt.Errorf("invalid --agent-type %q", opts.AgentType)
+			errPayload := checkpointResumeOutput{
+				GeneratedAt: output.Timestamp(),
+				RunID:       runID,
+				Session:     meta.SessionName,
+				Success:     false,
+				Error:       cause.Error(),
+			}
+			return renderCheckpointResumeFailureOutput(w, errPayload, format, quiet, cause)
+		}
+	}
+
+	synthCfg, budgetCfg, cacheCfg, earlyStopCfg, err := resolveCheckpointPolicyConfig(
+		cmd,
+		opts.Strategy,
+		opts.MinConfidence,
+		opts.MaxFindings,
+		opts.IncludeRawOutputs,
+		opts.ConflictResolution,
+		opts.BudgetSynthesis,
+		opts.BudgetContextPack,
+	)
+	if err != nil {
+		errPayload := checkpointResumeOutput{
+			GeneratedAt: output.Timestamp(),
+			RunID:       runID,
+			Session:     meta.SessionName,
+			Success:     false,
+			Error:       err.Error(),
+		}
+		return renderCheckpointResumeFailureOutput(w, errPayload, format, quiet, err)
+	}
+
+	_ = earlyStopCfg
+	manager, err := buildEnsembleManager(projectDir, opts.AgentCmd)
+	if err != nil {
+		errPayload := checkpointResumeOutput{
+			GeneratedAt: output.Timestamp(),
+			RunID:       runID,
+			Session:     meta.SessionName,
+			Success:     false,
+			Error:       err.Error(),
+		}
+		return renderCheckpointResumeFailureOutput(w, errPayload, format, quiet, err)
+	}
+
+	skippedBefore := len(meta.CompletedIDs)
+	if !opts.SkipDone {
+		skippedBefore = 0
+	}
+
 	slog.Default().Info("resuming ensemble run",
 		"run_id", runID,
 		"session", meta.SessionName,
 		"completed", len(meta.CompletedIDs),
 		"pending", len(meta.PendingIDs),
 		"errors", len(meta.ErrorIDs),
+		"skip_done", opts.SkipDone,
 	)
 
-	// Calculate modes to run
-	toRun := append([]string{}, meta.PendingIDs...)
-	toRun = append(toRun, meta.ErrorIDs...)
-	skipped := len(meta.CompletedIDs)
-	if !skipDone {
-		toRun = append(toRun, meta.CompletedIDs...)
-		skipped = 0
+	resumeRes, err := manager.ResumeRun(ctx, store, runID, ensemble.ResumeOptions{
+		SkipDone:       opts.SkipDone,
+		ProjectDir:     projectDir,
+		AgentType:      agentType,
+		CollectTimeout: opts.Timeout,
+		Synthesis:      synthCfg,
+		Budget:         budgetCfg,
+		Cache:          cacheCfg,
+		EarlyStop:      earlyStopCfg,
+	})
+	if err != nil {
+		errPayload := checkpointResumeOutput{
+			GeneratedAt: output.Timestamp(),
+			RunID:       runID,
+			Session:     meta.SessionName,
+			Success:     false,
+			Error:       err.Error(),
+		}
+		return renderCheckpointResumeFailureOutput(w, errPayload, format, quiet, err)
+	}
+
+	msg := fmt.Sprintf("Resumed %d mode(s) (%d skipped); status=%s", len(resumeRes.ModesExecuted), skippedBefore, resumeRes.Status)
+	if len(resumeRes.ModesToRerun) == 0 {
+		msg = "All modes already completed - synthesis up to date"
 	}
 
 	result := checkpointResumeOutput{
-		GeneratedAt: output.Timestamp(),
-		RunID:       runID,
-		Session:     meta.SessionName,
-		Success:     true,
-		Resumed:     len(toRun),
-		Skipped:     skipped,
-		Message:     fmt.Sprintf("Resume initiated: %d modes to run, %d already complete", len(toRun), skipped),
-	}
-
-	if len(toRun) == 0 {
-		result.Message = "All modes already completed - no resume needed"
+		GeneratedAt:    output.Timestamp(),
+		RunID:          resumeRes.RunID,
+		Session:        resumeRes.SessionName,
+		Success:        true,
+		Status:         resumeRes.Status.String(),
+		Resumed:        len(resumeRes.ModesToRerun),
+		Skipped:        skippedBefore,
+		CompletedModes: resumeRes.CompletedModes,
+		PendingModes:   resumeRes.PendingModes,
+		ErrorModes:     resumeRes.ErrorModes,
+		ModesToRerun:   resumeRes.ModesToRerun,
+		ModesExecuted:  resumeRes.ModesExecuted,
+		Synthesized:    resumeRes.SynthesisReport != nil,
+		Synthesis:      resumeRes.SynthesisReport,
+		Message:        msg,
 	}
 
 	return renderCheckpointResumeOutput(w, result, format, quiet)
@@ -2933,8 +3324,14 @@ func renderCheckpointResumeOutput(w io.Writer, payload checkpointResumeOutput, f
 
 		fmt.Fprintf(w, "Ensemble Resume: %s\n", payload.RunID)
 		fmt.Fprintf(w, "  Session: %s\n", payload.Session)
+		if payload.Status != "" {
+			fmt.Fprintf(w, "  Status: %s\n", payload.Status)
+		}
 		fmt.Fprintf(w, "  Modes to run: %d\n", payload.Resumed)
 		fmt.Fprintf(w, "  Already done: %d\n", payload.Skipped)
+		if payload.Synthesis != nil {
+			fmt.Fprintf(w, "  Synthesized findings: %d\n", len(payload.Synthesis.TopFindings))
+		}
 		fmt.Fprintf(w, "  %s\n", payload.Message)
 		return nil
 	}
@@ -2949,10 +3346,9 @@ func renderCheckpointResumeFailureOutput(w io.Writer, payload checkpointResumeOu
 }
 
 func newEnsembleRerunModeCmd() *cobra.Command {
-	var (
-		format string
-		quiet  bool
-	)
+	opts := ensembleRerunCommandOptions{
+		Format: "text",
+	}
 
 	cmd := &cobra.Command{
 		Use:   "rerun-mode <run-id> <mode>",
@@ -2961,34 +3357,48 @@ func newEnsembleRerunModeCmd() *cobra.Command {
 
 This is useful when:
   - A specific mode produced incorrect output
-  - You want to try a mode with different parameters
+  - You want to try a mode with a different agent type
   - A mode errored and you want to retry just that one
 
-The mode's checkpoint will be updated with the new output.`,
+The mode's checkpoint will be updated with the new output and stale synthesis invalidated.`,
 		Example: `  ntm ensemble rerun-mode my-run deductive
-  ntm ensemble rerun-mode my-run A1 --format json`,
+  ntm ensemble rerun-mode my-run A1 --synthesize --format json`,
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			runID := args[0]
-			modeRef := args[1]
-			return runEnsembleRerunMode(cmd.OutOrStdout(), runID, modeRef, format, quiet)
+			opts.RunID = args[0]
+			opts.ModeRef = args[1]
+			return runEnsembleRerunMode(cmd.Context(), cmd, cmd.OutOrStdout(), opts)
 		},
 	}
 
-	cmd.Flags().StringVarP(&format, "format", "f", "text", "Output format: text, json, yaml")
-	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "Minimal output")
+	cmd.Flags().StringVarP(&opts.Format, "format", "f", "text", "Output format: text, json, yaml")
+	cmd.Flags().BoolVarP(&opts.Quiet, "quiet", "q", false, "Minimal output")
+	cmd.Flags().StringVar(&opts.AgentType, "agent-type", "", "Override agent type for this mode (cc, cod, gmi)")
+	cmd.Flags().StringVar(&opts.AgentCmd, "agent-cmd", "", "Override agent command launched inside the rerun pane")
+	cmd.Flags().BoolVar(&opts.Synthesize, "synthesize", false, "Re-run Stage 3 synthesis after updating the mode checkpoint")
+	cmd.Flags().DurationVar(&opts.Timeout, "timeout", 0, "Timeout for collecting rerun mode output")
+	cmd.Flags().StringVar(&opts.Strategy, "strategy", "", "Override synthesis strategy")
+	cmd.Flags().Float64Var(&opts.MinConfidence, "min-confidence", 0, "Override minimum confidence threshold [0.0-1.0]")
+	cmd.Flags().IntVar(&opts.MaxFindings, "max-findings", 0, "Override maximum synthesized findings")
+	cmd.Flags().BoolVar(&opts.IncludeRawOutputs, "include-raw-outputs", false, "Include raw mode outputs in synthesis report")
+	cmd.Flags().StringVar(&opts.ConflictResolution, "conflict-resolution", "", "Override conflict resolution policy")
+	cmd.Flags().IntVar(&opts.BudgetSynthesis, "budget-synthesis", 0, "Override synthesis token budget")
+	cmd.Flags().IntVar(&opts.BudgetContextPack, "budget-context-pack", 0, "Override context pack token budget")
 
 	return cmd
 }
 
-func runEnsembleRerunMode(w io.Writer, runID, modeRef, format string, quiet bool) error {
-	format = strings.ToLower(strings.TrimSpace(format))
+func runEnsembleRerunMode(ctx context.Context, cmd *cobra.Command, w io.Writer, opts ensembleRerunCommandOptions) error {
+	runID := opts.RunID
+	modeRef := opts.ModeRef
+	format := strings.ToLower(strings.TrimSpace(opts.Format))
 	if format == "" {
 		format = "text"
 	}
 	if jsonOutput {
 		format = "json"
 	}
+	quiet := opts.Quiet
 
 	store, projectDir, err := resolveEnsembleCheckpointStoreForRunID(runID)
 	if err != nil {
@@ -3063,20 +3473,112 @@ func runEnsembleRerunMode(w io.Writer, runID, modeRef, format string, quiet bool
 		}
 	}
 
+	agentType := ""
+	if strings.TrimSpace(opts.AgentType) != "" {
+		agentType = normalizeEnsembleAgentType(opts.AgentType)
+		if agentType == "" {
+			cause := fmt.Errorf("invalid --agent-type %q", opts.AgentType)
+			errPayload := checkpointResumeOutput{
+				GeneratedAt: output.Timestamp(),
+				RunID:       runID,
+				Session:     meta.SessionName,
+				Success:     false,
+				Error:       cause.Error(),
+			}
+			return renderCheckpointResumeFailureOutput(w, errPayload, format, quiet, cause)
+		}
+	}
+
+	synthCfg, budgetCfg, cacheCfg, earlyStopCfg, err := resolveCheckpointPolicyConfig(
+		cmd,
+		opts.Strategy,
+		opts.MinConfidence,
+		opts.MaxFindings,
+		opts.IncludeRawOutputs,
+		opts.ConflictResolution,
+		opts.BudgetSynthesis,
+		opts.BudgetContextPack,
+	)
+	if err != nil {
+		errPayload := checkpointResumeOutput{
+			GeneratedAt: output.Timestamp(),
+			RunID:       runID,
+			Session:     meta.SessionName,
+			Success:     false,
+			Error:       err.Error(),
+		}
+		return renderCheckpointResumeFailureOutput(w, errPayload, format, quiet, err)
+	}
+
+	_ = earlyStopCfg
+	manager, err := buildEnsembleManager(projectDir, opts.AgentCmd)
+	if err != nil {
+		errPayload := checkpointResumeOutput{
+			GeneratedAt: output.Timestamp(),
+			RunID:       runID,
+			Session:     meta.SessionName,
+			Success:     false,
+			Error:       err.Error(),
+		}
+		return renderCheckpointResumeFailureOutput(w, errPayload, format, quiet, err)
+	}
+
 	slog.Default().Info("rerunning mode",
 		"run_id", runID,
 		"mode", modeID,
 		"mode_ref", modeRef,
 		"session", meta.SessionName,
+		"synthesize", opts.Synthesize,
 	)
 
+	rerunRes, err := manager.RerunMode(ctx, store, runID, modeRef, ensemble.RerunModeOptions{
+		ProjectDir:     projectDir,
+		AgentType:      agentType,
+		Synthesize:     opts.Synthesize,
+		CollectTimeout: opts.Timeout,
+		Synthesis:      synthCfg,
+		Budget:         budgetCfg,
+		Cache:          cacheCfg,
+	})
+	if err != nil {
+		errPayload := checkpointResumeOutput{
+			GeneratedAt: output.Timestamp(),
+			RunID:       runID,
+			Session:     meta.SessionName,
+			Success:     false,
+			Error:       err.Error(),
+		}
+		return renderCheckpointResumeFailureOutput(w, errPayload, format, quiet, err)
+	}
+
+	updatedMeta, _ := store.LoadMetadata(runID)
+	statusStr := rerunRes.CurrentStatus
+	var completedModes, pendingModes, errorModes []string
+	if updatedMeta != nil {
+		statusStr = updatedMeta.Status.String()
+		completedModes = updatedMeta.CompletedIDs
+		pendingModes = updatedMeta.PendingIDs
+		errorModes = updatedMeta.ErrorIDs
+	}
+
 	result := checkpointResumeOutput{
-		GeneratedAt: output.Timestamp(),
-		RunID:       runID,
-		Session:     meta.SessionName,
-		Success:     true,
-		Resumed:     1,
-		Message:     fmt.Sprintf("Re-running mode '%s' in run '%s'", modeID, runID),
+		GeneratedAt:    output.Timestamp(),
+		RunID:          rerunRes.RunID,
+		Session:        rerunRes.SessionName,
+		Success:        true,
+		Status:         statusStr,
+		ModeID:         rerunRes.ModeID,
+		AgentType:      rerunRes.AgentType,
+		PaneName:       rerunRes.PaneName,
+		Resumed:        1,
+		CompletedModes: completedModes,
+		PendingModes:   pendingModes,
+		ErrorModes:     errorModes,
+		ModesToRerun:   []string{rerunRes.ModeID},
+		ModesExecuted:  []string{rerunRes.ModeID},
+		Synthesized:    rerunRes.Synthesized,
+		Synthesis:      rerunRes.SynthesisReport,
+		Message:        fmt.Sprintf("Re-ran mode '%s' in run '%s'", rerunRes.ModeID, rerunRes.RunID),
 	}
 
 	return renderCheckpointResumeOutput(w, result, format, quiet)

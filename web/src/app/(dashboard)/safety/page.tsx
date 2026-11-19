@@ -8,15 +8,10 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { apiRequestSignal, getAuthHeaders, getBaseUrl } from "@/lib/api/client";
-
-interface ApiEnvelope {
-  success: boolean;
-  timestamp: string;
-  request_id?: string;
-  error?: string;
-  error_code?: string;
-}
+import { apiFetch, type ApiEnvelope } from "@/lib/api/client";
+import { AuditAndPolicyPanel } from "@/components/safety/AuditAndPolicyPanel";
+import { GitHooksAndRedactionPanel } from "@/components/safety/GitHooksAndRedactionPanel";
+import { ConfigAndPolicyValidatorPanel } from "@/components/safety/ConfigAndPolicyValidatorPanel";
 
 interface SafetyStatus {
   installed: boolean;
@@ -105,42 +100,24 @@ interface BlockedResponse extends ApiEnvelope {
   count: number;
 }
 
+interface SafetyCheckResponse extends ApiEnvelope {
+  command: string;
+  action: "allow" | "block" | "approve" | string;
+  pattern?: string;
+  reason?: string;
+  slb?: boolean;
+}
+
+interface CreateApprovalResponse extends ApiEnvelope {
+  id: string;
+  status: string;
+  expires_at: string;
+  slb_required: boolean;
+}
+
 type Notice = { type: "success" | "error"; message: string };
 
 type ApprovalStatusFilter = "all" | "pending" | "approved" | "denied" | "expired";
-
-async function apiFetch<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const baseUrl = getBaseUrl();
-  const headers: HeadersInit = {
-    "Content-Type": "application/json",
-    ...getAuthHeaders(),
-    ...(options.headers || {}),
-  };
-
-  const response = await fetch(`${baseUrl}${path}`, {
-    ...options,
-    signal: options.signal ?? apiRequestSignal(),
-    headers,
-  });
-
-  const raw = await response.text();
-  let data: unknown = null;
-  if (raw) {
-    try {
-      data = JSON.parse(raw);
-    } catch {
-      throw new Error("Invalid response from server.");
-    }
-  }
-
-  const envelope = data as ApiEnvelope | null;
-  if (!response.ok || !envelope?.success) {
-    const message = envelope?.error || `Request failed (${response.status})`;
-    throw new Error(message);
-  }
-
-  return data as T;
-}
 
 function getErrorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
@@ -200,6 +177,12 @@ export default function SafetyPage() {
   const [selectedApprovalId, setSelectedApprovalId] = useState<string | null>(null);
   const [policyYaml, setPolicyYaml] = useState("");
   const [showPolicyEditor, setShowPolicyEditor] = useState(false);
+  const [simCommand, setSimCommand] = useState("");
+  const [simResult, setSimResult] = useState<SafetyCheckResponse | null>(null);
+  const [reqAction, setReqAction] = useState("");
+  const [reqResource, setReqResource] = useState("");
+  const [reqReason, setReqReason] = useState("");
+  const [reqTtlSeconds, setReqTtlSeconds] = useState("3600");
   const noticeTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [actionBusy, setActionBusy] = useState({
     approve: false,
@@ -209,6 +192,8 @@ export default function SafetyPage() {
     reset: false,
     install: false,
     uninstall: false,
+    simulate: false,
+    requestApproval: false,
   });
 
   useEffect(() => {
@@ -304,7 +289,7 @@ export default function SafetyPage() {
         console.log("[Safety] Approve", { selectedApprovalId });
       }
       await apiFetch<ApiEnvelope>(
-        `/api/v1/approvals/${selectedApprovalId}/approve`,
+        `/api/v1/approvals/${encodeURIComponent(selectedApprovalId)}/approve`,
         { method: "POST" }
       );
       queryClient.invalidateQueries({ queryKey: ["safety", "approvals"] });
@@ -325,7 +310,7 @@ export default function SafetyPage() {
         console.log("[Safety] Deny", { selectedApprovalId });
       }
       await apiFetch<ApiEnvelope>(
-        `/api/v1/approvals/${selectedApprovalId}/deny`,
+        `/api/v1/approvals/${encodeURIComponent(selectedApprovalId)}/deny`,
         { method: "POST" }
       );
       queryClient.invalidateQueries({ queryKey: ["safety", "approvals"] });
@@ -419,6 +404,68 @@ export default function SafetyPage() {
       setActionBusy((prev) => ({ ...prev, uninstall: false }));
     }
   }, [queryClient, setStatusNotice]);
+
+  const handleSimulateCommand = useCallback(
+    async (event: React.FormEvent) => {
+      event.preventDefault();
+      const trimmed = simCommand.trim();
+      if (!trimmed) {
+        setStatusNotice({ type: "error", message: "Enter a command to evaluate." });
+        return;
+      }
+      setActionBusy((prev) => ({ ...prev, simulate: true }));
+      try {
+        const res = await apiFetch<SafetyCheckResponse>("/api/v1/safety/check", {
+          method: "POST",
+          body: JSON.stringify({ command: trimmed }),
+        });
+        setSimResult(res);
+      } catch (error) {
+        setStatusNotice({ type: "error", message: getErrorMessage(error) });
+      } finally {
+        setActionBusy((prev) => ({ ...prev, simulate: false }));
+      }
+    },
+    [simCommand, setStatusNotice]
+  );
+
+  const handleRequestApproval = useCallback(
+    async (event: React.FormEvent) => {
+      event.preventDefault();
+      const action = reqAction.trim();
+      if (!action) {
+        setStatusNotice({ type: "error", message: "Approval action is required." });
+        return;
+      }
+      const parsedTtl = Number.parseInt(reqTtlSeconds, 10);
+      const ttl = Number.isFinite(parsedTtl) && parsedTtl > 0 ? parsedTtl : 3600;
+      setActionBusy((prev) => ({ ...prev, requestApproval: true }));
+      try {
+        const res = await apiFetch<CreateApprovalResponse>("/api/v1/approvals/request", {
+          method: "POST",
+          body: JSON.stringify({
+            action,
+            ...(reqResource.trim() ? { resource: reqResource.trim() } : {}),
+            ...(reqReason.trim() ? { reason: reqReason.trim() } : {}),
+            ttl_seconds: ttl,
+          }),
+        });
+        setReqAction("");
+        setReqResource("");
+        setReqReason("");
+        void queryClient.invalidateQueries({ queryKey: ["safety", "approvals"] });
+        setStatusNotice({
+          type: "success",
+          message: `Approval request ${res.id} submitted (${res.slb_required ? "SLB two-person required" : res.status}).`,
+        });
+      } catch (error) {
+        setStatusNotice({ type: "error", message: getErrorMessage(error) });
+      } finally {
+        setActionBusy((prev) => ({ ...prev, requestApproval: false }));
+      }
+    },
+    [queryClient, reqAction, reqReason, reqResource, reqTtlSeconds, setStatusNotice]
+  );
 
   const connectionError =
     statusQuery.error ??
@@ -562,6 +609,118 @@ export default function SafetyPage() {
           <div className="mt-1 text-xs text-gray-500 dark:text-gray-400">
             Dangerous commands intercepted
           </div>
+        </div>
+      </section>
+
+      {/* Command Safety Simulator & Request Approval */}
+      <section className="grid gap-6 lg:grid-cols-2">
+        <div className="rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 p-4 space-y-3">
+          <div>
+            <h2 className="text-base font-semibold text-gray-900 dark:text-white">
+              Command Safety Simulator
+            </h2>
+            <p className="text-xs text-gray-500 dark:text-gray-400">
+              Evaluate any shell or Git command against the active safety policy before running it.
+            </p>
+          </div>
+
+          <form onSubmit={handleSimulateCommand} className="flex flex-col sm:flex-row gap-2">
+            <input
+              aria-label="Command to simulate"
+              value={simCommand}
+              onChange={(event) => setSimCommand(event.target.value)}
+              placeholder="e.g. git status or git reset --hard"
+              className="flex-1 rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 px-3 py-1.5 text-sm font-mono text-gray-900 dark:text-white"
+            />
+            <button
+              type="submit"
+              disabled={actionBusy.simulate || !simCommand.trim()}
+              className="px-3 py-1.5 rounded-md text-xs font-medium bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50"
+            >
+              {actionBusy.simulate ? "Checking…" : "Evaluate Command"}
+            </button>
+          </form>
+
+          {simResult && (
+            <div
+              className={`rounded-md border p-3 text-xs space-y-1.5 ${
+                simResult.action === "block"
+                  ? "border-red-200 bg-red-50 text-red-800 dark:border-red-800 dark:bg-red-900/20 dark:text-red-200"
+                  : simResult.action === "approve"
+                    ? "border-yellow-200 bg-yellow-50 text-yellow-800 dark:border-yellow-800 dark:bg-yellow-900/20 dark:text-yellow-200"
+                    : "border-green-200 bg-green-50 text-green-800 dark:border-green-800 dark:bg-green-900/20 dark:text-green-200"
+              }`}
+            >
+              <div className="flex flex-wrap items-center justify-between gap-2 font-semibold">
+                <span>
+                  Verdict: {simResult.action.toUpperCase()}
+                  {simResult.slb ? " (SLB Two-Person Rule)" : ""}
+                </span>
+                <code className="font-mono text-[11px] opacity-90">{simResult.command}</code>
+              </div>
+              {simResult.pattern && (
+                <div>
+                  Matched pattern: <code className="font-mono">{simResult.pattern}</code>
+                </div>
+              )}
+              {simResult.reason && <div>Reason: {simResult.reason}</div>}
+            </div>
+          )}
+        </div>
+
+        <div className="rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 p-4 space-y-3">
+          <div>
+            <h2 className="text-base font-semibold text-gray-900 dark:text-white">
+              Request Approval (SLB / Gate)
+            </h2>
+            <p className="text-xs text-gray-500 dark:text-gray-400">
+              Open a durable approval request for gated operations or two-person SLB review.
+            </p>
+          </div>
+
+          <form onSubmit={handleRequestApproval} className="space-y-2.5">
+            <div className="grid gap-2 sm:grid-cols-2">
+              <input
+                aria-label="Approval action"
+                value={reqAction}
+                onChange={(event) => setReqAction(event.target.value)}
+                placeholder="Action / command (required)"
+                className="rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 px-3 py-1.5 text-xs text-gray-900 dark:text-white"
+              />
+              <input
+                aria-label="Approval resource"
+                value={reqResource}
+                onChange={(event) => setReqResource(event.target.value)}
+                placeholder="Target resource / repo (optional)"
+                className="rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 px-3 py-1.5 text-xs text-gray-900 dark:text-white"
+              />
+            </div>
+            <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_7rem_auto]">
+              <input
+                aria-label="Approval reason"
+                value={reqReason}
+                onChange={(event) => setReqReason(event.target.value)}
+                placeholder="Operator justification (optional)"
+                className="rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 px-3 py-1.5 text-xs text-gray-900 dark:text-white"
+              />
+              <input
+                aria-label="Approval TTL seconds"
+                type="number"
+                min={60}
+                max={86400}
+                value={reqTtlSeconds}
+                onChange={(event) => setReqTtlSeconds(event.target.value)}
+                className="rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 px-2.5 py-1.5 text-xs text-gray-900 dark:text-white"
+              />
+              <button
+                type="submit"
+                disabled={actionBusy.requestApproval || !reqAction.trim()}
+                className="px-3 py-1.5 rounded-md text-xs font-medium bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50"
+              >
+                {actionBusy.requestApproval ? "Submitting…" : "Submit Request"}
+              </button>
+            </div>
+          </form>
         </div>
       </section>
 
@@ -968,6 +1127,12 @@ export default function SafetyPage() {
           </div>
         </section>
       </div>
+
+      <AuditAndPolicyPanel initialAutomation={policyData?.automation} />
+
+      <GitHooksAndRedactionPanel />
+
+      <ConfigAndPolicyValidatorPanel />
     </div>
   );
 }

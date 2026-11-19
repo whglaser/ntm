@@ -769,3 +769,42 @@ func TestLaunchCommandBuilderChaining(t *testing.T) {
 		t.Errorf("expected AgentArgs[cc] to be [--custom-arg], got %v", builder.AgentArgs["cc"])
 	}
 }
+
+func (lc LaunchCommand) ToSimpleCommand() string {
+	return lc.Binary
+}
+
+func (b *LaunchCommandBuilder) WithAgentPath(agentType, path string) *LaunchCommandBuilder {
+	b.AgentPaths[agentType] = path
+	return b
+}
+
+func (b *LaunchCommandBuilder) WithEnvVars(agentType string, env map[string]string) *LaunchCommandBuilder {
+	b.EnvVars[agentType] = env
+	return b
+}
+
+func (b *LaunchCommandBuilder) WithFullPaths(enabled bool) *LaunchCommandBuilder {
+	b.UseFullPaths = enabled
+	return b
+}
+
+func (b *LaunchCommandBuilder) BuildSwarmCommands(plan *SwarmPlan) []LaunchCommand {
+	if plan == nil {
+		return nil
+	}
+
+	var commands []LaunchCommand
+	for _, session := range plan.Sessions {
+		for _, pane := range session.Panes {
+			workDir := pane.Project
+			if workDir == "" {
+				workDir = plan.ScanDir
+			}
+			cmd := b.BuildLaunchCommand(pane, workDir)
+			commands = append(commands, cmd)
+		}
+	}
+
+	return commands
+}

@@ -1,10 +1,13 @@
-//go:build ensemble_experimental
-// +build ensemble_experimental
-
 package ensemble
 
 import (
+	"context"
+	"errors"
+	"io"
+	"log/slog"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
@@ -917,5 +920,214 @@ func TestEnsembleManager_HelpersWithValues(t *testing.T) {
 	// Test logger with set value
 	if m.logger() == nil {
 		t.Error("logger() should return set logger")
+	}
+}
+
+func TestSpawnEnsemble_CancelledBeforeCreation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	manager := NewEnsembleManager()
+	state, err := manager.SpawnEnsemble(ctx, &EnsembleConfig{
+		SessionName: "cancelled-ensemble",
+		Question:    "What should we analyze?",
+		Modes:       []string{"deductive", "abductive"},
+	})
+	if !errors.Is(err, context.Canceled) || state != nil {
+		t.Fatalf("SpawnEnsemble = %+v, %v; want nil, context canceled", state, err)
+	}
+}
+
+type cancellationTestInjector struct {
+	inject func(context.Context, string, string, string) error
+	delay  func(string) time.Duration
+}
+
+func (f cancellationTestInjector) InjectPromptContext(ctx context.Context, pane, agentType, prompt string) error {
+	return f.inject(ctx, pane, agentType, prompt)
+}
+
+func (f cancellationTestInjector) GetDelayForAgent(agentType string) time.Duration {
+	if f.delay == nil {
+		return 0
+	}
+	return f.delay(agentType)
+}
+
+func TestEnsembleInjection_CancellationPreservesCompletedReceipts(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	deliveries := 0
+	basic := cancellationTestInjector{
+		inject: func(got context.Context, pane, agentType, prompt string) error {
+			if got != ctx {
+				t.Fatal("caller context was not propagated to prompt delivery")
+			}
+			deliveries++
+			if deliveries == 2 {
+				cancel()
+				return ctx.Err()
+			}
+			return nil
+		},
+	}
+	injector := NewEnsembleInjector().WithBasicInjector(basic).
+		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	assignments := []ModeAssignment{
+		{ModeID: "deductive", PaneName: "%1", AgentType: "cc"},
+		{ModeID: "abductive", PaneName: "%2", AgentType: "cod"},
+		{ModeID: "practical", PaneName: "%3", AgentType: "cc"},
+	}
+
+	result, err := injector.InjectEnsemble(ctx, assignments, "Analyze cancellation", testModeCatalog(t), nil, 1000)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("InjectEnsemble error = %v, want context canceled", err)
+	}
+	if deliveries != 2 || result == nil || result.TotalPanes != 3 || result.Successful != 1 || result.Failed != 1 || len(result.Results) != 2 {
+		t.Fatalf("partial receipts were lost or later panes were dispatched: deliveries=%d result=%+v", deliveries, result)
+	}
+	if !result.Results[0].Success || result.Results[1].Success || result.Results[1].Error != context.Canceled.Error() {
+		t.Fatalf("unexpected completed receipts: %+v", result.Results)
+	}
+}
+
+func TestEnsembleInjection_CancellationInterruptsStagger(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	deliveries := 0
+	basic := cancellationTestInjector{
+		inject: func(context.Context, string, string, string) error {
+			deliveries++
+			return nil
+		},
+		delay: func(string) time.Duration {
+			cancel()
+			return 5 * time.Second
+		},
+	}
+	injector := NewEnsembleInjector().WithBasicInjector(basic).
+		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	assignments := []ModeAssignment{
+		{ModeID: "deductive", PaneName: "%1", AgentType: "cc"},
+		{ModeID: "abductive", PaneName: "%2", AgentType: "cod"},
+	}
+
+	start := time.Now()
+	result, err := injector.InjectEnsemble(ctx, assignments, "Analyze cancellation", testModeCatalog(t), nil, 1000)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("InjectEnsemble error = %v, want context canceled", err)
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatal("cancellation waited for the prompt stagger delay")
+	}
+	if deliveries != 1 || result == nil || result.Successful != 1 || result.Failed != 0 || len(result.Results) != 1 {
+		t.Fatalf("unexpected receipts after stagger cancellation: deliveries=%d result=%+v", deliveries, result)
+	}
+}
+
+func TestEnsembleInjection_PerPaneErrorStillAllowsOtherModes(t *testing.T) {
+	deliveries := 0
+	basic := cancellationTestInjector{
+		inject: func(context.Context, string, string, string) error {
+			deliveries++
+			if deliveries == 1 {
+				return errors.New("pane delivery failed")
+			}
+			return nil
+		},
+	}
+	injector := NewEnsembleInjector().WithBasicInjector(basic).
+		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	assignments := []ModeAssignment{
+		{ModeID: "deductive", PaneName: "%1", AgentType: "cc"},
+		{ModeID: "abductive", PaneName: "%2", AgentType: "cod"},
+	}
+
+	result, err := injector.InjectEnsemble(context.Background(), assignments, "Analyze resilience", testModeCatalog(t), nil, 1000)
+	if err != nil || deliveries != 2 || result == nil || result.Successful != 1 || result.Failed != 1 || len(result.Results) != 2 {
+		t.Fatalf("per-pane error stopped other modes: deliveries=%d result=%+v err=%v", deliveries, result, err)
+	}
+	if result.Results[0].Success || !result.Results[1].Success {
+		t.Fatalf("unexpected delivery receipts: %+v", result.Results)
+	}
+}
+
+func TestSpawnEnsemblePersistsResolvedConfigBeforeCreation(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("NTM_CONFIG", "")
+	resetDefaultStateStoreForTest()
+	t.Cleanup(CloseDefaultStateStore)
+
+	catalog := testModeCatalog(t)
+	preset := EnsemblePreset{
+		Name:  "persisted-settings",
+		Modes: []ModeRef{ModeRefFromID("deductive"), ModeRefFromID("abductive")},
+		Synthesis: SynthesisConfig{
+			Strategy:      StrategyManual,
+			MinConfidence: 0.8,
+			MaxFindings:   12,
+		},
+		Budget: BudgetConfig{
+			MaxTokensPerMode:     1100,
+			MaxTotalTokens:       9000,
+			ContextReserveTokens: 100,
+			TimeoutPerMode:       time.Minute,
+			TotalTimeout:         4 * time.Minute,
+			MaxRetries:           1,
+		},
+	}
+	manager := NewEnsembleManager()
+	manager.Catalog = catalog
+	manager.Registry = NewEnsembleRegistry([]EnsemblePreset{preset}, catalog)
+	manager.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	cfg := &EnsembleConfig{
+		SessionName: "persisted-settings",
+		Question:    "Retain the settings selected for this run",
+		Ensemble:    preset.Name,
+		// Fail pane planning after initial persistence, before any tmux calls.
+		AgentMix: map[string]int{"": 2},
+		Budget: BudgetConfig{
+			MaxTokensPerMode:       1600,
+			SynthesisReserveTokens: 600,
+		},
+		Synthesis: SynthesisConfig{
+			MinConfidence: 0.65,
+			MaxFindings:   3,
+		},
+	}
+
+	spawned, err := manager.SpawnEnsemble(context.Background(), cfg)
+	if err == nil || !strings.Contains(err.Error(), "empty agent type") {
+		t.Fatalf("SpawnEnsemble error = %v, want injected planning failure", err)
+	}
+	if spawned == nil || spawned.Budget == nil || spawned.Synthesis == nil {
+		t.Fatal("spawn did not snapshot its resolved configuration")
+	}
+	CloseDefaultStateStore()
+	loaded, err := LoadSession(cfg.SessionName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Status != EnsembleError || loaded.Budget == nil || loaded.Synthesis == nil {
+		t.Fatalf("initial failure state lost configuration: %+v", loaded)
+	}
+	wantBudget := preset.Budget
+	wantBudget.MaxTokensPerMode = 1600
+	wantBudget.SynthesisReserveTokens = 600
+	if got := loaded.EffectiveBudget(DefaultBudgetConfig()); got != wantBudget {
+		t.Fatalf("saved budget = %+v, want %+v", got, wantBudget)
+	}
+	wantSynthesis := preset.Synthesis
+	wantSynthesis.MinConfidence = 0.65
+	wantSynthesis.MaxFindings = 3
+	wantSynthesis.MaxSynthesisTokens = 600
+	if got := loaded.EffectiveSynthesis(DefaultSynthesisConfig()); got != wantSynthesis {
+		t.Fatalf("saved synthesis = %+v, want %+v", got, wantSynthesis)
+	}
+
+	cfg.Budget.MaxTokensPerMode = 9999
+	cfg.Synthesis.MaxFindings = 99
+	if spawned.Budget.MaxTokensPerMode != 1600 || spawned.Synthesis.MaxFindings != 3 {
+		t.Fatal("spawned configuration aliases mutable caller settings")
 	}
 }

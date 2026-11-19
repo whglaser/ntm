@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,10 +11,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/process"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/tests/testutil"
@@ -21,15 +24,15 @@ import (
 
 // Exercise the public --ssh dispatcher without supplying any signalable PID.
 // Refused commands may resolve the remote session but must stop before pane or
-// process observation; tmux-native graceful exit remains available.
+// process observation. Pane-preserving exit also needs host-local root-process
+// evidence, so it must refuse before consulting an unrelated local PID.
 func TestRemoteProcessOperationsCLIRefuseBeforePaneObservation(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("recording command fixture requires a POSIX shell")
 	}
 	for _, tc := range []struct {
-		name        string
-		args        []string
-		wantSuccess bool
+		name string
+		args []string
 	}{
 		{name: "kill-agent", args: []string{"--robot-kill-agent=remote-fixture"}},
 		{name: "kill-relaunch", args: []string{"--robot-kill-agent=remote-fixture", "--relaunch"}},
@@ -39,7 +42,8 @@ func TestRemoteProcessOperationsCLIRefuseBeforePaneObservation(t *testing.T) {
 		{name: "smart-hard-only", args: []string{"--robot-smart-restart=remote-fixture", "--hard-kill-only"}},
 		{name: "smart-fallback-dry", args: []string{"--robot-smart-restart=remote-fixture", "--hard-kill", "--dry-run"}},
 		{name: "smart-hard-only-dry", args: []string{"--robot-smart-restart=remote-fixture", "--hard-kill-only", "--dry-run"}},
-		{name: "exit-cli", args: []string{"--robot-exit-cli=remote-fixture"}, wantSuccess: true},
+		{name: "exit-cli", args: []string{"--robot-exit-cli=remote-fixture"}},
+		{name: "exit-relaunch", args: []string{"--robot-exit-cli=remote-fixture", "--relaunch"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
@@ -58,25 +62,7 @@ printf 'ssh %s\n' "$3" >> "$root/calls"
 case "$3" in
   *list-sessions*) printf 'remote-fixture_NTM_SEP_1_NTM_SEP_0_NTM_SEP_today\n' ;;
   *has-session*) ;;
-  *list-panes*)
-    if [ "$NTM_REMOTE_PROCESS_CONTROL_MODE" != exit-cli ]; then
-      : > "$root/forbidden"
-      exit 77
-    fi
-    command=codex
-    if [ -f "$root/exit-keys" ] && [ "$(cat "$root/exit-keys")" -ge 2 ]; then command=zsh; fi
-    printf '%%7_NTM_SEP_0_NTM_SEP_remote-fixture__cod_1_NTM_SEP_%s_NTM_SEP_80_NTM_SEP_24_NTM_SEP_0_NTM_SEP_0_NTM_SEP_0_NTM_SEP_codex\n' "$command"
-    ;;
-  *send-keys*)
-    if [ "$NTM_REMOTE_PROCESS_CONTROL_MODE" != exit-cli ]; then
-      : > "$root/forbidden"
-      exit 76
-    fi
-    case "$3" in *C-c*) ;; *) : > "$root/forbidden"; exit 75 ;; esac
-    count=0
-    if [ -f "$root/exit-keys" ]; then count=$(cat "$root/exit-keys"); fi
-    printf '%s' "$((count + 1))" > "$root/exit-keys"
-    ;;
+  *list-panes*|*send-keys*) : > "$root/forbidden"; exit 77 ;;
   *) : > "$root/forbidden"; exit 78 ;;
 esac
 `
@@ -102,40 +88,32 @@ esac
 				"HOME="+root, "XDG_CONFIG_HOME="+filepath.Join(root, "config"), "XDG_DATA_HOME="+filepath.Join(root, "data"),
 				"PATH="+root+string(os.PathListSeparator)+os.Getenv("PATH"), "TMUX=",
 				"NTM_TEST_TMUX_ENV_OWNED=1", "NTM_TMUX_BINARY="+filepath.Join(root, "tmux"),
-				"NTM_REMOTE_PROCESS_CONTROL_ROOT="+root, "NTM_REMOTE_PROCESS_CONTROL_MODE="+tc.name,
+				"NTM_REMOTE_PROCESS_CONTROL_ROOT="+root,
 				"NTM_NO_COLOR=1", "NTM_CONFIG=", "NTM_ROBOT_FORMAT=", "NTM_OUTPUT_FORMAT=", "TOON_DEFAULT_FORMAT=", "NTM_ROBOT_VERBOSITY=",
 				"NTM_ROBOT_CONTRACT_ARGS="+string(rawArgs))
 			var stdout, stderr bytes.Buffer
 			cmd.Stdout, cmd.Stderr = &stdout, &stderr
 			runErr := cmd.Run()
-			if ctx.Err() != nil || (runErr == nil) != tc.wantSuccess {
-				t.Fatalf("success=%t want=%t err=%v context=%v stdout=%s stderr=%s", runErr == nil, tc.wantSuccess, runErr, ctx.Err(), stdout.String(), stderr.String())
+			if ctx.Err() != nil || runErr == nil {
+				t.Fatalf("remote lifecycle command was not refused: err=%v context=%v stdout=%s stderr=%s", runErr, ctx.Err(), stdout.String(), stderr.String())
 			}
 			var response robot.RobotResponse
 			if err := json.Unmarshal(stdout.Bytes(), &response); err != nil {
 				t.Fatalf("decode response: %v stdout=%s stderr=%s", err, stdout.String(), stderr.String())
 			}
-			if response.Success != tc.wantSuccess {
-				t.Fatalf("remote lifecycle response=%+v", response)
-			}
-			if !tc.wantSuccess && (response.ErrorCode != robot.ErrCodeInvalidFlag || !strings.Contains(response.Error, "without --ssh")) {
+			if response.Success || response.ErrorCode != robot.ErrCodeInvalidFlag || !strings.Contains(response.Error, "without --ssh") {
 				t.Fatalf("remote process control lacked actionable typed refusal: %+v", response)
 			}
 			if _, err := os.Stat(filepath.Join(root, "forbidden")); !errors.Is(err, os.ErrNotExist) {
-				t.Fatalf("remote process control crossed a forbidden observation/mutation boundary: %v", err)
+				calls, _ := os.ReadFile(filepath.Join(root, "calls"))
+				t.Fatalf("remote process control crossed a forbidden observation/mutation boundary: %v; calls=%s", err, calls)
 			}
 			calls, err := os.ReadFile(filepath.Join(root, "calls"))
-			if err != nil {
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
 				t.Fatal(err)
 			}
-			if strings.Contains(string(calls), "list-panes") != tc.wantSuccess {
-				t.Fatalf("pane observation crossed admission or remote exit was blocked: %s", calls)
-			}
-			if tc.wantSuccess {
-				keys, err := os.ReadFile(filepath.Join(root, "exit-keys"))
-				if err != nil || string(keys) != "2" {
-					t.Fatalf("remote exit did not use the SSH keystroke path: keys=%q err=%v", keys, err)
-				}
+			if strings.Contains(string(calls), "list-panes") || strings.Contains(string(calls), "send-keys") {
+				t.Fatalf("remote pane observation or input crossed admission: %s", calls)
 			}
 		})
 	}
@@ -574,5 +552,270 @@ func TestAgentLifecycleKillIdempotent(t *testing.T) {
 	// Session should definitely not exist
 	if tmux.SessionExists(sessionName) {
 		t.Error("session exists after double kill")
+	}
+}
+
+func TestForcedRotationEscalatesOnlyWithVerifiedOriginalShell(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("forced rotation fixture requires POSIX shells")
+	}
+	t.Parallel()
+	const script = `#!/bin/sh
+set -eu
+root="$NTM_FORCED_ROTATION_TEST_ROOT"
+mode="$NTM_FORCED_ROTATION_TEST_MODE"
+case "$1" in
+  has-session)
+    if [ -f "$root/exit-attempted" ]; then
+      : > "$root/kill-fallback"
+      case "$mode" in
+        replacement-at-fallback|provider-at-fallback|kill-unverified|kill-replaced|kill-exited-shell-lost) ;;
+        *) printf 'stop fixture before process-tree inspection\n' >&2; exit 71 ;;
+      esac
+    fi
+    ;;
+  list-panes)
+    pid="$NTM_FORCED_ROTATION_SHELL_PID"
+    agent=cc
+    command=claude
+    if [ -f "$root/kill-preflighted" ]; then
+      case "$mode" in
+        kill-unverified) printf 'temporary kill verification failure\n' >&2; exit 79 ;;
+        kill-replaced) pid="$NTM_FORCED_ROTATION_OTHER_PID" ;;
+        kill-exited-shell-lost)
+          if ! kill -0 "$NTM_FORCED_ROTATION_AGENT_PID" 2>/dev/null; then exit 0; fi
+          ;;
+      esac
+    fi
+    if [ -f "$root/exit-attempted" ]; then
+      case "$mode" in
+        gone) exit 0 ;;
+        unverified) printf 'temporary observation failure\n' >&2; exit 72 ;;
+        replaced) pid="$NTM_FORCED_ROTATION_OTHER_PID" ;;
+        replacement-at-fallback)
+          if [ -f "$root/kill-fallback" ]; then pid="$NTM_FORCED_ROTATION_OTHER_PID"; fi
+          ;;
+        provider-at-fallback)
+          if [ -f "$root/kill-fallback" ]; then agent=cod; fi
+          ;;
+      esac
+    fi
+    printf '%%7_NTM_SEP_1_NTM_SEP_session__cc_1_NTM_SEP_%s_NTM_SEP_80_NTM_SEP_24_NTM_SEP_1_NTM_SEP_%s_NTM_SEP_0_NTM_SEP_%s_NTM_SEP__NTM_SEP__NTM_SEP_0_NTM_SEP_[]\n' "$command" "$pid" "$agent"
+    ;;
+  show-options)
+    if [ -f "$root/kill-fallback" ]; then
+      case "$mode" in
+        kill-unverified|kill-replaced|kill-exited-shell-lost) : > "$root/kill-preflighted" ;;
+        *)
+          : > "$root/forbidden-fallback"
+          printf 'replacement crossed lifecycle admission\n' >&2
+          exit 78
+          ;;
+      esac
+    fi
+    [ "$5" = '%7' ] && [ "$6" = '@ntm_agent_launch' ] || exit 73
+    cat "$root/original"
+    ;;
+  display-message)
+    [ "$4" = '%7' ] || exit 74
+    case "$5" in
+      '[#{pane_current_path}]') printf '[%s]\n' "$root" ;;
+      '[#{@ntm_agent_type}]') printf '[cc]\n' ;;
+      *) exit 75 ;;
+    esac
+    ;;
+  if-shell)
+    [ "$2" = '-F' ] && [ "$4" = '%7' ] || exit 76
+    eval "set -- $6"
+    [ "$1" = send-keys ] && [ "$3" = '%7' ] && [ "$4" = C-c ] || exit 80
+    : > "$root/exit-attempted"
+    printf 'C-c\n' >> "$root/keys"
+    case "$mode" in
+      gone|unverified|replaced|failed-send)
+        # Failed delivery cannot authorize an automatic process-kill retry,
+        # even when the original child remains positively observable.
+        printf 'ntm_pane_identity_changed\n'
+        ;;
+      *)
+        # A successfully delivered pair may leave a wedged agent active.
+        # Exercise both complete grace periods before admitting escalation.
+        ;;
+    esac
+    ;;
+  *) printf 'unexpected fixture command %s\n' "$1" >&2; exit 77 ;;
+esac
+`
+	for _, mode := range []string{"gone", "unverified", "replaced", "failed-send", "still-running", "replacement-at-fallback", "provider-at-fallback", "kill-unverified", "kill-replaced", "kill-exited-shell-lost"} {
+		mode := mode
+		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
+			root := t.TempDir()
+			tmuxPath := filepath.Join(root, "tmux")
+			if err := os.WriteFile(tmuxPath, []byte(script), 0700); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestForcedRotationLifecycleHelper$")
+			cmd.Env = envWithOverrides(os.Environ(),
+				"HOME="+root, "XDG_CONFIG_HOME="+filepath.Join(root, "config"), "XDG_DATA_HOME="+filepath.Join(root, "data"),
+				"NTM_CONFIG="+filepath.Join(root, "config.toml"), "NTM_TEST_TMUX_ENV_OWNED=1", "NTM_TMUX_BINARY="+tmuxPath,
+				"NTM_FORCED_ROTATION_TEST_ROOT="+root, "NTM_FORCED_ROTATION_TEST_MODE="+mode)
+			if output, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("forced rotation lifecycle boundary: %v\n%s", err, output)
+			}
+		})
+	}
+}
+
+func TestForcedRotationLifecycleHelper(t *testing.T) {
+	root := os.Getenv("NTM_FORCED_ROTATION_TEST_ROOT")
+	if root == "" {
+		return
+	}
+	startShell := func(active bool) (int, int) {
+		t.Helper()
+		cmd := exec.Command("/bin/sh", "-i")
+		process.DetachControllingTerminal(cmd)
+		stdin, err := cmd.StdinPipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := cmd.Start(); err != nil {
+			_ = stdin.Close()
+			t.Fatal(err)
+		}
+		var childPID int
+		t.Cleanup(func() {
+			if childPID > 0 {
+				if child, err := os.FindProcess(childPID); err == nil {
+					_ = child.Kill()
+				}
+			}
+			_ = stdin.Close()
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		})
+		if active {
+			if _, err := fmt.Fprintln(stdin, "sleep 60"); err != nil {
+				t.Fatal(err)
+			}
+			deadline := time.Now().Add(5 * time.Second)
+			for time.Now().Before(deadline) {
+				children := process.GetChildPIDs(cmd.Process.Pid, 16)
+				if len(children) == 1 && process.IsAlive(children[0]) {
+					childPID = children[0]
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if childPID == 0 {
+				t.Fatal("owned shell did not start the active fixture child")
+			}
+		}
+		return cmd.Process.Pid, childPID
+	}
+	shellPID, agentPID := startShell(true)
+	otherPID, _ := startShell(false)
+	t.Setenv("NTM_FORCED_ROTATION_SHELL_PID", strconv.Itoa(shellPID))
+	t.Setenv("NTM_FORCED_ROTATION_AGENT_PID", strconv.Itoa(agentPID))
+	t.Setenv("NTM_FORCED_ROTATION_OTHER_PID", strconv.Itoa(otherPID))
+	// Keep real lifetimes and parentage, modeling only terminal groups that a
+	// pipe-backed interactive shell lacks. Native robot tests cover real TTYs.
+	realPS, err := exec.LookPath("ps")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const psScript = `#!/bin/sh
+set -eu
+if [ "$*" != '-ww -axo pid=,ppid=,pgid=,tpgid=,stat=,lstart=,ucomm=' ]; then
+  exec "$NTM_FORCED_ROTATION_REAL_PS" "$@"
+fi
+"$NTM_FORCED_ROTATION_REAL_PS" "$@" | awk -v root="$NTM_FORCED_ROTATION_SHELL_PID" '
+  { rows[NR] = $0; if ($2 == root && $5 !~ /^[ZX]/) child = $1 }
+  END {
+    for (i = 1; i <= NR; i++) {
+      n = split(rows[i], fields)
+      if (fields[1] == root) { fields[3] = root; fields[4] = child ? child : root }
+      if (fields[2] == root) { fields[3] = fields[1]; fields[4] = fields[1] }
+      for (j = 1; j <= n; j++) printf "%s%s", fields[j], j == n ? "\n" : " "
+    }
+  }'
+`
+	if err := os.WriteFile(filepath.Join(root, "ps"), []byte(psScript), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("NTM_FORCED_ROTATION_REAL_PS", realPS)
+	t.Setenv("PATH", root+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if err := os.WriteFile(filepath.Join(root, "config.toml"), []byte("[agents]\nclaude = \"cat\"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	record, err := json.Marshal(struct {
+		PaneID string               `json:"pane_id"`
+		Spec   tmux.AgentLaunchSpec `json:"spec"`
+	}{
+		PaneID: "%7",
+		Spec: tmux.AgentLaunchSpec{
+			Version: tmux.AgentLaunchSpecVersion, AgentType: tmux.AgentClaude, Command: "cat",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "original"), []byte(base64.StdEncoding.EncodeToString(record)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	err = executeForcedRotation(t.Context(), "session", 1, "%7", "")
+	if err == nil {
+		t.Fatal("fixture must finish with a refusal, not claim a rotation completed")
+	}
+	if _, statErr := os.Stat(filepath.Join(root, "exit-attempted")); statErr != nil {
+		t.Fatalf("fixture did not reach graceful exit: result=%v observation=%v", err, statErr)
+	}
+	_, fallbackErr := os.Stat(filepath.Join(root, "kill-fallback"))
+	mode := os.Getenv("NTM_FORCED_ROTATION_TEST_MODE")
+	if !process.IsAlive(shellPID) || !process.IsAlive(otherPID) {
+		t.Fatal("forced rotation terminated an owned pane root")
+	}
+	wantAgentAlive := mode != "kill-exited-shell-lost"
+	if process.IsAlive(agentPID) != wantAgentAlive {
+		t.Fatalf("forced rotation acted on an unverified child or missed a confirmed exit: mode=%s agentAlive=%t result=%v", mode, process.IsAlive(agentPID), err)
+	}
+	keys, readErr := os.ReadFile(filepath.Join(root, "keys"))
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	wantKeys := "C-c\nC-c\nC-c\nC-c\n"
+	if mode == "gone" || mode == "unverified" || mode == "replaced" || mode == "failed-send" {
+		wantKeys = "C-c\n"
+	}
+	if string(keys) != wantKeys {
+		t.Fatalf("forced rotation skipped completed grace periods or replayed failed input: keys=%q want=%q result=%v", keys, wantKeys, err)
+	}
+	if mode == "replacement-at-fallback" || mode == "provider-at-fallback" {
+		_, forbiddenErr := os.Stat(filepath.Join(root, "forbidden-fallback"))
+		if fallbackErr != nil || !errors.Is(forbiddenErr, os.ErrNotExist) || !strings.Contains(err.Error(), "identity changed") {
+			t.Fatalf("kill fallback rebound to a replacement: result=%v fallback=%v forbidden=%v", err, fallbackErr, forbiddenErr)
+		}
+		return
+	}
+	if strings.HasPrefix(mode, "kill-") {
+		_, preflightErr := os.Stat(filepath.Join(root, "kill-preflighted"))
+		if fallbackErr != nil || preflightErr != nil || !strings.Contains(err.Error(), "could not verify the original shell") ||
+			strings.Contains(err.Error(), "survived SIGKILL") || strings.Contains(err.Error(), "--robot-restart-pane") {
+			t.Fatalf("kill observation failure was misreported as a surviving process: result=%v fallback=%v preflight=%v", err, fallbackErr, preflightErr)
+		}
+		return
+	}
+	if mode == "still-running" {
+		// The verified old shell is still hosting an agent. Keep the existing
+		// recovery ladder; the fixture stops that fallback before any signal.
+		if fallbackErr != nil {
+			t.Fatalf("verified still-running agent lost hard-kill fallback: result=%v marker=%v", err, fallbackErr)
+		}
+		return
+	}
+	if !errors.Is(fallbackErr, os.ErrNotExist) || !strings.Contains(err.Error(), "refusing to escalate") {
+		t.Fatalf("uncertain or replaced shell triggered kill fallback: result=%v marker=%v", err, fallbackErr)
 	}
 }

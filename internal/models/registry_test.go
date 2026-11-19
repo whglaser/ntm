@@ -169,6 +169,97 @@ func TestKnownModel(t *testing.T) {
 	}
 }
 
+func TestProviderQualifiedContextLimits(t *testing.T) {
+	for _, tt := range []struct {
+		model string
+		want  int
+	}{
+		{"anthropic/claude-opus-4-6", 1000000},
+		{"openrouter/anthropic/claude-opus-4-6", 1000000},
+		{"openrouter/anthropic/claude-opus-4-6-20260101", 1000000},
+		{"anthropic/opus-4.6", 1000000},
+		{"openai/gpt-5.3-codex", 256000},
+		{"google/gemini-pro", 32000},
+		{"  OpenRouter/Anthropic/Claude-Opus-4-6  ", 1000000},
+	} {
+		t.Run(tt.model, func(t *testing.T) {
+			if !KnownModel(tt.model) || GetContextLimit(tt.model) != tt.want {
+				t.Fatalf("qualified model %q: known=%t limit=%d, want known limit=%d", tt.model, KnownModel(tt.model), GetContextLimit(tt.model), tt.want)
+			}
+			budget, err := GetTokenBudgetForModel("omp", tt.model, 0)
+			if err != nil || budget != tt.want*78/100 {
+				t.Fatalf("qualified OMP budget = %d, %v; want %d", budget, err, tt.want*78/100)
+			}
+		})
+	}
+	for _, model := range []string{
+		"anthropic/unknown-model", "openrouter/stealth/union-alpha",
+		"gpt-4/unknown", "gpt-4o/custom-unknown", "anthropic/", "/claude-opus-4-6",
+		"anthropic//claude-opus-4-6", "anthropic/ /claude-opus-4-6", "anthropic/ claude-opus-4-6",
+	} {
+		t.Run(model, func(t *testing.T) {
+			if KnownModel(model) || GetContextLimit(model) != DefaultContextLimit {
+				t.Fatalf("unrecognized or malformed model %q received a known window", model)
+			}
+			if _, err := GetTokenBudgetForModel("omp", model, 0); err == nil {
+				t.Fatalf("unrecognized model %q received an explicit model budget", model)
+			}
+		})
+	}
+}
+
+func TestProviderQualifiedOverridesTakePrecedence(t *testing.T) {
+	overrides := map[string]int{
+		"anthropic/claude-opus-4-6":            4096,
+		"openrouter/anthropic/claude-opus-4-6": 8192,
+		"openrouter/stealth/union-alpha":       262144,
+		"test-provider":                        1234,
+	}
+	registryMu.RLock()
+	original := make(map[string]int)
+	for key := range overrides {
+		if limit, ok := ContextLimits[key]; ok {
+			original[key] = limit
+		}
+	}
+	registryMu.RUnlock()
+	t.Cleanup(func() {
+		registryMu.Lock()
+		defer registryMu.Unlock()
+		for key := range overrides {
+			if limit, ok := original[key]; ok {
+				ContextLimits[key] = limit
+			} else {
+				delete(ContextLimits, key)
+			}
+		}
+		rebuildSortedKeysLocked()
+	})
+	ApplyOverrides(overrides)
+	for _, tt := range []struct {
+		model string
+		want  int
+	}{
+		{"anthropic/claude-opus-4-6", 4096},
+		{"anthropic/claude-opus-4-6-20260101", 4096},
+		{"anthropic/claude-opus-4-6-preview", 4096},
+		{"openrouter/anthropic/claude-opus-4-6", 8192},
+		{"openrouter/anthropic/claude-opus-4-6-20260101", 8192},
+		{"proxy/openrouter/anthropic/claude-opus-4-6", 8192},
+		{"proxy/anthropic/claude-opus-4-6", 4096},
+		{"openrouter/stealth/union-alpha", 262144},
+		{"claude-opus-4-6", 1000000},
+		{"test-provider/claude-opus-4-6", 1000000},
+	} {
+		if !KnownModel(tt.model) || GetContextLimit(tt.model) != tt.want {
+			t.Errorf("override resolution for %q: known=%t limit=%d; want %d", tt.model, KnownModel(tt.model), GetContextLimit(tt.model), tt.want)
+		}
+	}
+	if KnownModel("test-provider/unknown") {
+		t.Fatal("provider name override was used as the unknown model's window")
+	}
+}
+
 func TestSuggestModel(t *testing.T) {
 	tests := []struct {
 		model string
@@ -200,5 +291,87 @@ func TestSuggestModelDeterministicTies(t *testing.T) {
 		if got := SuggestModel("claude-opus5"); got != first {
 			t.Fatalf("SuggestModel non-deterministic: %q then %q", first, got)
 		}
+	}
+}
+
+func TestGetTokenBudgetForModel(t *testing.T) {
+	tests := []struct {
+		name, agentType, model string
+		window, want           int
+		wantErr                bool
+	}{
+		{"agent default", "claude", "", 0, 180000, false},
+		{"current large model", "cc", "claude-opus-5", 0, 900000, false},
+		{"smaller model", "gmi", "gemini-pro", 0, 3200, false},
+		{"codex model", "openai-codex", "gpt-4o-mini", 0, 120320, false},
+		{"model normalization", "cc", " Claude-Opus-5 ", 0, 900000, false},
+		{"reported window wins", "cc", "claude-opus-5", 32000, 28800, false},
+		{"custom reported window", "cc", "custom-provider-model", 8192, 7372, false},
+		{"unknown agent with window", "unknown", "", 10000, 7800, false},
+		{"legacy unknown agent", "unknown", "", 0, 100000, false},
+		{"unknown model", "cc", "custom-provider-model", 0, 0, true},
+		{"negative window", "cc", "claude-opus-5", -1, 0, true},
+		{"no working space", "gmi", "gemini-pro", 1, 0, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := GetTokenBudgetForModel(tt.agentType, tt.model, tt.window)
+			if (err != nil) != tt.wantErr || got != tt.want {
+				t.Fatalf("budget = %d, %v; want %d, error=%t", got, err, tt.want, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestGetTokenBudgetForModelUsesOverrides(t *testing.T) {
+	original := GetContextLimit("claude-opus-5")
+	t.Cleanup(func() { ApplyOverrides(map[string]int{"claude-opus-5": original}) })
+	ApplyOverrides(map[string]int{"claude-opus-5": 10000})
+	got, err := GetTokenBudgetForModel("cc", "claude-opus-5", 0)
+	if err != nil || got != 9000 {
+		t.Fatalf("model override was ignored: %d, %v", got, err)
+	}
+	got, err = GetTokenBudgetForModel("cc", "claude-opus-5", 20000)
+	if err != nil || got != 18000 {
+		t.Fatalf("reported window did not override registry: %d, %v", got, err)
+	}
+}
+
+func TestGetTokenBudgetForModelDoesNotOverflow(t *testing.T) {
+	window := int(^uint(0) >> 1)
+	want := window - window/10
+	if window%10 != 0 {
+		want-- // floor(90% of window), computed without multiplication
+	}
+	got, err := GetTokenBudgetForModel("cc", "custom-model", window)
+	if err != nil || got != want {
+		t.Fatalf("large window overflowed: %d, %v; want %d", got, err, want)
+	}
+}
+
+func TestLookupContextLimitDistinguishesKnownCapacityFromDefault(t *testing.T) {
+	for _, tc := range []struct {
+		model string
+		want  int
+		known bool
+	}{
+		{"gpt-4", 128000, true},
+		{"openrouter/anthropic/claude-opus-4-6", 1000000, true},
+		{"anthropic/opus-4.6", 1000000, true},
+		{"claude-opus-4-20250514", 200000, true},
+		{"private-provider/new-model", 0, false},
+		{"gpt-4/unknown-model", 0, false},
+		{"anthropic//claude-opus-4-6", 0, false},
+		{"", 0, false},
+	} {
+		t.Run(tc.model, func(t *testing.T) {
+			limit, known := LookupContextLimit(tc.model)
+			if limit != tc.want || known != tc.known {
+				t.Fatalf("capacity = (%d, %t), want (%d, %t)", limit, known, tc.want, tc.known)
+			}
+			if !known && GetContextLimit(tc.model) != DefaultContextLimit {
+				t.Fatal("display fallback changed while separating unknown capacity")
+			}
+		})
 	}
 }

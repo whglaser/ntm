@@ -367,7 +367,7 @@ func buildRobotRegistry() *RobotRegistry {
 			Name:                    command.Name,
 			Flag:                    command.Flag,
 			Category:                command.Category,
-			Summary:                 summarizeDescription(command.Description),
+			Summary:                 firstNonEmptyString(strings.TrimSpace(command.Summary), summarizeDescription(command.Description)),
 			Description:             command.Description,
 			Note:                    command.Note,
 			Unavailable:             command.Unavailable,
@@ -895,6 +895,13 @@ func buildRobotSurfaceMetadata() map[string]robotSurfaceMetadata {
 				EvidenceSummaryField: "steps[].policy",
 			},
 		},
+		"policy-decisions": {
+			Sections: []string{"events"},
+			ConsumerGuidance: &ConsumerGuidance{
+				IntendedUse: "Inspect durable policy and operator audit decisions recorded in the runtime state store",
+				SummaryHint: "Filter by --policy-entity-type and --policy-entity-id when auditing a specific resource",
+			},
+		},
 		"xf-search": {
 			Sections: []string{"events"},
 		},
@@ -909,6 +916,13 @@ func buildRobotSurfaceMetadata() map[string]robotSurfaceMetadata {
 		},
 		"ensemble-stop": {
 			Sections: []string{"sessions", "next_actions"},
+		},
+		"ensemble-synthesize": {
+			Sections: []string{"sessions", "next_actions"},
+			ConsumerGuidance: &ConsumerGuidance{
+				IntendedUse: "Synthesize completed reasoning mode outputs for an ensemble session with disagreement audit and redundancy analysis",
+				SummaryHint: "Inspect report, audit, and formatted_output; pass --synth-force to synthesize completed modes before all panes finish",
+			},
 		},
 		"proxy-status": {
 			Sections: []string{"source_health"},
@@ -996,6 +1010,330 @@ func buildRobotSurfaceMetadata() map[string]robotSurfaceMetadata {
 				SupportsActions:   true,
 				ActionTypes:       []string{"acknowledge", "remediation"},
 				RemediationFormat: "next_actions with recovery commands",
+			},
+		},
+		"ubs-scan": {
+			SchemaType: "ubs_scan",
+			Sections:   []string{"source_health", "next_actions"},
+			ConsumerGuidance: &ConsumerGuidance{
+				IntendedUse: "Run full or incremental UBS static bug scans (staged, diff, file, or directory) in JSON",
+				SummaryHint: "Inspect summary.healthy and triage_preview for top-priority findings",
+			},
+		},
+		"handoff": {
+			SchemaID:   "ntm:robot:handoff:v1",
+			SchemaType: "handoff",
+			Sections:   []string{"sessions", "next_actions"},
+			ConsumerGuidance: &ConsumerGuidance{
+				IntendedUse: "Inspect or create Goal/Now session continuity handoffs with 4-dimension quality scoring",
+				SummaryHint: "Read latest, quality, handoffs, and ledger; pass --handoff-create with --handoff-goal/--handoff-now or --handoff-auto to persist a new handoff",
+			},
+			Boundedness: &BoundednessInfo{
+				DefaultLimit:       10,
+				SupportsPagination: false,
+				TruncationBehavior: "Recent handoffs capped by --handoff-limit (default 10)",
+			},
+		},
+		"analytics": {
+			SchemaID:   "ntm:robot:analytics:v1",
+			SchemaType: "analytics",
+			Sections:   []string{"summary", "sessions", "next_actions"},
+			ConsumerGuidance: &ConsumerGuidance{
+				IntendedUse: "Inspect aggregated multi-harness session, prompt, token, crash, restart, and error analytics from event history",
+				SummaryHint: "Read total_sessions, total_agents, agent_breakdown, error_types, agent_crashes, and agent_restarts; pass --analytics-sessions for per-session breakdown",
+			},
+			Boundedness: &BoundednessInfo{
+				SupportsPagination: false,
+				TruncationBehavior: "Bounded to events within --analytics-days (default 30) or --analytics-since window",
+			},
+		},
+		"audit": {
+			SchemaID:   "ntm:robot:audit:v1",
+			SchemaType: "audit",
+			Sections:   []string{"events", "source_health", "next_actions"},
+			ConsumerGuidance: &ConsumerGuidance{
+				IntendedUse: "Query, regex-search, list, or verify tamper-evident JSONL audit logs and projection source health",
+				SummaryHint: "Read entries/logs/files/sources based on action; follow pagination and _agent_hints.next_offset for continuation",
+			},
+			Boundedness: &BoundednessInfo{
+				DefaultLimit:       50,
+				SupportsPagination: true,
+				TruncationBehavior: "Results paged via --audit-limit (default 50) and --audit-offset",
+			},
+		},
+		"timeline": {
+			SchemaID:   "ntm:robot:timeline:v1",
+			SchemaType: "timeline",
+			Sections:   []string{"sessions", "events", "next_actions"},
+			ConsumerGuidance: &ConsumerGuidance{
+				IntendedUse: "List persisted session timelines, inspect agent state transitions for a session, or compute storage statistics",
+				SummaryHint: "Read timelines for list, info/session_stats/events for show, and aggregate_stats for stats",
+			},
+			Boundedness: &BoundednessInfo{
+				DefaultLimit:       20,
+				SupportsPagination: false,
+				TruncationBehavior: "Saved timelines capped by --timeline-limit (default 20)",
+			},
+		},
+		"doctor": {
+			SchemaID:   doctorSchemaID,
+			SchemaType: "doctor",
+			Sections:   []string{"source_health", "next_actions"},
+			ConsumerGuidance: &ConsumerGuidance{
+				IntendedUse: "Validate NTM ecosystem health, tools, dependencies, daemons, configuration, invariants, and shared-resource contention",
+				SummaryHint: "Read overall, tools, dependencies, daemons, configuration, invariants, guard_hook, and contention; pass --doctor-contention to scan active process locks",
+			},
+			Boundedness: &BoundednessInfo{
+				SupportsPagination: false,
+				TruncationBehavior: "Bounded to installed tool/dependency/daemon/config/invariant checks and live contention holders",
+			},
+		},
+		"preflight": {
+			SchemaID:   preflightSchemaID,
+			SchemaType: "preflight",
+			Sections:   []string{"next_actions"},
+			ConsumerGuidance: &ConsumerGuidance{
+				IntendedUse: "Lint and validate a prompt for secrets, destructive commands, PII, and size limits before sending to agents",
+				SummaryHint: "Read success, findings, error_count, warning_count, estimated_tokens, and preview; pass --preflight-strict to escalate warnings to errors",
+			},
+			Boundedness: &BoundednessInfo{
+				SupportsPagination: false,
+				TruncationBehavior: "Bounded to lint findings for one submitted prompt; preview truncated at 500 characters",
+			},
+		},
+		"scale": {
+			SchemaID:   scaleSchemaID,
+			SchemaType: "scale",
+			Sections:   []string{"sessions", "next_actions"},
+			ConsumerGuidance: &ConsumerGuidance{
+				IntendedUse: "Scale session agent counts up or down across all 11 built-in harnesses in one structured call",
+				SummaryHint: "Read before, after, actions, and errors; pass --dry-run to preview or --force when scaling down active panes",
+			},
+			Boundedness: &BoundednessInfo{
+				SupportsPagination: false,
+				TruncationBehavior: "Bounded to one action row per scaled harness in the target session",
+			},
+		},
+		"rebalance": {
+			SchemaID:   rebalanceSchemaID,
+			SchemaType: "rebalance",
+			Sections:   []string{"sessions", "work", "next_actions"},
+			ConsumerGuidance: &ConsumerGuidance{
+				IntendedUse: "Analyze per-pane bead assignment imbalance, check tile geometry uniformity, and optionally apply rebalance transfers",
+				SummaryHint: "Read imbalance_score, recommendation, workloads, transfers, and geometry; pass --rebalance-apply to execute transfers",
+			},
+			Boundedness: &BoundednessInfo{
+				SupportsPagination: false,
+				TruncationBehavior: "Bounded to panes and active bead assignments in the target session",
+			},
+		},
+		"review-queue": {
+			SchemaID:   reviewQueueSchemaID,
+			SchemaType: "review_queue",
+			Sections:   []string{"sessions", "work", "next_actions"},
+			ConsumerGuidance: &ConsumerGuidance{
+				IntendedUse: "Identify idle session agents and generate or dispatch peer-review prompts from completed beads and recent git commits",
+				SummaryHint: "Read idle_agents, suggestions, dispatched, sent, and skipped; pass --review-dispatch to deliver prompts automatically",
+			},
+			Boundedness: &BoundednessInfo{
+				DefaultLimit:       5,
+				SupportsPagination: false,
+				TruncationBehavior: "Bounded to idle panes in the target session and recent git commits (--review-commits, default 5)",
+			},
+		},
+		"coordinator": {
+			SchemaID:   coordinatorSchemaID,
+			SchemaType: "coordinator",
+			Sections:   []string{"sessions", "coordination", "next_actions"},
+			ConsumerGuidance: &ConsumerGuidance{
+				IntendedUse: "Inspect session coordinator agent status, generate or send coordination digests, or list active file reservation conflicts",
+				SummaryHint: "Read agents/runtime/config for status, digest/digest_sent for digest, and conflicts/conflict_count for conflicts",
+			},
+			Boundedness: &BoundednessInfo{
+				SupportsPagination: false,
+				TruncationBehavior: "Bounded to panes, digest summary, and active file reservation conflicts for one session",
+			},
+		},
+		"webhook-outbox": {
+			SchemaID:   webhookOutboxSchemaID,
+			SchemaType: "webhook_outbox",
+			Sections:   []string{"events", "source_health", "next_actions"},
+			ConsumerGuidance: &ConsumerGuidance{
+				IntendedUse: "Inspect, retry, or archive durable project webhook outbox receipts without starting background HTTP senders",
+				SummaryHint: "Read snapshot.entries and each entry revision on list; pass --outbox-record and --outbox-revision for retry or archive",
+			},
+			Boundedness: &BoundednessInfo{
+				SupportsPagination: false,
+				TruncationBehavior: "Bounded to retained durable webhook outbox receipt files in the project directory",
+			},
+		},
+		"adopt": {
+			SchemaID:   adoptSchemaID,
+			SchemaType: "adopt",
+			Sections:   []string{"sessions", "next_actions"},
+			ConsumerGuidance: &ConsumerGuidance{
+				IntendedUse: "Adopt an external tmux session into NTM management across all 11 agent harnesses plus user panes",
+				SummaryHint: "Read adopted_panes, total_panes, and agents; pass --dry-run first or --adopt-by-window for window-per-agent sessions",
+			},
+			Boundedness: &BoundednessInfo{
+				SupportsPagination: false,
+				TruncationBehavior: "Bounded to panes in the target tmux session",
+			},
+		},
+		"redact": {
+			SchemaID:   redactSchemaID,
+			SchemaType: "redact",
+			Sections:   []string{"source_health"},
+			ConsumerGuidance: &ConsumerGuidance{
+				IntendedUse: "Preview secret/PII detection findings and safe-redacted output without exposing raw matched secrets",
+				SummaryHint: "Read finding_count, findings (category, redacted token, line, column), and safe output",
+			},
+			Boundedness: &BoundednessInfo{
+				SupportsPagination: false,
+				TruncationBehavior: "Bounded to findings detected within the single inline text or file input",
+			},
+		},
+		"hooks": {
+			SchemaID:   hooksSchemaID,
+			SchemaType: "hooks",
+			Sections:   []string{"source_health", "next_actions"},
+			ConsumerGuidance: &ConsumerGuidance{
+				IntendedUse: "Inspect installed repository git hooks or execute pre-commit, pre-push, commit-msg, post-commit, or post-checkout checks",
+				SummaryHint: "Read hooks and installed_count on status, or passed, pre_commit_result, and check_result on run",
+			},
+			Boundedness: &BoundednessInfo{
+				SupportsPagination: false,
+				TruncationBehavior: "Bounded to the 5 managed git hook slots or a single hook execution report",
+			},
+		},
+		"personas": {
+			SchemaID:   personasSchemaID,
+			SchemaType: "personas",
+			Sections:   []string{"sessions"},
+			ConsumerGuidance: &ConsumerGuidance{
+				IntendedUse: "List built-in, user, and project agent personas and profile sets with 11-harness alias and tag filtering",
+				SummaryHint: "Read personas, profile_sets, count, and builtin_count; filter with --personas-agent or --personas-tag",
+			},
+			Boundedness: &BoundednessInfo{
+				SupportsPagination: false,
+				TruncationBehavior: "Bounded to configured built-in, user, and project persona definitions",
+			},
+		},
+		"saved-sessions": {
+			SchemaID:   savedSessionsSchemaID,
+			SchemaType: "saved_sessions",
+			Sections:   []string{"sessions"},
+			ConsumerGuidance: &ConsumerGuidance{
+				IntendedUse: "List, inspect (with 11-harness counts and casr/native resume readiness), capture, archive, or unarchive saved session snapshots",
+				SummaryHint: "Read sessions and count on list, or state and resumable_panes on show/save",
+			},
+			Boundedness: &BoundednessInfo{
+				SupportsPagination: false,
+				TruncationBehavior: "Bounded to saved session snapshot files stored under ~/.ntm/sessions",
+			},
+		},
+		"mapping": {
+			SchemaID:   mappingSchemaID,
+			SchemaType: "mapping",
+			Sections:   []string{"sessions", "source_health"},
+			ConsumerGuidance: &ConsumerGuidance{
+				IntendedUse: "Resolve Agent Mail names to live tmux panes, reconcile canonical identity files, publish/withdraw border badges, and surface drift",
+				SummaryHint: "Read entries, count, discrepancies, and badges for the target session",
+			},
+			Boundedness: &BoundednessInfo{
+				SupportsPagination: false,
+				TruncationBehavior: "Bounded to mapped panes and discrepancy records in the target tmux session",
+			},
+		},
+		"workflows": {
+			SchemaID:   workflowsSchemaID,
+			SchemaType: "workflows",
+			Sections:   []string{"sessions"},
+			ConsumerGuidance: &ConsumerGuidance{
+				IntendedUse: "List workflow coordination templates (ping-pong, pipeline, parallel, review-gate) or inspect one template with trigger validation",
+				SummaryHint: "Read workflows and total on list, or workflow and validated_triggers when --workflows-name is set",
+			},
+			Boundedness: &BoundednessInfo{
+				SupportsPagination: false,
+				TruncationBehavior: "Bounded to built-in, user, and project workflow template definitions",
+			},
+		},
+		"session-templates": {
+			SchemaID:   sessionTemplatesSchemaID,
+			SchemaType: "session_templates",
+			Sections:   []string{"sessions"},
+			ConsumerGuidance: &ConsumerGuidance{
+				IntendedUse: "List built-in, user, and project multi-agent session templates or inspect a template specification by name",
+				SummaryHint: "Read templates and total on list, or template when --template-name is set",
+			},
+			Boundedness: &BoundednessInfo{
+				SupportsPagination: false,
+				TruncationBehavior: "Bounded to built-in, user, and project session template definitions",
+			},
+		},
+		"grep": {
+			SchemaID:   grepSchemaID,
+			SchemaType: "grep",
+			Sections:   []string{"sessions"},
+			ConsumerGuidance: &ConsumerGuidance{
+				IntendedUse: "Search captured tmux pane scrollback with regular expressions across one or all sessions and all 11 agent harnesses",
+				SummaryHint: "Read matches, matching_panes, match_count, and panes_searched",
+			},
+			Boundedness: &BoundednessInfo{
+				SupportsPagination: false,
+				TruncationBehavior: "Bounded per pane by --lines (default 1000)",
+			},
+		},
+		"extract": {
+			SchemaID:   extractSchemaID,
+			SchemaType: "extract",
+			Sections:   []string{"sessions"},
+			ConsumerGuidance: &ConsumerGuidance{
+				IntendedUse: "Extract fenced Markdown code blocks, language tags, and inferred target file paths from captured session pane scrollback",
+				SummaryHint: "Read blocks, total_found, and panes_scanned",
+			},
+			Boundedness: &BoundednessInfo{
+				SupportsPagination: false,
+				TruncationBehavior: "Bounded per pane by --lines (default 500)",
+			},
+		},
+		"validate": {
+			SchemaID:   validateSchemaID,
+			SchemaType: "validate",
+			Sections:   []string{"summary"},
+			ConsumerGuidance: &ConsumerGuidance{
+				IntendedUse: "Validate main config.toml, project .ntm/config.toml, recipes.toml, personas.toml, policy.yaml, and 11-harness executables",
+				SummaryHint: "Read valid, summary, and results[].errors / results[].warnings",
+			},
+			Boundedness: &BoundednessInfo{
+				SupportsPagination: false,
+				TruncationBehavior: "Bounded to active user and project configuration files",
+			},
+		},
+		"plugins": {
+			SchemaID:   pluginsSchemaID,
+			SchemaType: "plugins",
+			Sections:   []string{"summary"},
+			ConsumerGuidance: &ConsumerGuidance{
+				IntendedUse: "Inspect installed TOML agent plugins and executable command plugins from the active NTM config directory",
+				SummaryHint: "Read agent_plugins, command_plugins, and total_count",
+			},
+			Boundedness: &BoundednessInfo{
+				SupportsPagination: false,
+				TruncationBehavior: "Bounded to installed files in agents/ and commands/ plugin directories",
+			},
+		},
+		"models": {
+			SchemaID:   modelsSchemaID,
+			SchemaType: "models",
+			Sections:   []string{"summary"},
+			ConsumerGuidance: &ConsumerGuidance{
+				IntendedUse: "Recommend local coding models from detected GPU VRAM or list installed Ollama models and storage usage",
+				SummaryHint: "Read detected_vram_gb and recommendations on recommend, or models and disk_low on list",
+			},
+			Boundedness: &BoundednessInfo{
+				SupportsPagination: false,
+				TruncationBehavior: "Bounded to installed local Ollama models and 4 VRAM recommendation tiers",
 			},
 		},
 	}

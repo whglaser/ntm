@@ -92,7 +92,7 @@ func init() {
 		},
 		REST: &kernel.RESTBinding{
 			Method: "GET",
-			Path:   "/deps",
+			Path:   "/api/v1/deps",
 		},
 		Examples: []kernel.Example{
 			{
@@ -109,7 +109,10 @@ func init() {
 		SafetyLevel: kernel.SafetySafe,
 		Idempotent:  true,
 	})
-	kernel.MustRegisterHandler("core.deps", func(ctx context.Context, _ any) (any, error) {
+	kernel.MustRegisterHandler("core.deps", func(ctx context.Context, input any) (any, error) {
+		if _, err := decodeKernelInput[DepsInput]("core.deps", input); err != nil {
+			return nil, err
+		}
 		return buildDepsResponse()
 	})
 }
@@ -362,7 +365,7 @@ func runDeps(verbose bool) error {
 
 	if missingRequired {
 		fmt.Printf("%s✗%s Missing required dependencies!\n", colorize(t.Error), "\033[0m")
-		os.Exit(1)
+		return newSilentExitError(1)
 	} else if agentsAvailable == 0 {
 		fmt.Printf("%s⚠%s No AI agents installed. Install at least one to use ntm spawn.\n",
 			colorize(t.Warning), "\033[0m")

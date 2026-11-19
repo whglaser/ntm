@@ -2624,118 +2624,172 @@ func TestRegisteredPluginActivityAndLiveBusy(t *testing.T) {
 	}
 }
 
-// TestClassifyStatePluginIdleOutranksTruncatedFooterDots covers ntm-l6cuz.7: a
-// capture ending in pi's truncated stats footer matches dots_spinner (70), but
-// the plugin's declared idle pattern (92) is readiness evidence and must win.
-// A genuine spinner frame without the plugin idle signal still reads THINKING.
-func TestClassifyStatePluginIdleOutranksTruncatedFooterDots(t *testing.T) {
-	const pluginType = "pi-footer-classifier-fixture"
-	if err := agent.RegisterPlugin(pluginType, []string{`CH99\.2%`}, nil, nil); err != nil {
-		t.Fatalf("register fixture plugin: %v", err)
-	}
+// Same-package test inspection and reset helpers for VelocityTracker, StateClassifier, and ActivityMonitor.
 
-	finished := NewStateClassifier("%7", &ClassifierConfig{AgentType: pluginType})
-	activity, err := finished.ClassifyWithOutput("↑99k ↓27k R1.4M CH99.2%...")
-	if err != nil || activity == nil {
-		t.Fatalf("classify finished footer: %+v, %v", activity, err)
-	}
-	if activity.State != StateWaiting {
-		t.Fatalf("finished pane state = %s (patterns %v), want waiting", activity.State, activity.DetectedPatterns)
-	}
-	if !slices.Contains(activity.DetectedPatterns, "plugin_idle") || !slices.Contains(activity.DetectedPatterns, "dots_spinner") {
-		t.Fatalf("fixture must match both patterns, got %v", activity.DetectedPatterns)
-	}
-	if activity.StateSource != "scrape" {
-		t.Fatalf("state source = %q, want scrape", activity.StateSource)
-	}
+func (vt *VelocityTracker) CurrentVelocity() float64 {
+	vt.mu.Lock()
+	defer vt.mu.Unlock()
 
-	live := NewStateClassifier("%8", &ClassifierConfig{AgentType: pluginType})
-	activity, err = live.ClassifyWithOutput("Scanning repository layout ...")
-	if err != nil || activity == nil {
-		t.Fatalf("classify live spinner: %+v, %v", activity, err)
+	if len(vt.Samples) == 0 {
+		return 0
 	}
-	if activity.State != StateThinking {
-		t.Fatalf("live spinner state = %s (patterns %v), want thinking", activity.State, activity.DetectedPatterns)
-	}
+	return vt.Samples[len(vt.Samples)-1].Velocity
 }
 
-// activityFakeProgramStatus is the OSC report seam shared by the wait and
-// activity surfaces (ntm-l6cuz.2).
-type activityFakeProgramStatus map[string]status.AgentStatus
+func (vt *VelocityTracker) AverageVelocity() float64 {
+	vt.mu.Lock()
+	defer vt.mu.Unlock()
 
-func (f activityFakeProgramStatus) DetectReport(paneID string) (status.AgentStatus, bool) {
-	report, ok := f[paneID]
-	return report, ok
+	if len(vt.Samples) == 0 {
+		return 0
+	}
+
+	var sum float64
+	for _, s := range vt.Samples {
+		sum += s.Velocity
+	}
+	return sum / float64(len(vt.Samples))
 }
 
-func TestRobotStateFromProgramStatusMapping(t *testing.T) {
-	for _, tc := range []struct {
-		status status.AgentState
-		want   AgentState
-		known  bool
-	}{
-		{status.StateIdle, StateWaiting, true},
-		{status.StateWorking, StateGenerating, true},
-		{status.StateError, StateError, true},
-		{status.StateUnknown, StateUnknown, false},
-	} {
-		got, known := robotStateFromPromptStatus(tc.status)
-		if got != tc.want || known != tc.known {
-			t.Errorf("robotStateFromPromptStatus(%q) = (%q, %v), want (%q, %v)", tc.status, got, known, tc.want, tc.known)
+func (vt *VelocityTracker) RecentVelocity(n int) float64 {
+	vt.mu.Lock()
+	defer vt.mu.Unlock()
+
+	if len(vt.Samples) == 0 {
+		return 0
+	}
+
+	if n <= 0 || n > len(vt.Samples) {
+		n = len(vt.Samples)
+	}
+
+	var sum float64
+	start := len(vt.Samples) - n
+	for i := start; i < len(vt.Samples); i++ {
+		sum += vt.Samples[i].Velocity
+	}
+	return sum / float64(n)
+}
+
+func (vt *VelocityTracker) SampleCount() int {
+	vt.mu.Lock()
+	defer vt.mu.Unlock()
+	return len(vt.Samples)
+}
+
+func (vt *VelocityTracker) GetSamples() []VelocitySample {
+	vt.mu.Lock()
+	defer vt.mu.Unlock()
+
+	result := make([]VelocitySample, len(vt.Samples))
+	copy(result, vt.Samples)
+	return result
+}
+
+func (vt *VelocityTracker) Reset() {
+	vt.mu.Lock()
+	defer vt.mu.Unlock()
+
+	vt.Samples = vt.Samples[:0]
+	vt.LastCapture = ""
+	vt.LastCaptureAt = time.Time{}
+	vt.lastOutputAt = time.Time{}
+	vt.baselineHash = ""
+	vt.baselineRuneCount = 0
+	vt.persistToStore()
+}
+
+func (sc *StateClassifier) CurrentState() AgentState {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	return sc.currentState
+}
+
+func (sc *StateClassifier) Reset() {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+
+	sc.velocityTracker.Reset()
+	sc.currentState = StateUnknown
+	sc.stateSince = time.Now()
+	sc.stateHistory = sc.stateHistory[:0]
+	sc.pendingState = ""
+	sc.pendingSince = time.Time{}
+	sc.lastPatterns = nil
+	sc.lastOutputContent = ""
+}
+
+func (sc *StateClassifier) GetStateHistory() []StateTransition {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	return sc.getHistoryCopy()
+}
+
+func (sc *StateClassifier) StateDuration() time.Duration {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	return time.Since(sc.stateSince)
+}
+
+func (am *ActivityMonitor) Get(paneID string) *StateClassifier {
+	am.mu.RLock()
+	defer am.mu.RUnlock()
+	return am.classifiers[paneID]
+}
+
+func (am *ActivityMonitor) Remove(paneID string) {
+	am.mu.Lock()
+	defer am.mu.Unlock()
+	delete(am.classifiers, paneID)
+}
+
+func (am *ActivityMonitor) ClassifyAll() (map[string]*AgentActivity, map[string]error) {
+	am.mu.RLock()
+	paneIDs := make([]string, 0, len(am.classifiers))
+	for id := range am.classifiers {
+		paneIDs = append(paneIDs, id)
+	}
+	am.mu.RUnlock()
+
+	activities := make(map[string]*AgentActivity)
+	errors := make(map[string]error)
+
+	for _, paneID := range paneIDs {
+		classifier := am.Get(paneID)
+		if classifier == nil {
+			continue
+		}
+
+		activity, err := classifier.Classify()
+		if err != nil {
+			errors[paneID] = err
+		} else {
+			activities[paneID] = activity
 		}
 	}
+
+	return activities, errors
 }
 
-func TestApplyProgramStatusOverridesAndSynthesizes(t *testing.T) {
-	scraped := &AgentActivity{
-		PaneID:           "%1",
-		AgentType:        "claude",
-		State:            StateThinking,
-		StateSource:      activityStateSourceScrape,
-		Confidence:       0.8,
-		Velocity:         12.5,
-		DetectedPatterns: []string{"claude_spinner_running"},
-		RateLimited:      true,
-	}
-	detector := activityFakeProgramStatus{
-		"%1": {PaneID: "%1", State: status.StateIdle, StateSource: status.StateSourceOSC, ReportAgeSeconds: 42},
-	}
+func (am *ActivityMonitor) GetAllStates() map[string]AgentState {
+	am.mu.RLock()
+	defer am.mu.RUnlock()
 
-	overridden, applied := ApplyProgramStatus(detector, "%1", "claude", scraped)
-	if !applied {
-		t.Fatal("fresh OSC report did not apply")
+	result := make(map[string]AgentState, len(am.classifiers))
+	for paneID, classifier := range am.classifiers {
+		result[paneID] = classifier.CurrentState()
 	}
-	if overridden.State != StateWaiting || overridden.StateSource != activityStateSourceOSC || overridden.ReportAgeSeconds != 42 || overridden.Confidence != 1.0 {
-		t.Fatalf("override = %+v, want WAITING/osc/42s/1.0", overridden)
-	}
-	// Scrape metadata is preserved: only the authoritative fields change.
-	if overridden.Velocity != 12.5 || len(overridden.DetectedPatterns) != 1 || !overridden.RateLimited {
-		t.Fatalf("scrape metadata was dropped: %+v", overridden)
-	}
+	return result
+}
 
-	// A pane the classifier could not read at all is still decided by the
-	// agent's own report.
-	synthesized, applied := ApplyProgramStatus(detector, "%1", "claude", nil)
-	if !applied || synthesized == nil {
-		t.Fatal("OSC report did not decide an unclassified pane")
-	}
-	if synthesized.State != StateWaiting || synthesized.AgentType != "claude" {
-		t.Fatalf("synthesized = %+v, want WAITING/claude", synthesized)
-	}
+func (am *ActivityMonitor) Clear() {
+	am.mu.Lock()
+	defer am.mu.Unlock()
+	am.classifiers = make(map[string]*StateClassifier)
+}
 
-	// No detector, no report, and unknown states leave the scrape in charge.
-	for name, tc := range map[string]struct {
-		detector ProgramStatusDetector
-		paneID   string
-	}{
-		"nil detector": {nil, "%1"},
-		"no report":    {activityFakeProgramStatus{}, "%1"},
-		"unknown":      {activityFakeProgramStatus{"%1": {PaneID: "%1", State: status.StateUnknown}}, "%1"},
-		"empty pane":   {detector, ""},
-	} {
-		got, applied := ApplyProgramStatus(tc.detector, tc.paneID, "claude", scraped)
-		if applied || got != scraped {
-			t.Errorf("%s: got (%+v, %v), want the untouched scrape", name, got, applied)
-		}
-	}
+func (am *ActivityMonitor) Count() int {
+	am.mu.RLock()
+	defer am.mu.RUnlock()
+	return len(am.classifiers)
 }

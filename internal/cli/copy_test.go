@@ -1,7 +1,12 @@
 package cli
 
 import (
+	"bytes"
+	"os"
+	"path/filepath"
 	"regexp"
+	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/Dicklesworthstone/ntm/internal/clipboard"
@@ -259,5 +264,121 @@ func TestPaneMatchesSelector_EdgeCases(t *testing.T) {
 					tt.pane, tt.selector, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestCopyCommandPasteFlagReadsFiltersAndWrites(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("fake wl-paste test requires linux clipboard backend selection")
+	}
+
+	binDir := t.TempDir()
+	clipBody := "header line\n```go\nfmt.Println(\"hello\")\n```\nERROR: boom\n"
+	clipFile := filepath.Join(binDir, "clipboard.txt")
+	if err := os.WriteFile(clipFile, []byte(clipBody), 0o644); err != nil {
+		t.Fatalf("write clipboard fixture: %v", err)
+	}
+	for name, script := range map[string]string{
+		"wl-copy":  "#!/bin/sh\ncat > " + clipFile + "\n",
+		"wl-paste": "#!/bin/sh\ncat " + clipFile + "\n",
+	} {
+		p := filepath.Join(binDir, name)
+		if err := os.WriteFile(p, []byte(script), 0o755); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("WAYLAND_DISPLAY", "wayland-0")
+	t.Setenv("XDG_SESSION_TYPE", "wayland")
+	t.Setenv("WSL_DISTRO_NAME", "")
+	t.Setenv("WSL_INTEROP", "")
+
+	// 1. Raw paste to stdout
+	var out bytes.Buffer
+	cmd := newCopyCmd()
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"--paste"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("copy --paste failed: %v", err)
+	}
+	if out.String() != clipBody {
+		t.Fatalf("copy --paste = %q, want %q", out.String(), clipBody)
+	}
+
+	// 2. Code-only paste to stdout
+	out.Reset()
+	cmd = newCopyCmd()
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"--paste", "--code"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("copy --paste --code failed: %v", err)
+	}
+	if strings.TrimSpace(out.String()) != `fmt.Println("hello")` {
+		t.Fatalf("copy --paste --code = %q, want extracted code block", out.String())
+	}
+
+	// 3. Pattern-filtered paste to output file
+	destFile := filepath.Join(t.TempDir(), "filtered.txt")
+	out.Reset()
+	cmd = newCopyCmd()
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"--paste", "--pattern", "ERROR", "--output", destFile, "--quiet"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("copy --paste --pattern --output failed: %v", err)
+	}
+	saved, err := os.ReadFile(destFile)
+	if err != nil {
+		t.Fatalf("read saved paste output: %v", err)
+	}
+	if string(saved) != "ERROR: boom" {
+		t.Fatalf("saved paste file = %q, want %q", string(saved), "ERROR: boom")
+	}
+}
+
+func TestCopyAgentFilter_MultiHarness(t *testing.T) {
+	t.Parallel()
+
+	cmd := newCopyCmd()
+	for _, flagName := range []string{"agy", "grok", "omp", "oc"} {
+		if cmd.Flags().Lookup(flagName) == nil {
+			t.Fatalf("expected --%s flag on copy command", flagName)
+		}
+	}
+
+	if !(AgentFilter{}).IsEmpty() {
+		t.Fatal("zero AgentFilter should be empty")
+	}
+	for _, nonEmpty := range []AgentFilter{
+		{Antigravity: true},
+		{Grok: true},
+		{Omp: true},
+		{Opencode: true},
+	} {
+		if nonEmpty.IsEmpty() {
+			t.Fatalf("expected AgentFilter %+v to be non-empty", nonEmpty)
+		}
+	}
+
+	cases := []struct {
+		filter    AgentFilter
+		agentType tmux.AgentType
+		want      bool
+	}{
+		{AgentFilter{Antigravity: true}, tmux.AgentAntigravity, true},
+		{AgentFilter{Antigravity: true}, tmux.AgentType("antigravity"), true},
+		{AgentFilter{Grok: true}, tmux.AgentGrok, true},
+		{AgentFilter{Grok: true}, tmux.AgentType("grok-build"), true},
+		{AgentFilter{Omp: true}, tmux.AgentOmp, true},
+		{AgentFilter{Omp: true}, tmux.AgentType("oh-my-pi"), true},
+		{AgentFilter{Opencode: true}, tmux.AgentOpencode, true},
+		{AgentFilter{Opencode: true}, tmux.AgentType("opencode"), true},
+		{AgentFilter{Grok: true}, tmux.AgentOpencode, false},
+		{AgentFilter{Opencode: true}, tmux.AgentUser, false},
+	}
+	for _, tc := range cases {
+		if got := tc.filter.Matches(tc.agentType); got != tc.want {
+			t.Errorf("filter %+v Matches(%q) = %v, want %v", tc.filter, tc.agentType, got, tc.want)
+		}
 	}
 }

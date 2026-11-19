@@ -46,11 +46,6 @@ func (sm *SpringManager) Has(id string) bool {
 	return ok
 }
 
-// Set updates a spring target using the default spring parameters.
-func (sm *SpringManager) Set(id string, target float64) {
-	sm.SetWithDeadZone(id, target, defaultSpringStiffness, defaultSpringDamping, 0)
-}
-
 // SetWithParams updates a spring target with explicit spring tuning.
 func (sm *SpringManager) SetWithParams(id string, target, stiffness, damping float64) {
 	sm.SetWithDeadZone(id, target, stiffness, damping, 0)

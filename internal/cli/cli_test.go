@@ -322,7 +322,14 @@ func resetFlags() {
 	robotSendType = ""
 	robotSendExclude = ""
 	robotSendDelay = 0
+	robotOpID = ""
+	robotSendReceipt = ""
+	robotActionStatus = ""
+	robotWaitRequest = ""
+	robotCancelRequest = ""
+	robotRequestID = ""
 	robotAssignStrategy = "simple"
+	robotAssignRelax = false
 	robotBulkAssign = ""
 	robotBulkAssignFromBV = false
 	robotBulkAssignAlloc = ""
@@ -361,6 +368,15 @@ func resetFlags() {
 	robotSpawnGrok = ""
 	robotSpawnOmp = ""
 	robotSpawnOc = ""
+	robotSpawnOllama = ""
+	robotSpawnAider = ""
+	robotSpawnCursor = ""
+	robotSpawnWindsurf = ""
+	for _, ptr := range robotSpawnPlugins {
+		if ptr != nil {
+			*ptr = ""
+		}
+	}
 	robotSpawnPreset = ""
 	robotSpawnNoUser = false
 	robotSpawnWait = false
@@ -396,6 +412,189 @@ func resetFlags() {
 	robotVerbosity = ""
 	robotMonitorOutput = ""
 	robotSaveOutput = ""
+	robotRelax = false
+	assignRelax = false
+	robotUBSScan = ""
+	robotScanPath = ""
+	robotScanFile = ""
+	robotScanStaged = false
+	robotScanDiff = false
+	robotScanOnly = nil
+	robotScanExclude = nil
+	robotScanFailOnWarning = false
+	robotScanTimeout = 60 * time.Second
+	robotHandoff = ""
+	robotHandoffCreate = false
+	robotHandoffAuto = false
+	robotHandoffGoal = ""
+	robotHandoffNow = ""
+	robotHandoffDescription = ""
+	robotHandoffLimit = 10
+	robotHandoffProjectDir = ""
+	robotAudit = ""
+	robotAuditAction = ""
+	robotAuditSearch = ""
+	robotAuditVerify = false
+	robotAuditSources = false
+	robotAuditType = ""
+	robotAuditActor = ""
+	robotAuditSince = ""
+	robotAuditDays = 30
+	robotAuditLimit = 50
+	robotAuditOffset = 0
+	robotTimeline = ""
+	robotTimelineAction = ""
+	robotTimelineEvents = false
+	robotTimelineStats = false
+	robotTimelineLimit = 20
+	robotPreflight = ""
+	robotPreflightStrict = false
+	robotPreflightFile = ""
+	robotDoctor = false
+	robotDoctorContention = false
+	robotDoctorVerbose = false
+	robotScale = ""
+	robotScaleCC = 0
+	robotScaleCod = 0
+	robotScaleGmi = 0
+	robotScaleAgy = 0
+	robotScaleOllama = 0
+	robotScaleCursor = 0
+	robotScaleWindsurf = 0
+	robotScaleAider = 0
+	robotScaleGrok = 0
+	robotScaleOmp = 0
+	robotScaleOc = 0
+	robotRebalance = ""
+	robotRebalanceApply = false
+	robotRebalanceThreshold = 0.0
+	robotRebalanceGeometry = false
+	robotRebalanceGeometryTolerance = 2
+	robotReviewQueue = ""
+	robotReviewDispatch = false
+	robotReviewIdleThreshold = 2 * time.Minute
+	robotReviewCommits = 5
+	robotCoordinator = ""
+	robotCoordinatorAction = "status"
+	robotCoordinatorSendDigest = false
+	robotWebhookOutbox = false
+	robotOutboxAction = "list"
+	robotOutboxRecord = ""
+	robotOutboxRevision = ""
+	if rootCmd != nil {
+		for _, flagName := range []string{
+			"robot-scale", "scale-cc", "scale-cod", "scale-gmi", "scale-agy",
+			"scale-ollama", "scale-cursor", "scale-windsurf", "scale-aider",
+			"scale-grok", "scale-omp", "scale-oc",
+			"robot-rebalance", "rebalance-apply", "rebalance-threshold",
+			"rebalance-geometry", "rebalance-geometry-tolerance",
+			"robot-review-queue", "review-dispatch", "review-idle-threshold", "review-commits",
+			"robot-coordinator", "coordinator-action", "coordinator-send-digest",
+			"robot-webhook-outbox", "outbox-action", "outbox-record", "outbox-revision",
+		} {
+			if f := rootCmd.Flags().Lookup(flagName); f != nil {
+				f.Changed = false
+			}
+		}
+	}
+	resetRobotExtFlags()
+	robotProcessExit = nil
+}
+
+func resetRobotExtFlags() {
+	robotAdopt = ""
+	robotAdoptCC = ""
+	robotAdoptCod = ""
+	robotAdoptGmi = ""
+	robotAdoptAgy = ""
+	robotAdoptGrok = ""
+	robotAdoptCursor = ""
+	robotAdoptWindsurf = ""
+	robotAdoptAider = ""
+	robotAdoptOc = ""
+	robotAdoptOmp = ""
+	robotAdoptOllama = ""
+	robotAdoptUser = ""
+	robotAdoptByWindow = ""
+	robotAdoptAutoName = true
+
+	robotRedact = ""
+	robotRedactFile = ""
+
+	robotHooks = false
+	robotHooksAction = "status"
+	robotHooksType = "pre-commit"
+	robotHooksFailOnWarning = true
+
+	robotPersonas = false
+	robotPersonasAgent = ""
+	robotPersonasTag = ""
+
+	robotSavedSessions = false
+	robotSavedAction = "list"
+	robotSavedName = ""
+	robotSavedSession = ""
+	robotSavedArchived = false
+	robotSavedOverwrite = false
+
+	robotMapping = ""
+
+	robotWorkflows = false
+	robotWorkflowsName = ""
+	robotWorkflowsRole = ""
+
+	robotSessionTemplates = false
+	robotTemplateName = ""
+
+	robotGrep = ""
+	robotGrepSession = ""
+	robotGrepIgnoreCase = false
+	robotGrepInvert = false
+	robotGrepContext = 0
+	robotGrepBefore = 0
+	robotGrepAfter = 0
+	robotGrepListOnly = false
+
+	robotExtract = ""
+	robotExtractPane = ""
+	robotExtractLang = ""
+	robotExtractLast = false
+	robotExtractSelect = 0
+
+	robotValidate = false
+	robotValidateAll = false
+	robotValidateFix = false
+
+	robotPlugins = false
+
+	robotModels = false
+	robotModelsAction = "recommend"
+	robotModelsHost = ""
+
+	if rootCmd != nil {
+		for _, flagName := range []string{
+			"robot-adopt", "adopt-cc", "adopt-cod", "adopt-gmi", "adopt-agy",
+			"adopt-grok", "adopt-cursor", "adopt-windsurf", "adopt-aider",
+			"adopt-oc", "adopt-omp", "adopt-ollama", "adopt-user",
+			"adopt-by-window", "adopt-auto-name",
+			"robot-redact", "redact-file",
+			"robot-hooks", "hooks-action", "hooks-type", "hooks-fail-on-warning",
+			"robot-personas", "personas-agent", "personas-tag",
+			"robot-saved-sessions", "saved-action", "saved-name", "saved-session", "saved-archived", "saved-overwrite",
+			"robot-mapping",
+			"robot-workflows", "workflows-name", "workflows-role",
+			"robot-session-templates", "template-name",
+			"robot-grep", "grep-session", "grep-ignore-case", "grep-invert", "grep-context", "grep-before", "grep-after", "grep-list-only",
+			"robot-extract", "extract-pane", "extract-lang", "extract-last", "extract-select",
+			"robot-validate", "validate-all", "validate-fix",
+			"robot-plugins",
+			"robot-models", "models-action", "models-host",
+		} {
+			if f := rootCmd.Flags().Lookup(flagName); f != nil {
+				f.Changed = false
+			}
+		}
+	}
 }
 
 func TestRobotSpawnOptionsFromFlagsPreservesDurationAndCopiesInputs(t *testing.T) {
@@ -5493,6 +5692,13 @@ func TestGlobalJSONFlag(t *testing.T) {
 // TestGlobalConfigFlag tests the global --config flag parses
 func TestGlobalConfigFlag(t *testing.T) {
 	resetFlags()
+	oldCfg, oldCfgFile := cfg, cfgFile
+	t.Setenv("NTM_CONFIG", os.Getenv("NTM_CONFIG"))
+	t.Cleanup(func() {
+		cfg = oldCfg
+		cfgFile = oldCfgFile
+		startup.ResetConfig()
+	})
 	rootCmd.SetArgs([]string{"--config", "/nonexistent/config.toml", "version"})
 
 	// Should still work even with nonexistent config (falls back to defaults)
@@ -5863,30 +6069,43 @@ func TestRootDispatcherDoesNotExitProcess(t *testing.T) {
 	if !ok {
 		t.Fatal("locate cli test source")
 	}
-	rootFile := filepath.Join(filepath.Dir(testFile), "root.go")
-	file, err := parser.ParseFile(token.NewFileSet(), rootFile, nil, 0)
+	rootPaths, err := filepath.Glob(filepath.Join(filepath.Dir(testFile), "root*.go"))
 	if err != nil {
-		t.Fatalf("parse root dispatcher: %v", err)
+		t.Fatalf("glob root files: %v", err)
 	}
-
-	var exitCalls []token.Pos
-	ast.Inspect(file, func(node ast.Node) bool {
-		call, ok := node.(*ast.CallExpr)
-		if !ok {
+	fset := token.NewFileSet()
+	var exitCalls []string
+	parsedCount := 0
+	for _, rootFile := range rootPaths {
+		if strings.HasSuffix(rootFile, "_test.go") {
+			continue
+		}
+		file, parseErr := parser.ParseFile(fset, rootFile, nil, 0)
+		if parseErr != nil {
+			t.Fatalf("parse %s: %v", rootFile, parseErr)
+		}
+		parsedCount++
+		ast.Inspect(file, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			selector, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok || selector.Sel.Name != "Exit" {
+				return true
+			}
+			pkg, ok := selector.X.(*ast.Ident)
+			if ok && pkg.Name == "os" {
+				exitCalls = append(exitCalls, fset.Position(call.Pos()).String())
+			}
 			return true
-		}
-		selector, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok || selector.Sel.Name != "Exit" {
-			return true
-		}
-		pkg, ok := selector.X.(*ast.Ident)
-		if ok && pkg.Name == "os" {
-			exitCalls = append(exitCalls, call.Pos())
-		}
-		return true
-	})
+		})
+	}
+	if parsedCount == 0 {
+		t.Fatal("no root*.go files parsed")
+	}
 	if len(exitCalls) != 0 {
-		t.Fatalf("root dispatcher must return typed errors instead of calling os.Exit; found %d call(s)", len(exitCalls))
+		t.Fatalf("root dispatcher must return typed errors instead of calling os.Exit; found %d call(s): %v", len(exitCalls), exitCalls)
 	}
 }
 
@@ -6162,6 +6381,11 @@ func TestRobotProcessErrorContract(t *testing.T) {
 		{name: "coordinator interval on wrong feature", args: []string{"--json", "coordinator", "enable", "auto-assign", "--interval=30m"}, errorCode: robot.ErrCodeInvalidFlag, expectedExit: 1},
 		{name: "format before bulk metadata", args: []string{"--robot-format=json", "--robot-bulk-assign=proj", "--not-a-real-flag"}, errorCode: robot.ErrCodeInvalidFlag, expectedExit: 1, expectedCommand: "robot-bulk-assign"},
 		{name: "default ensemble spawn stub", args: []string{"--robot-ensemble-spawn=contract", "--robot-format=toon"}, errorCode: robot.ErrCodeNotImplemented, expectedExit: 2},
+		{name: "missing ensemble synthesize session", args: []string{"--robot-ensemble-synthesize=ntm-robot-contract-missing-session", "--robot-format=json"}, errorCode: robot.ErrCodeSessionNotFound, expectedExit: 1},
+		{name: "invalid ensemble synthesize strategy", args: []string{"--robot-ensemble-synthesize=ntm-robot-contract-missing-session", "--synth-strategy=bogus", "--robot-format=json"}, errorCode: robot.ErrCodeInvalidFlag, expectedExit: 1},
+		{name: "empty robot handoff session", args: []string{"--robot-handoff=", "--robot-format=json"}, errorCode: robot.ErrCodeInvalidFlag, expectedExit: 1},
+		{name: "path traversal robot handoff session", args: []string{"--robot-handoff=../bad", "--robot-format=json"}, errorCode: robot.ErrCodeInvalidFlag, expectedExit: 1},
+		{name: "manual robot handoff create missing goal and now", args: []string{"--robot-handoff=myproject", "--handoff-create", "--robot-format=json"}, errorCode: robot.ErrCodeInvalidFlag, expectedExit: 1},
 		{name: "unavailable feature", args: []string{"__robot_contract_unavailable__"}, errorCode: robot.ErrCodeNotImplemented, expectedExit: 2},
 	}
 
@@ -8056,5 +8280,145 @@ func TestRobotSpawnOptionsFromFlagsCarriesOpencode(t *testing.T) {
 	}
 	if opts.OcCount != 2 || opts.OcModel != "opencode/space-bunny-free" {
 		t.Fatalf("oc options = count:%d model:%q, want 2 opencode/space-bunny-free", opts.OcCount, opts.OcModel)
+	}
+}
+
+func TestRobotHandoffFlagsRegistered(t *testing.T) {
+	expected := []string{
+		"robot-handoff",
+		"handoff-create",
+		"handoff-auto",
+		"handoff-goal",
+		"handoff-now",
+		"handoff-description",
+		"handoff-limit",
+		"handoff-project-dir",
+	}
+	for _, flagName := range expected {
+		if rootCmd.Flags().Lookup(flagName) == nil {
+			t.Errorf("expected root flag --%s to be registered", flagName)
+		}
+	}
+}
+
+func TestRobotHandoffInspectCreateAutoAndAllSubprocess(t *testing.T) {
+	tmpRoot := t.TempDir()
+	homeDir := filepath.Join(tmpRoot, "home")
+	configHome := filepath.Join(tmpRoot, "config")
+	projectDir := filepath.Join(tmpRoot, "project")
+	emptyBin := filepath.Join(tmpRoot, "bin")
+	for _, dir := range []string{homeDir, configHome, projectDir, emptyBin} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+
+	runSubprocess := func(t *testing.T, args ...string) (robot.HandoffOutput, int, string) {
+		t.Helper()
+		rawArgs, err := json.Marshal(args)
+		if err != nil {
+			t.Fatalf("marshal args: %v", err)
+		}
+		cmd := exec.Command(os.Args[0], "-test.run=^TestRobotProcessContractHelper$")
+		cmd.Dir = projectDir
+		cmd.Env = envWithOverrides(os.Environ(),
+			"HOME="+homeDir,
+			"XDG_CONFIG_HOME="+configHome,
+			"PATH="+emptyBin,
+			"NTM_NO_COLOR=1",
+			"NTM_CONFIG=",
+			"NTM_ROBOT_FORMAT=json",
+			"NTM_OUTPUT_FORMAT=",
+			"TOON_DEFAULT_FORMAT=",
+			"NTM_ROBOT_VERBOSITY=",
+			"NTM_ROBOT_CONTRACT_ARGS="+string(rawArgs),
+		)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		runErr := cmd.Run()
+		exitCode := 0
+		if runErr != nil {
+			var exitErr *exec.ExitError
+			if !errors.As(runErr, &exitErr) {
+				t.Fatalf("run subprocess %v: %v (stderr=%s)", args, runErr, stderr.String())
+			}
+			exitCode = exitErr.ExitCode()
+		}
+		var out robot.HandoffOutput
+		if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+			t.Fatalf("decode stdout for %v: %v\nstdout=%s\nstderr=%s", args, err, stdout.String(), stderr.String())
+		}
+		return out, exitCode, stdout.String()
+	}
+
+	// 1. Inspect empty session -> exit 0, success: true, handoffs: []
+	inspectEmpty, code, _ := runSubprocess(t,
+		"--robot-handoff=myproject",
+		"--handoff-project-dir="+projectDir,
+	)
+	if code != 0 || !inspectEmpty.Success {
+		t.Fatalf("expected exit 0 and success=true for empty inspect, got code=%d out=%+v", code, inspectEmpty)
+	}
+	if inspectEmpty.Action != "handoff_inspect" || len(inspectEmpty.Handoffs) != 0 {
+		t.Fatalf("unexpected empty inspect output: %+v", inspectEmpty)
+	}
+
+	// 2. Manual create -> exit 0, persists YAML + ledger + 4-dimension quality report
+	created, code, _ := runSubprocess(t,
+		"--robot-handoff=myproject",
+		"--handoff-create",
+		"--handoff-goal=Wired --robot-handoff CLI dispatch",
+		"--handoff-now=Verify subprocess contract tests",
+		"--handoff-description=cli-dispatch",
+		"--handoff-project-dir="+projectDir,
+	)
+	if code != 0 || !created.Success {
+		t.Fatalf("expected exit 0 and success=true for manual create, got code=%d out=%+v", code, created)
+	}
+	if created.Action != "handoff_create" || created.CreatedPath == "" {
+		t.Fatalf("unexpected manual create output: %+v", created)
+	}
+	if created.Quality == nil || created.Quality.Score <= 0 || len(created.Quality.Dimensions) != 4 {
+		t.Fatalf("expected 4-dimension quality report, got %+v", created.Quality)
+	}
+	if created.Ledger == nil || !created.Ledger.Exists || created.Ledger.Bytes <= 0 {
+		t.Fatalf("expected continuity ledger to exist, got %+v", created.Ledger)
+	}
+
+	// 3. Auto create on second session -> exit 0, fallback synthesis + quality report
+	autoCreated, code, _ := runSubprocess(t,
+		"--robot-handoff=autoproj",
+		"--handoff-create",
+		"--handoff-auto",
+		"--handoff-project-dir="+projectDir,
+	)
+	if code != 0 || !autoCreated.Success {
+		t.Fatalf("expected exit 0 and success=true for auto create, got code=%d out=%+v", code, autoCreated)
+	}
+	if autoCreated.Quality == nil || len(autoCreated.Quality.Dimensions) != 4 {
+		t.Fatalf("expected 4-dimension quality report for auto create, got %+v", autoCreated.Quality)
+	}
+
+	// 4. Inspect all with --handoff-limit=1 -> exit 0, 2 sessions discovered, 1 handoff returned
+	inspectAll, code, _ := runSubprocess(t,
+		"--robot-handoff=all",
+		"--handoff-limit=1",
+		"--handoff-project-dir="+projectDir,
+	)
+	if code != 0 || !inspectAll.Success {
+		t.Fatalf("expected exit 0 and success=true for --robot-handoff=all, got code=%d out=%+v", code, inspectAll)
+	}
+	if len(inspectAll.Sessions) != 2 || inspectAll.TotalReturned != 1 || len(inspectAll.Handoffs) != 1 {
+		t.Fatalf("expected 2 sessions and 1 bounded handoff, got sessions=%v handoffs=%+v", inspectAll.Sessions, inspectAll.Handoffs)
+	}
+
+	// 5. Relative --handoff-project-dir -> exit 1, INVALID_FLAG
+	badDirOut, code, _ := runSubprocess(t,
+		"--robot-handoff=myproject",
+		"--handoff-project-dir=relative/dir",
+	)
+	if code != 1 || badDirOut.Success || badDirOut.ErrorCode != robot.ErrCodeInvalidFlag {
+		t.Fatalf("expected exit 1 and INVALID_FLAG for relative project dir, got code=%d out=%+v", code, badDirOut)
 	}
 }

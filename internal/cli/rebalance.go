@@ -17,9 +17,11 @@ import (
 	agentpkg "github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/assign"
 	"github.com/Dicklesworthstone/ntm/internal/assignment"
+	"github.com/Dicklesworthstone/ntm/internal/kernel"
 	"github.com/Dicklesworthstone/ntm/internal/output"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
 	statuspkg "github.com/Dicklesworthstone/ntm/internal/status"
+	"github.com/Dicklesworthstone/ntm/internal/swarm"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/internal/tui/theme"
 )
@@ -42,33 +44,77 @@ type RebalanceTransfer struct {
 	prompt       string
 }
 
-// RebalanceWorkload represents workload for a single pane/agent
-type RebalanceWorkload struct {
-	Pane       int      `json:"pane"`
-	PaneTarget string   `json:"pane_target"`
-	PaneID     string   `json:"pane_id"`
-	AgentType  string   `json:"agent_type"`
-	AgentName  string   `json:"agent_name,omitempty"`
-	TaskCount  int      `json:"task_count"`
-	TaskIDs    []string `json:"task_ids,omitempty"`
-	IsHealthy  bool     `json:"is_healthy"`
-	IsIdle     bool     `json:"is_idle"`
-	Status     string   `json:"status,omitempty"`
+// RebalanceWorkload represents workload for a single pane/agent.
+type RebalanceWorkload = robot.RebalanceWorkload
+
+// RebalanceGeometryReport captures pane layout uniformity and optional tiling rebalance.
+type RebalanceGeometryReport = robot.RebalanceGeometryReport
+
+func init() {
+	kernel.MustRegister(kernel.Command{
+		Name:        "sessions.rebalance",
+		Description: "Analyze agent workload distribution and optionally apply bead transfers and pane geometry tiling",
+		Category:    "sessions",
+		Input: &kernel.SchemaRef{
+			Name: "RebalanceInput",
+			Ref:  "robot.RebalanceInput",
+		},
+		Output: &kernel.SchemaRef{
+			Name: "RebalanceOutput",
+			Ref:  "robot.RebalanceOutput",
+		},
+		REST: &kernel.RESTBinding{
+			Method: "POST",
+			Path:   "/api/v1/sessions/{id}/rebalance",
+		},
+		Examples: []kernel.Example{
+			{
+				Name:        "rebalance-preview",
+				Description: "Analyze workload distribution without mutating assignments",
+				Command:     "ntm rebalance myproject --dry-run",
+			},
+			{
+				Name:        "rebalance-robot",
+				Description: "Analyze and apply rebalance transfers via robot mode",
+				Command:     "ntm --robot-rebalance=myproject --rebalance-apply",
+			},
+		},
+		SafetyLevel: kernel.SafetyCaution,
+		Idempotent:  true,
+	})
+	kernel.MustRegisterHandler("sessions.rebalance", func(ctx context.Context, input any) (any, error) {
+		opts, err := decodeKernelInput[robot.RebalanceInput]("sessions.rebalance", input)
+		if err != nil {
+			return nil, fmt.Errorf("invalid sessions.rebalance input: %w", err)
+		}
+		out, err := executeRebalanceRobot(ctx, opts)
+		if err != nil {
+			return nil, err
+		}
+		if !out.Success {
+			if strings.TrimSpace(out.Error) != "" {
+				return nil, errors.New(out.Error)
+			}
+			return nil, errors.New("sessions.rebalance failed")
+		}
+		return out, nil
+	})
 }
 
 // RebalanceResponse is the JSON response for rebalance command
 type RebalanceResponse struct {
 	output.TimestampedResponse
-	Success        bool                `json:"success"`
-	Session        string              `json:"session"`
-	ImbalanceScore float64             `json:"imbalance_score"`
-	Recommendation string              `json:"recommendation"`
-	Transfers      []RebalanceTransfer `json:"transfers"`
-	Workloads      []RebalanceWorkload `json:"workloads"`
-	Before         map[string]int      `json:"before"` // physical pane ID -> task count
-	After          map[string]int      `json:"after"`  // physical pane ID -> task count after transfers
-	Applied        bool                `json:"applied,omitempty"`
-	DryRun         bool                `json:"dry_run,omitempty"`
+	Success        bool                     `json:"success"`
+	Session        string                   `json:"session"`
+	ImbalanceScore float64                  `json:"imbalance_score"`
+	Recommendation string                   `json:"recommendation"`
+	Transfers      []RebalanceTransfer      `json:"transfers"`
+	Workloads      []RebalanceWorkload      `json:"workloads"`
+	Before         map[string]int           `json:"before"` // physical pane ID -> task count
+	After          map[string]int           `json:"after"`  // physical pane ID -> task count after transfers
+	Geometry       *RebalanceGeometryReport `json:"geometry,omitempty"`
+	Applied        bool                     `json:"applied,omitempty"`
+	DryRun         bool                     `json:"dry_run,omitempty"`
 }
 
 const (
@@ -81,6 +127,7 @@ var (
 	resolveRebalanceProjectDir   = resolveAssignProjectDir
 	loadRebalanceAssignmentStore = assignment.LoadStoreStrict
 	getRebalancePanes            = tmux.GetPanesContext
+	rebalanceSessionExists       = tmux.SessionExistsContext
 )
 
 type rebalanceCommandError struct {
@@ -97,11 +144,13 @@ func newRebalanceCommandError(code string, err error) error {
 
 func newRebalanceCmd() *cobra.Command {
 	var (
-		dryRun    bool
-		apply     bool
-		filter    string
-		threshold float64
-		formatOut string
+		dryRun            bool
+		apply             bool
+		filter            string
+		threshold         float64
+		formatOut         string
+		checkGeometry     bool
+		geometryTolerance int
 	)
 
 	cmd := &cobra.Command{
@@ -124,6 +173,7 @@ Examples:
   ntm rebalance myproject              # Show rebalance suggestions
   ntm rebalance myproject --dry-run    # Preview without prompting
   ntm rebalance myproject --apply      # Apply after confirmation
+  ntm rebalance myproject --geometry   # Inspect pane layout uniformity alongside workload
   ntm rebalance myproject --filter cc  # Only consider Claude agents
   ntm rebalance myproject --threshold 0.5  # Only suggest if score > 0.5
   ntm rebalance myproject --format json    # Robot mode JSON output`,
@@ -146,7 +196,7 @@ Examples:
 			res.ExplainIfInferredForOutput(cmd.ErrOrStderr(), machineJSON)
 			session = res.Session
 
-			return runRebalance(cmd.Context(), session, dryRun, apply, filter, threshold, formatOut)
+			return runRebalanceWithGeometry(cmd.Context(), session, dryRun, apply, filter, threshold, formatOut, checkGeometry, geometryTolerance)
 		},
 	}
 
@@ -155,125 +205,114 @@ Examples:
 	cmd.Flags().StringVar(&filter, "filter", "", "Filter by agent type alias (claude|cc, codex|cod, gemini|gmi, antigravity|agy, cursor, windsurf|ws, aider, ollama)")
 	cmd.Flags().Float64Var(&threshold, "threshold", 0.0, "Only suggest if imbalance score exceeds threshold")
 	cmd.Flags().StringVar(&formatOut, "format", "", "Output format: json for robot mode")
+	cmd.Flags().BoolVar(&checkGeometry, "geometry", false, "Verify pane geometry uniformity (and reapply tiled layout when --apply is set)")
+	cmd.Flags().IntVar(&geometryTolerance, "geometry-tolerance", 2, "Maximum allowed width/height delta in cells for --geometry")
 
 	return cmd
 }
 
-func runRebalance(ctx context.Context, session string, dryRun, apply bool, filter string, threshold float64, formatOut string) error {
-	isJSON := IsJSONOutput() || strings.EqualFold(strings.TrimSpace(formatOut), "json")
+func planRebalanceCore(
+	ctx context.Context,
+	session string,
+	dryRun, apply bool,
+	filter string,
+	threshold float64,
+	checkGeometry bool,
+	geometryTolerance int,
+) (RebalanceResponse, string, *assignment.AssignmentStore, bool, error) {
+	var empty RebalanceResponse
 	if ctx == nil {
-		err := errors.New("rebalance requires a command context")
-		if isJSON {
-			return outputRebalanceError(session, err)
-		}
-		return err
+		return empty, "", nil, false, errors.New("rebalance requires a command context")
 	}
 	if err := ctx.Err(); err != nil {
-		err = fmt.Errorf("rebalance canceled: %w", err)
-		if isJSON {
-			return outputRebalanceError(session, err)
-		}
-		return err
+		return empty, "", nil, false, fmt.Errorf("rebalance canceled: %w", err)
 	}
 	projectDir, err := resolveRebalanceProjectDir(ctx, session)
 	if err != nil {
-		err = fmt.Errorf("resolve rebalance project: %w", err)
-		if isJSON {
-			return outputRebalanceError(session, err)
-		}
-		return err
+		return empty, "", nil, false, fmt.Errorf("resolve rebalance project: %w", err)
 	}
 	if err := configureAuthoritativeAssignmentPolicy(projectDir); err != nil {
-		err = newRebalanceCommandError(robot.ErrCodeInvalidFlag, err)
-		if isJSON {
-			return outputRebalanceError(session, err)
-		}
-		return err
+		return empty, "", nil, false, newRebalanceCommandError(robot.ErrCodeInvalidFlag, err)
 	}
 	normalizedFilter, err := normalizeAgentTypeFilter(filter)
 	if err != nil {
-		err = newRebalanceCommandError(robot.ErrCodeInvalidFlag, err)
-		if isJSON {
-			return outputRebalanceError(session, err)
-		}
-		return err
+		return empty, "", nil, false, newRebalanceCommandError(robot.ErrCodeInvalidFlag, err)
 	}
 
-	// Load assignment store
 	store, err := loadRebalanceAssignmentStore(session)
 	if err != nil {
-		err = fmt.Errorf("failed to load assignments: %w", err)
-		if isJSON {
-			return outputRebalanceError(session, err)
-		}
-		return err
+		return empty, "", nil, false, fmt.Errorf("failed to load assignments: %w", err)
 	}
 
-	// Get pane information
 	panes, err := getRebalancePanes(ctx, session)
 	if err != nil {
-		err = fmt.Errorf("failed to list panes: %w", err)
-		if isJSON {
-			return outputRebalanceError(session, err)
-		}
-		return err
+		return empty, "", nil, false, fmt.Errorf("failed to list panes: %w", err)
 	}
-
 	if len(panes) == 0 {
-		err = newRebalanceCommandError(robot.ErrCodePaneNotFound, fmt.Errorf("no panes found in session %s", session))
-		if isJSON {
-			return outputRebalanceError(session, err)
-		}
-		return err
+		return empty, "", nil, false, newRebalanceCommandError(robot.ErrCodePaneNotFound, fmt.Errorf("no panes found in session %s", session))
 	}
 
-	// Build workload map
+	var geometryReport *RebalanceGeometryReport
+	if checkGeometry {
+		if geometryTolerance < 0 {
+			return empty, "", nil, false, newRebalanceCommandError(robot.ErrCodeInvalidFlag, fmt.Errorf("--geometry-tolerance cannot be negative: %d", geometryTolerance))
+		}
+		sessOrch := swarm.NewSessionOrchestrator()
+		geomRes, geomErr := sessOrch.VerifyGeometry(session, geometryTolerance)
+		if geomErr != nil {
+			return empty, "", nil, false, fmt.Errorf("failed to verify pane geometry: %w", geomErr)
+		}
+		rebalanced := false
+		if apply && !dryRun && !geomRes.IsUniform {
+			if rebErr := sessOrch.RebalanceGeometry(session); rebErr != nil {
+				return empty, "", nil, false, fmt.Errorf("failed to rebalance pane geometry: %w", rebErr)
+			}
+			if updatedGeom, updErr := sessOrch.EnsureUniformGeometry(session, geometryTolerance); updErr == nil {
+				geomRes = updatedGeom
+			}
+			rebalanced = true
+		}
+		var avgGeom *swarm.PaneGeometry
+		if avg, avgErr := sessOrch.GetAverageGeometry(session); avgErr == nil {
+			avgGeom = avg
+		}
+		geometryReport = &RebalanceGeometryReport{
+			Result:     geomRes,
+			Average:    avgGeom,
+			Rebalanced: rebalanced,
+		}
+	}
+
 	workloads, err := buildRebalanceWorkloads(store, panes, normalizedFilter)
 	if err != nil {
-		err = fmt.Errorf("failed to build canonical rebalance topology: %w", err)
-		if isJSON {
-			return outputRebalanceError(session, err)
-		}
-		return err
+		return empty, "", nil, false, fmt.Errorf("failed to build canonical rebalance topology: %w", err)
 	}
 
-	// Calculate imbalance score
 	imbalanceScore := calculateImbalanceScore(workloads)
-
-	// A known-unsent rebalance generation is already durable at its target and
-	// must be recovered even when the remaining workload is numerically balanced.
 	recoveries := discoverPendingRebalanceTransfers(workloads, store)
 
-	// Check threshold. Recovery is a correctness operation, not a new balancing
-	// suggestion, so an imbalance threshold never suppresses it.
 	if threshold > 0 && imbalanceScore < threshold && len(recoveries) == 0 {
-		if isJSON {
-			resp := RebalanceResponse{
-				TimestampedResponse: output.NewTimestamped(),
-				Success:             true,
-				Session:             session,
-				ImbalanceScore:      imbalanceScore,
-				Recommendation:      "balanced",
-				Transfers:           []RebalanceTransfer{},
-				Workloads:           workloads,
-				Before:              rebalanceWorkloadCounts(workloads),
-				After:               rebalanceWorkloadCounts(workloads),
-			}
-			return outputRebalanceJSON(resp)
+		resp := RebalanceResponse{
+			TimestampedResponse: output.NewTimestamped(),
+			Success:             true,
+			Session:             session,
+			ImbalanceScore:      imbalanceScore,
+			Recommendation:      "balanced",
+			Transfers:           []RebalanceTransfer{},
+			Workloads:           workloads,
+			Before:              rebalanceWorkloadCounts(workloads),
+			After:               rebalanceWorkloadCounts(workloads),
+			Geometry:            geometryReport,
+			DryRun:              dryRun,
 		}
-		fmt.Printf("Session %s is balanced (score: %.2f < threshold: %.2f)\n", session, imbalanceScore, threshold)
-		return nil
+		return resp, projectDir, store, true, nil
 	}
 
-	// Generate transfer suggestions
 	transfers := make([]RebalanceTransfer, 0, len(recoveries)+len(workloads))
 	transfers = append(transfers, recoveries...)
 	transfers = append(transfers, suggestTransfers(workloads, store)...)
-
-	// Calculate after state
 	after := calculateAfterState(workloads, transfers)
 
-	// Build response
 	resp := RebalanceResponse{
 		TimestampedResponse: output.NewTimestamped(),
 		Success:             true,
@@ -284,11 +323,180 @@ func runRebalance(ctx context.Context, session string, dryRun, apply bool, filte
 		Workloads:           workloads,
 		Before:              rebalanceWorkloadCounts(workloads),
 		After:               after,
+		Geometry:            geometryReport,
 		DryRun:              dryRun,
 	}
+	return resp, projectDir, store, false, nil
+}
 
-	if apply && len(transfers) > 0 && !dryRun && isJSON {
-		if err := applyRebalanceTransfers(ctx, session, projectDir, store, transfers); err != nil {
+func newRebalanceRobotErrorOutput(session string, dryRun bool, err error, code, hint string) *robot.RebalanceOutput {
+	return &robot.RebalanceOutput{
+		RobotResponse: robot.NewErrorResponse(err, code, hint),
+		SchemaID:      robot.RebalanceSchemaID,
+		SchemaVersion: robot.RebalanceSchemaVersion,
+		Session:       strings.TrimSpace(session),
+		Transfers:     []robot.RebalanceTransferItem{},
+		Workloads:     []RebalanceWorkload{},
+		Before:        map[string]int{},
+		After:         map[string]int{},
+		DryRun:        dryRun,
+	}
+}
+
+func toRebalanceTransferItems(transfers []RebalanceTransfer) []robot.RebalanceTransferItem {
+	items := make([]robot.RebalanceTransferItem, 0, len(transfers))
+	for _, t := range transfers {
+		items = append(items, robot.RebalanceTransferItem{
+			BeadID:     t.BeadID,
+			BeadTitle:  t.BeadTitle,
+			FromPane:   t.FromPane,
+			FromTarget: t.FromTarget,
+			FromPaneID: t.FromPaneID,
+			FromAgent:  t.FromAgent,
+			ToPane:     t.ToPane,
+			ToTarget:   t.ToTarget,
+			ToPaneID:   t.ToPaneID,
+			ToAgent:    t.ToAgent,
+			Reason:     t.Reason,
+		})
+	}
+	return items
+}
+
+func executeRebalanceRobot(ctx context.Context, input robot.RebalanceInput) (*robot.RebalanceOutput, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return newRebalanceRobotErrorOutput(input.Session, input.DryRun, fmt.Errorf("rebalance canceled: %w", err), robot.ErrCodeTimeout, "Retry --robot-rebalance with an active context"), nil
+	}
+
+	session := strings.TrimSpace(input.Session)
+	if session == "" {
+		return newRebalanceRobotErrorOutput("", input.DryRun, errors.New("session is required"), robot.ErrCodeInvalidFlag, "Pass --robot-rebalance=SESSION"), nil
+	}
+	if err := tmux.ValidateSessionName(session); err != nil {
+		return newRebalanceRobotErrorOutput(session, input.DryRun, fmt.Errorf("invalid session name: %w", err), robot.ErrCodeInvalidFlag, "Provide a valid tmux session name"), nil
+	}
+	if _, err := normalizeAgentTypeFilter(input.Filter); err != nil {
+		return newRebalanceRobotErrorOutput(session, input.DryRun, err, robot.ErrCodeInvalidFlag, "Filter with --type=cc|cod|gmi|agy|grok|omp|oc|cursor|windsurf|aider|ollama"), nil
+	}
+	if input.Threshold < 0 {
+		return newRebalanceRobotErrorOutput(session, input.DryRun, fmt.Errorf("invalid rebalance threshold %.2f: cannot be negative", input.Threshold), robot.ErrCodeInvalidFlag, "Use a non-negative --rebalance-threshold"), nil
+	}
+
+	geometryTolerance := input.GeometryTolerance
+	if !input.GeometryToleranceSet && geometryTolerance == 0 {
+		geometryTolerance = 2
+	}
+	if geometryTolerance < 0 {
+		return newRebalanceRobotErrorOutput(session, input.DryRun, fmt.Errorf("invalid geometry_tolerance %d: cannot be negative", geometryTolerance), robot.ErrCodeInvalidFlag, "Use a non-negative --rebalance-geometry-tolerance"), nil
+	}
+
+	exists, err := rebalanceSessionExists(ctx, session)
+	if err != nil {
+		code := robot.ErrCodeInternalError
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			code = robot.ErrCodeTimeout
+		}
+		return newRebalanceRobotErrorOutput(session, input.DryRun, fmt.Errorf("checking session %q before rebalance: %w", session, err), code, "Check tmux server health"), nil
+	}
+	if !exists {
+		return newRebalanceRobotErrorOutput(session, input.DryRun, fmt.Errorf("session '%s' does not exist", session), robot.ErrCodeSessionNotFound, "Use 'ntm --robot-status' to see active sessions"), nil
+	}
+
+	resp, projectDir, store, belowThreshold, err := planRebalanceCore(
+		ctx,
+		session,
+		input.DryRun,
+		input.Apply,
+		input.Filter,
+		input.Threshold,
+		input.CheckGeometry,
+		geometryTolerance,
+	)
+	if err != nil {
+		return newRebalanceRobotErrorOutput(session, input.DryRun, err, classifyRebalanceError(err), "Inspect session assignments and pane topology"), nil
+	}
+
+	if !belowThreshold && input.Apply && len(resp.Transfers) > 0 && !input.DryRun {
+		if err := applyRebalanceTransfers(ctx, session, projectDir, store, resp.Transfers); err != nil {
+			return newRebalanceRobotErrorOutput(session, input.DryRun, fmt.Errorf("failed to apply transfers: %w", err), classifyRebalanceError(err), "Verify target panes are freshly idle and reservation policy is satisfied"), nil
+		}
+		resp.Applied = true
+	}
+
+	workloads := resp.Workloads
+	if workloads == nil {
+		workloads = []RebalanceWorkload{}
+	}
+	out := &robot.RebalanceOutput{
+		RobotResponse:  robot.NewRobotResponse(true),
+		SchemaID:       robot.RebalanceSchemaID,
+		SchemaVersion:  robot.RebalanceSchemaVersion,
+		Session:        resp.Session,
+		ImbalanceScore: resp.ImbalanceScore,
+		Recommendation: resp.Recommendation,
+		Transfers:      toRebalanceTransferItems(resp.Transfers),
+		Workloads:      workloads,
+		Before:         resp.Before,
+		After:          resp.After,
+		Geometry:       resp.Geometry,
+		Applied:        resp.Applied,
+		DryRun:         resp.DryRun,
+	}
+
+	summary := fmt.Sprintf("Session %s imbalance=%.2f (%s): %d transfer(s) suggested", resp.Session, resp.ImbalanceScore, resp.Recommendation, len(out.Transfers))
+	if out.Applied {
+		summary = fmt.Sprintf("Applied %d rebalance transfer(s) in %s (imbalance=%.2f)", len(out.Transfers), resp.Session, resp.ImbalanceScore)
+	}
+	var actions []robot.RobotAction
+	if len(out.Transfers) > 0 && !out.Applied && !out.DryRun {
+		actions = append(actions, robot.RobotAction{
+			Action:   "apply_rebalance",
+			Target:   resp.Session,
+			Reason:   fmt.Sprintf("%d bead transfer(s) recommended (%s)", len(out.Transfers), resp.Recommendation),
+			Priority: 1,
+			Details:  fmt.Sprintf("ntm --robot-rebalance=%s --rebalance-apply", resp.Session),
+		})
+	}
+	out.AgentHints = &robot.AgentHints{
+		Summary:          summary,
+		SuggestedActions: actions,
+	}
+	return out, nil
+}
+
+func runRebalanceWithGeometry(ctx context.Context, session string, dryRun, apply bool, filter string, threshold float64, formatOut string, checkGeometry bool, geometryTolerance int) error {
+	isJSON := IsJSONOutput() || strings.EqualFold(strings.TrimSpace(formatOut), "json")
+	resp, projectDir, store, belowThreshold, err := planRebalanceCore(
+		ctx,
+		session,
+		dryRun,
+		apply,
+		filter,
+		threshold,
+		checkGeometry,
+		geometryTolerance,
+	)
+	if err != nil {
+		if isJSON {
+			return outputRebalanceError(session, err)
+		}
+		return err
+	}
+
+	if belowThreshold {
+		if isJSON {
+			resp.DryRun = false
+			return outputRebalanceJSON(resp)
+		}
+		fmt.Printf("Session %s is balanced (score: %.2f < threshold: %.2f)\n", session, resp.ImbalanceScore, threshold)
+		return nil
+	}
+
+	if apply && len(resp.Transfers) > 0 && !dryRun && isJSON {
+		if err := applyRebalanceTransfers(ctx, session, projectDir, store, resp.Transfers); err != nil {
 			return outputRebalanceError(session, fmt.Errorf("failed to apply transfers: %w", err))
 		}
 		resp.Applied = true
@@ -302,10 +510,10 @@ func runRebalance(ctx context.Context, session string, dryRun, apply bool, filte
 	printRebalanceReport(resp)
 
 	// If --apply, prompt for confirmation
-	if apply && len(transfers) > 0 && !dryRun {
+	if apply && len(resp.Transfers) > 0 && !dryRun {
 		var confirmed bool
 		err := huh.NewConfirm().
-			Title(fmt.Sprintf("Apply %d transfers?", len(transfers))).
+			Title(fmt.Sprintf("Apply %d transfers?", len(resp.Transfers))).
 			Description("This will reassign beads between agents.").
 			Affirmative("Yes, apply").
 			Negative("Cancel").
@@ -316,7 +524,7 @@ func runRebalance(ctx context.Context, session string, dryRun, apply bool, filte
 			return fmt.Errorf("confirmation dialog: %w", err)
 		}
 		if confirmed {
-			if err := applyRebalanceTransfers(ctx, session, projectDir, store, transfers); err != nil {
+			if err := applyRebalanceTransfers(ctx, session, projectDir, store, resp.Transfers); err != nil {
 				return fmt.Errorf("failed to apply transfers: %w", err)
 			}
 			th := theme.Current()
@@ -479,8 +687,9 @@ func normalizeAgentTypeLike(value string) string {
 func isSupportedWorkAgentType(agentType agentpkg.AgentType) bool {
 	switch agentType {
 	case agentpkg.AgentTypeClaudeCode, agentpkg.AgentTypeCodex, agentpkg.AgentTypeGemini,
-		agentpkg.AgentTypeAntigravity, agentpkg.AgentTypeCursor, agentpkg.AgentTypeWindsurf,
-		agentpkg.AgentTypeAider, agentpkg.AgentTypeOpencode, agentpkg.AgentTypeOmp, agentpkg.AgentTypeOllama:
+		agentpkg.AgentTypeAntigravity, agentpkg.AgentTypeGrok, agentpkg.AgentTypeCursor,
+		agentpkg.AgentTypeWindsurf, agentpkg.AgentTypeAider, agentpkg.AgentTypeOpencode,
+		agentpkg.AgentTypeOmp, agentpkg.AgentTypeOllama:
 		return true
 	default:
 		return false
@@ -1061,6 +1270,20 @@ func printRebalanceReport(resp RebalanceResponse) {
 		}
 	} else {
 		fmt.Println("\nNo transfers suggested.")
+	}
+	if resp.Geometry != nil && resp.Geometry.Result != nil {
+		fmt.Printf("\nPane Geometry: uniform=%t (panes=%d, max delta=%dx%d",
+			resp.Geometry.Result.IsUniform,
+			resp.Geometry.Result.PaneCount,
+			resp.Geometry.Result.MaxWidthDelta,
+			resp.Geometry.Result.MaxHeightDelta)
+		if resp.Geometry.Average != nil {
+			fmt.Printf(", avg=%dx%d", resp.Geometry.Average.Width, resp.Geometry.Average.Height)
+		}
+		if resp.Geometry.Rebalanced {
+			fmt.Print(", rebalanced")
+		}
+		fmt.Println(")")
 	}
 }
 

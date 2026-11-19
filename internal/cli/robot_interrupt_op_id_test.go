@@ -84,6 +84,21 @@ func TestRobotInterruptOpIDRetryAcrossProcessesReplays(t *testing.T) {
 		t.Fatalf("receipt interrupt_outcome = %v, want the recorded successful interrupt with the task delivered", receipt["interrupt_outcome"])
 	}
 
+	statusDoc, code := run("--robot-action-status=" + opID)
+	if code != 0 || statusDoc["success"] != true || statusDoc["request_id"] != opID || statusDoc["terminal"] != true || statusDoc["status"] != "completed" {
+		t.Fatalf("action-status exit=%d payload=%v, want terminal completed status for %s", code, statusDoc, opID)
+	}
+
+	waitDoc, code := run("--robot-wait-request", "--request-id="+opID, "--timeout=2s", "--poll=25ms")
+	if code != 0 || waitDoc["success"] != true || waitDoc["request_id"] != opID || waitDoc["terminal"] != true {
+		t.Fatalf("wait-request exit=%d payload=%v, want immediate terminal completion for %s", code, waitDoc, opID)
+	}
+
+	cancelDoc, code := run("--robot-cancel-request=" + opID)
+	if code != 1 || cancelDoc["error_code"] != "REQUEST_NOT_CANCELLABLE" {
+		t.Fatalf("cancel-request on completed op exit=%d payload=%v, want REQUEST_NOT_CANCELLABLE", code, cancelDoc)
+	}
+
 	conflict, code := run(interrupt("different task " + marker)...)
 	if code != 1 || conflict["error_code"] != robot.ErrCodeIdempotencyConflict {
 		t.Fatalf("conflicting reuse exit=%d payload=%v, want IDEMPOTENCY_CONFLICT", code, conflict)
@@ -131,6 +146,11 @@ func TestRobotInterruptTypeFilterInterruptsOnlyThatAgentType(t *testing.T) {
 // isolated tmux server.
 func newRobotProcessRunner(t *testing.T) func(args ...string) (map[string]any, int) {
 	t.Helper()
+	return newRobotProcessRunnerWithEnv(t)
+}
+
+func newRobotProcessRunnerWithEnv(t *testing.T, extraEnv ...string) func(args ...string) (map[string]any, int) {
+	t.Helper()
 	tmpDir := t.TempDir()
 	homeDir := filepath.Join(tmpDir, "home")
 	configHome := filepath.Join(tmpDir, "xdg")
@@ -147,9 +167,9 @@ func newRobotProcessRunner(t *testing.T) func(args ...string) (map[string]any, i
 		}
 		cmd := exec.Command(os.Args[0], "-test.run=^TestRobotProcessContractHelper$")
 		cmd.Dir = tmpDir
-		cmd.Env = envWithOverrides(os.Environ(),
-			"HOME="+homeDir,
-			"XDG_CONFIG_HOME="+configHome,
+		overrides := []string{
+			"HOME=" + homeDir,
+			"XDG_CONFIG_HOME=" + configHome,
 			"NTM_NO_COLOR=1",
 			"NTM_CONFIG=",
 			"NTM_ROBOT_FORMAT=",
@@ -159,8 +179,10 @@ func newRobotProcessRunner(t *testing.T) func(args ...string) (map[string]any, i
 			// Keep the child on this process's isolated tmux server, where
 			// the fixture session lives.
 			"NTM_TEST_TMUX_ENV_OWNED=1",
-			"NTM_ROBOT_CONTRACT_ARGS="+string(rawArgs),
-		)
+			"NTM_ROBOT_CONTRACT_ARGS=" + string(rawArgs),
+		}
+		overrides = append(overrides, extraEnv...)
+		cmd.Env = envWithOverrides(os.Environ(), overrides...)
 		var stdout, stderr bytes.Buffer
 		cmd.Stdout = &stdout
 		cmd.Stderr = &stderr

@@ -221,13 +221,6 @@ func (a *ProxyAdapter) GetAvailability(ctx context.Context) (*ProxyAvailability,
 	return availability, nil
 }
 
-// InvalidateAvailabilityCache forces the next GetAvailability call to re-check.
-func (a *ProxyAdapter) InvalidateAvailabilityCache() {
-	proxyAvailabilityMutex.Lock()
-	proxyAvailabilityExpiry = time.Time{}
-	proxyAvailabilityMutex.Unlock()
-}
-
 // GetStatus queries runtime status from rust_proxy.
 func (a *ProxyAdapter) GetStatus(ctx context.Context) (*ProxyStatus, error) {
 	path, installed := a.Detect()

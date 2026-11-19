@@ -1,14 +1,17 @@
 package pipeline
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // BeadQueryStep describes a first-class br query operation. It replaces
@@ -24,21 +27,23 @@ type BeadQueryStep struct {
 }
 
 // BeadRecord is the typed subset of `br list --json` issue fields that
-// pipeline authors commonly consume downstream.
+// pipeline authors commonly consume downstream. Keep zero and empty fields
+// in the wire representation: persisted execution state decodes records into
+// maps, which must expose the same fields as fresh native records.
 type BeadRecord struct {
 	ID          string   `json:"id"`
-	Title       string   `json:"title,omitempty"`
-	Description string   `json:"description,omitempty"`
-	Labels      []string `json:"labels,omitempty"`
-	Status      string   `json:"status,omitempty"`
-	State       string   `json:"state,omitempty"`
-	Priority    int      `json:"priority,omitempty"`
-	IssueType   string   `json:"issue_type,omitempty"`
-	Assignee    string   `json:"assignee,omitempty"`
-	CreatedAt   string   `json:"created_at,omitempty"`
-	UpdatedAt   string   `json:"updated_at,omitempty"`
-	ClosedAt    string   `json:"closed_at,omitempty"`
-	SourceRepo  string   `json:"source_repo,omitempty"`
+	Title       string   `json:"title"`
+	Description string   `json:"description"`
+	Labels      []string `json:"labels"`
+	Status      string   `json:"status"`
+	State       string   `json:"state"`
+	Priority    int      `json:"priority"`
+	IssueType   string   `json:"issue_type"`
+	Assignee    string   `json:"assignee"`
+	CreatedAt   string   `json:"created_at"`
+	UpdatedAt   string   `json:"updated_at"`
+	ClosedAt    string   `json:"closed_at"`
+	SourceRepo  string   `json:"source_repo"`
 }
 
 func (e *Executor) executeBeadQuery(ctx context.Context, step *Step, workflow *Workflow) StepResult {
@@ -55,6 +60,16 @@ func (e *Executor) executeBeadQuery(ctx context.Context, step *Step, workflow *W
 		result.Error = stepRuntimeError(step, "bead_query", "bead_query",
 			fmt.Sprintf("variable substitution failed: %v", err),
 			"reference declared workflow vars or provide a | fallback for optional values",
+			err.Error())
+		result.FinishedAt = time.Now()
+		return result
+	}
+	filter, err := compileBeadFilter(resolvedQuery.Filter)
+	if err != nil {
+		result.Status = StatusFailed
+		result.Error = stepRuntimeError(step, "bead_query", "bead_query",
+			fmt.Sprintf("filter failed: %v", err),
+			"use field==value or field!=value with &&, ||, and parentheses; quote values containing spaces or operators",
 			err.Error())
 		result.FinishedAt = time.Now()
 		return result
@@ -117,12 +132,12 @@ func (e *Executor) executeBeadQuery(ctx context.Context, step *Step, workflow *W
 		result.FinishedAt = time.Now()
 		return result
 	}
-	records, err = filterBeadRecords(records, resolvedQuery.Filter)
+	records, err = filterBeadRecords(records, filter)
 	if err != nil {
 		result.Status = StatusFailed
 		result.Error = stepRuntimeError(step, "bead_query", "bead_query",
 			fmt.Sprintf("filter failed: %v", err),
-			"use simple field==value or field!=value clauses joined by && or ||",
+			"use field==value or field!=value with &&, ||, and parentheses; quote values containing spaces or operators",
 			err.Error())
 		result.FinishedAt = time.Now()
 		return result
@@ -264,30 +279,150 @@ func (q *BeadQueryStep) brListArgs() []string {
 }
 
 func parseBeadQueryRecords(out []byte) ([]BeadRecord, error) {
-	trimmed := strings.TrimSpace(string(out))
-	if trimmed == "" {
-		return []BeadRecord{}, nil
-	}
-	var doc struct {
-		Issues []BeadRecord `json:"issues"`
-	}
-	if err := json.Unmarshal([]byte(trimmed), &doc); err != nil {
+	payload, err := completeBeadListPayload(out)
+	if err != nil {
 		return nil, err
 	}
-	if doc.Issues == nil {
-		return []BeadRecord{}, nil
+	var records []BeadRecord
+	if err := json.Unmarshal(payload, &records); err != nil {
+		return nil, fmt.Errorf("invalid br list records: %w", err)
 	}
-	return doc.Issues, nil
+	for i := range records {
+		if records[i].Labels == nil {
+			records[i].Labels = []string{}
+		}
+	}
+	return records, nil
 }
 
-func filterBeadRecords(records []BeadRecord, filter string) ([]BeadRecord, error) {
-	filter = strings.TrimSpace(filter)
-	if filter == "" {
+// completeBeadListPayload validates the whole native br response before a
+// query filter or foreach can hide an invalid row. Both consumers request
+// --limit 0: only an explicit issues array with unique identities and no
+// contradictory pagination is a usable work set. Return the original array
+// so foreach retains fields outside the typed BeadRecord subset.
+func completeBeadListPayload(out []byte) (json.RawMessage, error) {
+	envelope, err := beadListObject(out, "issues", "total", "limit", "offset", "has_more", "success", "error")
+	if err != nil {
+		return nil, fmt.Errorf("invalid br list envelope: %w", err)
+	}
+	payload := bytes.TrimSpace(envelope["issues"])
+	if len(payload) == 0 || payload[0] != '[' {
+		return nil, fmt.Errorf("br list response must contain an explicit issues array")
+	}
+	var rows []json.RawMessage
+	if err := json.Unmarshal(payload, &rows); err != nil {
+		return nil, fmt.Errorf("invalid br list issues array: %w", err)
+	}
+	seen := make(map[string]struct{}, len(rows))
+	for i, row := range rows {
+		id, err := beadListRecordID(row)
+		if err != nil {
+			return nil, fmt.Errorf("br list issue %d: %w", i, err)
+		}
+		if _, exists := seen[id]; exists {
+			return nil, fmt.Errorf("br list response contains duplicate issue identities")
+		}
+		seen[id] = struct{}{}
+	}
+	for _, field := range []string{"total", "offset", "limit"} {
+		raw, exists := envelope[field]
+		if !exists {
+			continue
+		}
+		var value *int
+		if err := json.Unmarshal(raw, &value); err != nil || value == nil || *value < 0 {
+			return nil, fmt.Errorf("br list response has invalid %s metadata", field)
+		}
+		if (field == "total" && *value != len(rows)) || (field != "total" && *value != 0) {
+			return nil, fmt.Errorf("br list response has incomplete or inconsistent %s metadata", field)
+		}
+	}
+	for _, field := range []string{"has_more", "success"} {
+		raw, exists := envelope[field]
+		if !exists {
+			continue
+		}
+		var value *bool
+		if err := json.Unmarshal(raw, &value); err != nil || value == nil {
+			return nil, fmt.Errorf("br list response has invalid %s metadata", field)
+		}
+		if (field == "success" && !*value) || (field == "has_more" && *value) {
+			return nil, fmt.Errorf("br list response reports an unsuccessful or incomplete query (%s)", field)
+		}
+	}
+	reportedError := bytes.TrimSpace(envelope["error"])
+	if len(reportedError) != 0 && !bytes.Equal(reportedError, []byte("null")) && !bytes.Equal(reportedError, []byte(`""`)) {
+		return nil, fmt.Errorf("br list response reports a query error")
+	}
+	return payload, nil
+}
+
+// beadListObject rejects duplicate keys before map decoding can discard
+// contradictory evidence. Critical fields also require their exact spelling:
+// case aliases must not hide pagination or change a typed record's identity.
+func beadListObject(data []byte, criticalFields ...string) (map[string]json.RawMessage, error) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	opening, err := decoder.Token()
+	if err != nil || opening != json.Delim('{') {
+		return nil, fmt.Errorf("expected a JSON object")
+	}
+	fields := make(map[string]json.RawMessage)
+	for decoder.More() {
+		key, err := decoder.Token()
+		if err != nil {
+			return nil, fmt.Errorf("invalid object field: %w", err)
+		}
+		name, ok := key.(string)
+		if !ok {
+			return nil, fmt.Errorf("invalid object field name")
+		}
+		if _, exists := fields[name]; exists {
+			return nil, fmt.Errorf("duplicate object field")
+		}
+		for _, canonical := range criticalFields {
+			if name != canonical && strings.EqualFold(name, canonical) {
+				return nil, fmt.Errorf("ambiguous %s field", canonical)
+			}
+		}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return nil, fmt.Errorf("invalid object value: %w", err)
+		}
+		fields[name] = value
+	}
+	closing, err := decoder.Token()
+	if err != nil || closing != json.Delim('}') {
+		return nil, fmt.Errorf("incomplete JSON object")
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		return nil, fmt.Errorf("trailing data after JSON object")
+	}
+	return fields, nil
+}
+
+// beadListRecordID validates the same exact identity for both consumers.
+// In particular, an "ID" alias cannot replace the validated "id" when the
+// native query subsequently decodes its case-insensitive BeadRecord fields.
+func beadListRecordID(row json.RawMessage) (string, error) {
+	fields, err := beadListObject(row, "id")
+	if err != nil {
+		return "", err
+	}
+	var id string
+	if err := json.Unmarshal(fields["id"], &id); err != nil || id == "" ||
+		strings.IndexFunc(id, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
+		return "", fmt.Errorf("issue identity must be a nonempty string without whitespace or control characters")
+	}
+	return id, nil
+}
+
+func filterBeadRecords(records []BeadRecord, filter filterNode) ([]BeadRecord, error) {
+	if filter == nil {
 		return records, nil
 	}
 	out := make([]BeadRecord, 0, len(records))
 	for _, record := range records {
-		ok, err := matchBeadFilter(record, filter)
+		ok, err := filter.eval(FilterContext{Item: record})
 		if err != nil {
 			return nil, err
 		}
@@ -298,102 +433,87 @@ func filterBeadRecords(records []BeadRecord, filter string) ([]BeadRecord, error
 	return out, nil
 }
 
-func matchBeadFilter(record BeadRecord, expr string) (bool, error) {
-	// bd-3at8h: the existing string-split parser cannot handle the
-	// parenthesized E2.6 filter shapes the docs imply (e.g.
-	// `status==open && (label==hypothesis || label==phase-4)`). Splitting
-	// on `||` first chops the parens into clauses like `(label==hypothesis`
-	// and `label==phase-4)` that then fail with confusing field/value
-	// errors or silently match the wrong record set. Reject parentheses
-	// up front with an actionable error so authors don't get a wrong-set
-	// surprise; the deeper "reuse foreach filter parser" path is tracked
-	// for a follow-up.
-	if strings.ContainsAny(expr, "()") {
-		return false, fmt.Errorf("bead_query.filter does not yet support parenthesized expressions (got %q): rewrite without grouping (e.g. status==open && label==hypothesis || status==open && label==phase-4) or pre-narrow with bead_query.labels/status", expr)
+// compileBeadFilter reuses the foreach expression grammar while retaining
+// bead-specific semantics: labels are membership tests, priority is an
+// integer, and other fields compare exact strings. Every comparison is
+// validated before br is invoked, rather than only along a matching row's
+// short-circuit path. The compiled predicate is reused for the whole result.
+func compileBeadFilter(expr string) (filterNode, error) {
+	if strings.TrimSpace(expr) == "" {
+		return nil, nil
 	}
-	orParts := strings.Split(expr, "||")
-	for _, orPart := range orParts {
-		andParts := strings.Split(orPart, "&&")
-		all := true
-		for _, rawClause := range andParts {
-			ok, err := matchBeadFilterClause(record, rawClause)
-			if err != nil {
-				return false, err
-			}
-			if !ok {
-				all = false
-				break
-			}
-		}
-		if all {
-			return true, nil
-		}
+	node, err := parseFilterExpression(expr)
+	if err != nil {
+		return nil, err
 	}
-	return false, nil
+	return compileBeadFilterNode(node)
 }
 
-func matchBeadFilterClause(record BeadRecord, rawClause string) (bool, error) {
-	clause := strings.TrimSpace(rawClause)
-	if clause == "" {
-		return false, fmt.Errorf("empty filter clause")
-	}
-
-	// bd-o4ji9: detect the operator by the earliest occurrence of `==` or
-	// `!=`. Preferring `==` regardless of position mis-parsed clauses like
-	// `field!=foo==bar`, where SplitN(clause, "==", 2) splits cleanly into
-	// two parts but locks `op` to `==` and assigns the literal `field!=foo`
-	// as the field name.
-	eqIdx := strings.Index(clause, "==")
-	neIdx := strings.Index(clause, "!=")
-	op := ""
-	splitIdx := -1
-	switch {
-	case eqIdx >= 0 && neIdx >= 0:
-		if eqIdx <= neIdx {
-			op, splitIdx = "==", eqIdx
-		} else {
-			op, splitIdx = "!=", neIdx
+func compileBeadFilterNode(node filterNode) (filterNode, error) {
+	switch n := node.(type) {
+	case filterLogicalNode:
+		left, err := compileBeadFilterNode(n.left)
+		if err != nil {
+			return nil, err
 		}
-	case eqIdx >= 0:
-		op, splitIdx = "==", eqIdx
-	case neIdx >= 0:
-		op, splitIdx = "!=", neIdx
+		right, err := compileBeadFilterNode(n.right)
+		if err != nil {
+			return nil, err
+		}
+		return filterLogicalNode{op: n.op, left: left, right: right}, nil
+	case filterCompareNode:
+		field := strings.ToLower(strings.TrimSpace(n.left.value))
+		if n.left.quoted {
+			return nil, fmt.Errorf("bead field %q must not be quoted", field)
+		}
+		if _, ok := beadRecordField(BeadRecord{}, field); !ok {
+			return nil, fmt.Errorf("unknown bead field %q", field)
+		}
+		compiled := beadFilterComparison{field: field, value: n.right.value, negate: n.op == "!="}
+		if field == "priority" {
+			priority, err := strconv.Atoi(n.right.value)
+			if err != nil {
+				return nil, fmt.Errorf("bead priority requires an integer, got %q", n.right.value)
+			}
+			compiled.priority = priority
+		}
+		return compiled, nil
+	default:
+		return nil, fmt.Errorf("bead filters require field==value or field!=value comparisons")
 	}
-	if splitIdx < 0 {
-		return false, fmt.Errorf("unsupported filter clause %q", clause)
-	}
-	parts := []string{clause[:splitIdx], clause[splitIdx+2:]}
+}
 
-	// bd-6uylc: beadRecordField lowercases the field internally, so the
-	// label/labels list-membership branch must compare against the same
-	// canonical form. Otherwise "Label==alpha" returned the comma-joined
-	// label string, mismatched the user's value, and silently excluded
-	// records that should match.
-	field := strings.ToLower(strings.TrimSpace(parts[0]))
-	want := trimFilterValue(parts[1])
-	got, ok := beadRecordField(record, field)
+type beadFilterComparison struct {
+	field    string
+	value    string
+	priority int
+	negate   bool
+}
+
+func (n beadFilterComparison) eval(ctx FilterContext) (bool, error) {
+	record, ok := ctx.Item.(BeadRecord)
 	if !ok {
-		return false, fmt.Errorf("unknown bead field %q", field)
+		return false, fmt.Errorf("bead filter requires a bead record")
 	}
-
-	matches := got == want
-	if field == "label" || field == "labels" {
-		matches = false
+	var matches bool
+	switch n.field {
+	case "label", "labels":
 		for _, label := range record.Labels {
-			if label == want {
+			if label == n.value {
 				matches = true
 				break
 			}
 		}
+	case "priority":
+		matches = record.Priority == n.priority
+	default:
+		got, _ := beadRecordField(record, n.field) // Validated during compilation.
+		matches = got == n.value
 	}
-	if op == "!=" {
+	if n.negate {
 		return !matches, nil
 	}
 	return matches, nil
-}
-
-func trimFilterValue(raw string) string {
-	return strings.Trim(strings.TrimSpace(raw), `"'`)
 }
 
 func beadRecordField(record BeadRecord, field string) (string, bool) {

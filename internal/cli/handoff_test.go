@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -604,6 +606,99 @@ func TestRunHandoffCreateAutoPreservesCommandCancellation(t *testing.T) {
 	err := runHandoffCreate(cmd, "", "", "", "", true, "", false, "", "yaml", false)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("runHandoffCreate() error = %v, want context.Canceled", err)
+	}
+}
+
+func TestHandoffAutoSavesAfterOptionalCASSDeadline(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("CASS subprocess fixture requires a POSIX shell")
+	}
+	sleepPath, err := exec.LookPath("sleep")
+	if err != nil {
+		t.Skip("CASS subprocess fixture requires sleep")
+	}
+	projectDir, binDir := t.TempDir(), t.TempDir()
+	t.Chdir(projectDir)
+	t.Setenv("PATH", binDir)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("NTM_HANDOFF_CASS_SLEEP", sleepPath)
+	marker := filepath.Join(projectDir, "cass-called")
+	t.Setenv("NTM_HANDOFF_CASS_MARKER", marker)
+	const slowCASS = `#!/bin/sh
+set -eu
+[ "$1" = search ] || exit 92
+printf '%s\n' "$@" > "$NTM_HANDOFF_CASS_MARKER"
+exec "$NTM_HANDOFF_CASS_SLEEP" 30
+`
+	if err := os.WriteFile(filepath.Join(binDir, "cass"), []byte(slowCASS), 0700); err != nil {
+		t.Fatal(err)
+	}
+	// A non-repository workspace is valid. Keep project discovery and git
+	// enrichment deterministic instead of consulting any host configuration.
+	if err := os.WriteFile(filepath.Join(binDir, "git"), []byte("#!/bin/sh\nexit 1\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	oldJSONOutput, oldConfig := jsonOutput, cfg
+	jsonOutput, cfg = false, nil
+	t.Cleanup(func() { jsonOutput, cfg = oldJSONOutput, oldConfig })
+	ctx, cancel := context.WithTimeout(t.Context(), 12*time.Second)
+	defer cancel()
+	path := filepath.Join(projectDir, "handoff.yaml")
+	var stdout bytes.Buffer
+	cmd := newHandoffCmd()
+	cmd.SetContext(ctx)
+	cmd.SetOut(&stdout)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{"create", "--auto", "--goal", "Implemented recovery", "--now", "Validate the saved work", "--output", path, "--format", "json"})
+	started := time.Now()
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("auto handoff failed after optional source timeout: %v; stdout=%s", err, stdout.String())
+	}
+	if elapsed := time.Since(started); elapsed >= 10*time.Second || ctx.Err() != nil {
+		t.Fatalf("optional search consumed the caller's lifetime: elapsed=%s parent=%v", elapsed, ctx.Err())
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("CASS fixture was not searched: %v", err)
+	}
+	var result struct {
+		Success  bool                        `json:"success"`
+		Path     string                      `json:"path"`
+		Warnings []handoff.EnrichmentWarning `json:"warnings"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil || !result.Success || result.Path != path {
+		t.Fatalf("create result=%+v decode=%v stdout=%s", result, err, stdout.String())
+	}
+	hasCASSWarning := func(warnings []handoff.EnrichmentWarning) bool {
+		for _, warning := range warnings {
+			if warning.Source == "cass" && strings.Contains(warning.Message, "deadline exceeded") {
+				return true
+			}
+		}
+		return false
+	}
+	if !hasCASSWarning(result.Warnings) {
+		t.Fatalf("successful create omitted its source degradation: %+v", result)
+	}
+	h, err := handoff.NewReader(projectDir).Read(path)
+	if err != nil || h.Goal != "Implemented recovery" || h.Now != "Validate the saved work" || !hasCASSWarning(h.Warnings) {
+		t.Fatalf("persisted handoff lost work or source evidence: handoff=%+v error=%v", h, err)
+	}
+
+	// Both supported human-readable views must explain the partial enrichment
+	// from the saved artifact, without rerunning external sources.
+	for _, args := range [][]string{
+		{"show", path},
+		{"create", "--from-file", path, "--output", "-", "--format", "markdown"},
+	} {
+		var view bytes.Buffer
+		cmd := newHandoffCmd()
+		cmd.SetContext(ctx)
+		cmd.SetOut(&view)
+		cmd.SetErr(io.Discard)
+		cmd.SetArgs(args)
+		if err := cmd.Execute(); err != nil || !strings.Contains(view.String(), "Incomplete Enrichment") || !strings.Contains(view.String(), "deadline exceeded") {
+			t.Fatalf("saved handoff view %v omitted degradation: error=%v output=%s", args, err, view.String())
+		}
 	}
 }
 
@@ -1589,5 +1684,213 @@ func TestRunHandoffCreateValidation(t *testing.T) {
 	err = runHandoffCreate(cmd, "testsession", "Test goal", "Task now", "", false, "", false, "", "yaml", false)
 	if err != nil {
 		t.Fatalf("runHandoffCreate() with goal and now should succeed: %v", err)
+	}
+}
+
+func TestRunHandoffCreateAutoDegradesOnSlowCASS(t *testing.T) {
+	tmpDir := t.TempDir()
+	binDir := filepath.Join(tmpDir, "bin")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	cassScript := filepath.Join(binDir, "cass")
+	if err := os.WriteFile(cassScript, []byte("#!/bin/sh\nexec sleep 15\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Chdir(tmpDir)
+
+	cmd := newHandoffCreateCmd()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetErr(&buf)
+	cmd.SetArgs([]string{"general", "--auto", "--goal", "Slow CASS resilience", "--now", "Verify degraded JSON", "--format", "json"})
+
+	start := time.Now()
+	if err := cmd.ExecuteContext(t.Context()); err != nil {
+		t.Fatalf("handoff create --auto failed on slow cass: %v; output=%s", err, buf.String())
+	}
+	elapsed := time.Since(start)
+	if elapsed >= 6*time.Second {
+		t.Fatalf("handoff create --auto did not bound 15s slow cass: elapsed=%v", elapsed)
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(buf.Bytes(), &result); err != nil {
+		t.Fatalf("decode JSON output: %v; raw=%s", err, buf.String())
+	}
+	if result["success"] != true {
+		t.Fatalf("expected success=true, got %+v", result)
+	}
+	warnings, ok := result["warnings"].([]interface{})
+	if !ok || len(warnings) == 0 {
+		t.Fatalf("expected structured cass degradation warning in JSON output, got %+v", result)
+	}
+}
+
+func TestHandoffCreateBlockerDecisionFlagsAndShowState(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Chdir(tmpDir)
+
+	createCmd := newHandoffCreateCmd()
+	var createOut bytes.Buffer
+	createCmd.SetOut(&createOut)
+	createCmd.SetErr(&createOut)
+	outPath := filepath.Join(tmpDir, "blocked-handoff.yaml")
+	createCmd.SetArgs([]string{
+		"general",
+		"--goal", "Investigated projection sync",
+		"--now", "Unblock upstream credentials",
+		"--blocker", "Missing API token",
+		"--decision", "store=sqlite",
+		"--output", outPath,
+		"--format", "json",
+		"--include-git=false",
+	})
+	if err := createCmd.ExecuteContext(t.Context()); err != nil {
+		t.Fatalf("handoff create with --blocker/--decision failed: %v; output=%s", err, createOut.String())
+	}
+
+	var created map[string]interface{}
+	if err := json.Unmarshal(createOut.Bytes(), &created); err != nil {
+		t.Fatalf("decode create JSON: %v; raw=%s", err, createOut.String())
+	}
+	if created["is_blocked"] != true || created["is_complete"] != false {
+		t.Fatalf("expected is_blocked=true and is_complete=false, got %+v", created)
+	}
+
+	showCmd := newHandoffShowCmd()
+	var showOut bytes.Buffer
+	showCmd.SetOut(&showOut)
+	showCmd.SetErr(&showOut)
+	showCmd.SetArgs([]string{outPath})
+	if err := showCmd.ExecuteContext(t.Context()); err != nil {
+		t.Fatalf("handoff show failed: %v", err)
+	}
+	text := showOut.String()
+	for _, want := range []string{"State: blocked (1 blocker(s))", "Missing API token", "store: sqlite"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected handoff show output to contain %q, got:\n%s", want, text)
+		}
+	}
+}
+
+func TestHandoffCreateFromInvalidFileFormatsAllFieldValidationErrors(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Chdir(tmpDir)
+
+	invalidPath := filepath.Join(tmpDir, "invalid.yaml")
+	invalidYAML := "session: bad session!\nstatus: invalid_status\noutcome: BAD_OUTCOME\n"
+	if err := os.WriteFile(invalidPath, []byte(invalidYAML), 0o600); err != nil {
+		t.Fatalf("write invalid yaml: %v", err)
+	}
+
+	cmd := newHandoffCreateCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs([]string{"--from-file", invalidPath})
+
+	err := cmd.ExecuteContext(t.Context())
+	if err == nil {
+		t.Fatal("expected validation error for invalid handoff YAML")
+	}
+	for _, want := range []string{"validation failed:", "field=goal", "field=now", "field=status", "field=outcome"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected error %q to contain %q", err.Error(), want)
+		}
+	}
+}
+
+func TestHandoffCreateManualComputesQualityReport(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Chdir(tmpDir)
+
+	prevCfg := cfg
+	prevJSON := jsonOutput
+	cfg = nil
+	jsonOutput = false
+	t.Cleanup(func() {
+		cfg = prevCfg
+		jsonOutput = prevJSON
+	})
+
+	root := &cobra.Command{Use: "ntm"}
+	root.PersistentFlags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
+	root.AddCommand(newHandoffCmd())
+
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetErr(&out)
+	root.SetArgs([]string{
+		"handoff", "create", "myproject",
+		"--goal", "Implemented ORI robot handoff surface",
+		"--now", "Run quality and deadcode gates",
+		"--include-git=false",
+		"--json",
+	})
+
+	if err := root.ExecuteContext(t.Context()); err != nil {
+		t.Fatalf("handoff create myproject --json failed: %v; output=%s", err, out.String())
+	}
+
+	var payload struct {
+		Success bool                   `json:"success"`
+		Path    string                 `json:"path"`
+		Session string                 `json:"session"`
+		Quality *handoff.QualityReport `json:"quality"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatalf("decode JSON output: %v; raw=%s", err, out.String())
+	}
+	if !payload.Success || payload.Path == "" {
+		t.Fatalf("expected success=true and non-empty path, got %+v", payload)
+	}
+	if payload.Quality == nil || payload.Quality.Score <= 0 || len(payload.Quality.Dimensions) != 4 {
+		t.Fatalf("expected JSON stdout quality report with score>0 and 4 dimensions, got %+v", payload.Quality)
+	}
+
+	persisted, err := handoff.NewReader(tmpDir).Read(payload.Path)
+	if err != nil {
+		t.Fatalf("read persisted handoff YAML %s: %v", payload.Path, err)
+	}
+	if persisted.Quality == nil {
+		t.Fatal("expected persisted manual handoff YAML to include non-nil QualityReport")
+	}
+	if persisted.Quality.Score <= 0 {
+		t.Fatalf("expected persisted Quality.Score > 0, got %d", persisted.Quality.Score)
+	}
+	if len(persisted.Quality.Dimensions) != 4 {
+		t.Fatalf("expected 4 Quality.Dimensions, got %d (%+v)", len(persisted.Quality.Dimensions), persisted.Quality.Dimensions)
+	}
+
+	// Verify --from-file handoffs without precomputed quality also persist a 4-dimension QualityReport.
+	srcFile := filepath.Join(tmpDir, "source-handoff.yaml")
+	srcYAML := "session: myproject\ngoal: Seeded from file\nnow: Verify quality report on import\nstatus: complete\noutcome: SUCCEEDED\n"
+	if err := os.WriteFile(srcFile, []byte(srcYAML), 0o600); err != nil {
+		t.Fatalf("write source handoff YAML: %v", err)
+	}
+
+	fromFileCmd := newHandoffCreateCmd()
+	var fromFileOut bytes.Buffer
+	fromFileCmd.SetOut(&fromFileOut)
+	fromFileCmd.SetErr(&fromFileOut)
+	jsonOutput = false
+	fromFileDest := filepath.Join(tmpDir, "imported-handoff.yaml")
+	fromFileCmd.SetArgs([]string{
+		"myproject",
+		"--from-file", srcFile,
+		"--output", fromFileDest,
+		"--format", "json",
+	})
+	if err := fromFileCmd.ExecuteContext(t.Context()); err != nil {
+		t.Fatalf("handoff create --from-file failed: %v; output=%s", err, fromFileOut.String())
+	}
+	imported, err := handoff.NewReader(tmpDir).Read(fromFileDest)
+	if err != nil {
+		t.Fatalf("read imported handoff YAML: %v", err)
+	}
+	if imported.Quality == nil || imported.Quality.Score <= 0 || len(imported.Quality.Dimensions) != 4 {
+		t.Fatalf("expected imported handoff YAML quality report with score>0 and 4 dimensions, got %+v", imported.Quality)
 	}
 }

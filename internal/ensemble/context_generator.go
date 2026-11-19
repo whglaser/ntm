@@ -2,6 +2,7 @@ package ensemble
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	tokenpkg "github.com/Dicklesworthstone/ntm/internal/tokens"
+	"github.com/Dicklesworthstone/ntm/internal/util"
 )
 
 const (
@@ -28,6 +30,7 @@ type ContextPackGenerator struct {
 	ProjectDir string
 	Logger     *slog.Logger
 	Cache      *ContextPackCache
+	MaxTokens  int
 }
 
 // NewContextPackGenerator returns a generator instance.
@@ -40,9 +43,18 @@ func NewContextPackGenerator(projectDir string, cache *ContextPackCache, logger 
 }
 
 // Generate builds a context pack and uses cache when enabled.
-func (g *ContextPackGenerator) Generate(question string, modeKey string, cacheCfg CacheConfig) (*ContextPack, error) {
-	projectRoot := g.resolveProjectRoot()
-	fingerprint := g.buildFingerprint(projectRoot, question, modeKey)
+func (g *ContextPackGenerator) Generate(ctx context.Context, question string, modeKey string, cacheCfg CacheConfig) (*ContextPack, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("context pack generation context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	projectRoot := g.resolveProjectRoot(ctx)
+	fingerprint := g.buildFingerprint(ctx, projectRoot, question, modeKey)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	cacheKey := fingerprint.cacheKey()
 
 	if cacheCfg.Enabled && g.Cache != nil {
@@ -51,6 +63,9 @@ func (g *ContextPackGenerator) Generate(question string, modeKey string, cacheCf
 				"key", cacheKey,
 				"project", projectRoot,
 			)
+			if g.MaxTokens > 0 {
+				return CapContextPackTokens(pack, g.MaxTokens), nil
+			}
 			return pack, nil
 		}
 		g.loggerSafe().Info("context pack cache miss",
@@ -59,7 +74,10 @@ func (g *ContextPackGenerator) Generate(question string, modeKey string, cacheCf
 		)
 	}
 
-	brief := g.buildProjectBrief(projectRoot)
+	brief := g.buildProjectBrief(ctx, projectRoot)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	userCtx := &UserContext{
 		ProblemStatement: strings.TrimSpace(question),
 	}
@@ -82,6 +100,9 @@ func (g *ContextPackGenerator) Generate(question string, modeKey string, cacheCf
 
 	pack.TokenEstimate = tokenpkg.EstimateTokensWithLanguageHint(formatContextPack(pack), tokenpkg.ContentMarkdown)
 	pack.Hash = hashContextPack(pack)
+	if g.MaxTokens > 0 {
+		pack = CapContextPackTokens(pack, g.MaxTokens)
+	}
 
 	if cacheCfg.Enabled && g.Cache != nil {
 		if err := g.Cache.Put(cacheKey, pack, fingerprint); err != nil {
@@ -102,11 +123,11 @@ func (g *ContextPackGenerator) Generate(question string, modeKey string, cacheCf
 	return pack, nil
 }
 
-func (g *ContextPackGenerator) resolveProjectRoot() string {
+func (g *ContextPackGenerator) resolveProjectRoot(ctx context.Context) string {
 	if g.ProjectDir == "" {
 		return "."
 	}
-	root, err := findProjectRoot(g.ProjectDir)
+	root, err := findProjectRoot(ctx, g.ProjectDir)
 	if err == nil && root != "" {
 		return root
 	}
@@ -115,9 +136,10 @@ func (g *ContextPackGenerator) resolveProjectRoot() string {
 
 // findProjectRoot returns the git repository root for the given directory.
 // This is inlined here to avoid import cycles with the git package.
-func findProjectRoot(startDir string) (string, error) {
-	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
+func findProjectRoot(ctx context.Context, startDir string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", "rev-parse", "--show-toplevel")
 	cmd.Dir = startDir
+	cmd.WaitDelay = time.Second
 	output, err := cmd.Output()
 	if err != nil {
 		return "", err
@@ -125,8 +147,8 @@ func findProjectRoot(startDir string) (string, error) {
 	return strings.TrimSpace(string(output)), nil
 }
 
-func (g *ContextPackGenerator) buildFingerprint(projectRoot, question, modeKey string) ContextFingerprint {
-	head, status := gitState(projectRoot)
+func (g *ContextPackGenerator) buildFingerprint(ctx context.Context, projectRoot, question, modeKey string) ContextFingerprint {
+	head, status := gitState(ctx, projectRoot)
 	readme := findReadme(projectRoot)
 	return ContextFingerprint{
 		ProjectRoot:  projectRoot,
@@ -145,11 +167,11 @@ func (g *ContextPackGenerator) loggerSafe() *slog.Logger {
 	return slog.Default()
 }
 
-func (g *ContextPackGenerator) buildProjectBrief(projectRoot string) *ProjectBrief {
+func (g *ContextPackGenerator) buildProjectBrief(ctx context.Context, projectRoot string) *ProjectBrief {
 	name, description := readProjectOverview(projectRoot)
-	structure, languages, frameworks := scanProjectStructure(projectRoot)
-	commits := recentCommits(projectRoot, 8)
-	openIssues := countOpenIssues(projectRoot)
+	structure, languages, frameworks := scanProjectStructure(ctx, projectRoot)
+	commits := recentCommits(ctx, projectRoot, 8)
+	openIssues := countOpenIssues(ctx, projectRoot)
 
 	sort.Strings(languages)
 	sort.Strings(frameworks)
@@ -238,7 +260,7 @@ type projectScan struct {
 	frameworks  map[string]bool
 }
 
-func scanProjectStructure(root string) (*ProjectStructure, []string, []string) {
+func scanProjectStructure(ctx context.Context, root string) (*ProjectStructure, []string, []string) {
 	scan := &projectScan{
 		entryPoints: make(map[string]bool),
 		corePkgs:    make(map[string]bool),
@@ -262,6 +284,9 @@ func scanProjectStructure(root string) (*ProjectStructure, []string, []string) {
 	}
 
 	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err != nil {
 			return nil
 		}
@@ -522,12 +547,13 @@ func frameworksFromPython(path string) []string {
 	return frameworks
 }
 
-func recentCommits(root string, limit int) []CommitSummary {
+func recentCommits(ctx context.Context, root string, limit int) []CommitSummary {
 	if limit <= 0 {
 		return nil
 	}
-	cmd := exec.Command("git", "log", fmt.Sprintf("-%d", limit), "--pretty=format:%H|%an|%s|%cI")
+	cmd := exec.CommandContext(ctx, "git", "log", fmt.Sprintf("-%d", limit), "--pretty=format:%H|%an|%s|%cI")
 	cmd.Dir = root
+	cmd.WaitDelay = time.Second
 	out, err := cmd.Output()
 	if err != nil {
 		return nil
@@ -553,18 +579,20 @@ func recentCommits(root string, limit int) []CommitSummary {
 	return commits
 }
 
-func gitState(root string) (string, string) {
+func gitState(ctx context.Context, root string) (string, string) {
 	head := ""
 	statusHash := ""
 
-	cmd := exec.Command("git", "rev-parse", "HEAD")
+	cmd := exec.CommandContext(ctx, "git", "rev-parse", "HEAD")
 	cmd.Dir = root
+	cmd.WaitDelay = time.Second
 	if out, err := cmd.Output(); err == nil {
 		head = strings.TrimSpace(string(out))
 	}
 
-	cmd = exec.Command("git", "status", "--porcelain")
+	cmd = exec.CommandContext(ctx, "git", "status", "--porcelain")
 	cmd.Dir = root
+	cmd.WaitDelay = time.Second
 	if out, err := cmd.Output(); err == nil {
 		statusHash = hashString(string(out))
 	}
@@ -572,7 +600,7 @@ func gitState(root string) (string, string) {
 	return head, statusHash
 }
 
-func countOpenIssues(root string) int {
+func countOpenIssues(ctx context.Context, root string) int {
 	path := filepath.Join(root, ".beads", "issues.jsonl")
 	file, err := os.Open(path)
 	if err != nil {
@@ -586,6 +614,9 @@ func countOpenIssues(root string) int {
 
 	openCount := 0
 	for scanner.Scan() {
+		if ctx.Err() != nil {
+			return openCount
+		}
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
 			continue
@@ -627,4 +658,113 @@ func hashContextPack(pack *ContextPack) string {
 	}
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])[:16]
+}
+
+// CapContextPackTokens returns a ContextPack trimmed to stay within maxTokens when maxTokens > 0.
+func CapContextPackTokens(pack *ContextPack, maxTokens int) *ContextPack {
+	if pack == nil || maxTokens <= 0 {
+		return pack
+	}
+	estimate := func(cp *ContextPack) int {
+		return tokenpkg.EstimateTokensWithLanguageHint(formatContextPack(cp), tokenpkg.ContentMarkdown)
+	}
+	if pack.TokenEstimate <= 0 {
+		pack.TokenEstimate = estimate(pack)
+	}
+	if pack.TokenEstimate <= maxTokens {
+		return pack
+	}
+
+	capped := *pack
+	if pack.Questions != nil {
+		capped.Questions = append([]TargetedQuestion(nil), pack.Questions...)
+	}
+	if pack.ProjectBrief != nil {
+		b := *pack.ProjectBrief
+		b.Languages = append([]string(nil), pack.ProjectBrief.Languages...)
+		b.Frameworks = append([]string(nil), pack.ProjectBrief.Frameworks...)
+		b.RecentActivity = append([]CommitSummary(nil), pack.ProjectBrief.RecentActivity...)
+		if pack.ProjectBrief.Structure != nil {
+			s := *pack.ProjectBrief.Structure
+			s.EntryPoints = append([]string(nil), pack.ProjectBrief.Structure.EntryPoints...)
+			s.CorePackages = append([]string(nil), pack.ProjectBrief.Structure.CorePackages...)
+			b.Structure = &s
+		}
+		capped.ProjectBrief = &b
+	}
+	if pack.UserContext != nil {
+		u := *pack.UserContext
+		u.FocusAreas = append([]string(nil), pack.UserContext.FocusAreas...)
+		u.Constraints = append([]string(nil), pack.UserContext.Constraints...)
+		u.Stakeholders = append([]string(nil), pack.UserContext.Stakeholders...)
+		u.Decisions = append([]string(nil), pack.UserContext.Decisions...)
+		u.History = append([]string(nil), pack.UserContext.History...)
+		u.SuccessCriteria = append([]string(nil), pack.UserContext.SuccessCriteria...)
+		capped.UserContext = &u
+	}
+
+	recompute := func() bool {
+		capped.TokenEstimate = estimate(&capped)
+		return capped.TokenEstimate <= maxTokens
+	}
+
+	for len(capped.Questions) > 0 && !recompute() {
+		capped.Questions = capped.Questions[:len(capped.Questions)-1]
+	}
+	if capped.ProjectBrief != nil {
+		for len(capped.ProjectBrief.RecentActivity) > 0 && !recompute() {
+			capped.ProjectBrief.RecentActivity = capped.ProjectBrief.RecentActivity[:len(capped.ProjectBrief.RecentActivity)-1]
+		}
+		for len(capped.ProjectBrief.Description) > 0 && !recompute() {
+			nextLen := len(capped.ProjectBrief.Description) / 2
+			if nextLen < 24 {
+				capped.ProjectBrief.Description = ""
+			} else {
+				capped.ProjectBrief.Description = util.SafeSlice(capped.ProjectBrief.Description, nextLen)
+			}
+		}
+		if capped.ProjectBrief.Structure != nil {
+			for len(capped.ProjectBrief.Structure.CorePackages) > 0 && !recompute() {
+				capped.ProjectBrief.Structure.CorePackages = capped.ProjectBrief.Structure.CorePackages[:len(capped.ProjectBrief.Structure.CorePackages)-1]
+			}
+			for len(capped.ProjectBrief.Structure.EntryPoints) > 0 && !recompute() {
+				capped.ProjectBrief.Structure.EntryPoints = capped.ProjectBrief.Structure.EntryPoints[:len(capped.ProjectBrief.Structure.EntryPoints)-1]
+			}
+			if !recompute() {
+				capped.ProjectBrief.Structure = nil
+			}
+		}
+	}
+	if capped.UserContext != nil {
+		trimSlice := func(items *[]string) {
+			for len(*items) > 0 && !recompute() {
+				*items = (*items)[:len(*items)-1]
+			}
+		}
+		trimSlice(&capped.UserContext.History)
+		trimSlice(&capped.UserContext.Decisions)
+		trimSlice(&capped.UserContext.Stakeholders)
+		trimSlice(&capped.UserContext.Constraints)
+		trimSlice(&capped.UserContext.FocusAreas)
+		trimSlice(&capped.UserContext.SuccessCriteria)
+		for len(capped.UserContext.ProblemStatement) > 16 && !recompute() {
+			nextLen := len(capped.UserContext.ProblemStatement) / 2
+			if nextLen < 16 {
+				nextLen = 16
+			}
+			capped.UserContext.ProblemStatement = util.SafeSlice(capped.UserContext.ProblemStatement, nextLen)
+			if nextLen == 16 {
+				break
+			}
+		}
+	}
+	if !recompute() && capped.ProjectBrief != nil {
+		capped.ProjectBrief = nil
+		_ = recompute()
+	}
+	if capped.TokenEstimate > maxTokens {
+		capped.TokenEstimate = maxTokens
+	}
+	capped.Hash = hashContextPack(&capped)
+	return &capped
 }

@@ -112,17 +112,17 @@ func endpointHandlerName(handler http.Handler) string {
 // envelope's request_id/success/timestamp fields).
 //
 // The table is deliberately explicit rather than name-derived, because names
-// lie: handleRobotAttentionV1 actually serves robot.DigestOutput, and the
-// legacy handleRobotHealth serves a stub note map, not robot.HealthOutput.
-// Unlisted handlers get the honest generic envelope schema — honest generic
-// beats invented specific. Add entries only after reading the handler body.
+// alone can mislead (for example /api/v1/version returns an ad hoc map rather
+// than robot.VersionOutput). Unlisted handlers get the honest generic envelope
+// schema — honest generic beats invented specific. Add entries only after
+// reading the handler body.
 var verifiedRobotHandlers = map[string]string{
 	// Robot read surface (thin adapters in server.go).
 	"handleRobotStatusV1":    "status",
 	"handleRobotHealthV1":    "health",
 	"handleRobotSnapshotV1":  "snapshot",
 	"handleRobotDigestV1":    "digest",
-	"handleRobotAttentionV1": "digest", // serves GetDigest with an attention profile, NOT AttentionOutput
+	"handleRobotAttentionV1": "attention",
 	"handleRobotDashboardV1": "dashboard",
 	"handleRobotTerseV1":     "terse",
 	"handleRobotTriageV1":    "triage",
@@ -130,15 +130,19 @@ var verifiedRobotHandlers = map[string]string{
 	"handleRobotGraphV1":     "graph",
 	"handleRobotActivityV1":  "activity",
 	"handleRobotAlertsV1":    "alerts",
-	// Legacy /api/robot/status serves robot.StatusOutput directly.
-	// (Legacy /api/robot/health serves a stub map and is intentionally absent.)
+	// Legacy /api/robot/* endpoints delegate directly to robot.GetStatus / robot.GetHealth.
 	"handleRobotStatus": "status",
-	// System and agent-lifecycle handlers verified to serialize robot outputs.
-	"handleCapabilitiesV1":   "capabilities",
-	"handleAgentSpawnV1":     "spawn",
-	"handleAgentSendV1":      "send",
-	"handleAgentInterruptV1": "interrupt",
-	"handleAgentWaitV1":      "wait",
+	"handleRobotHealth": "health",
+	// System, policy, and agent-lifecycle handlers verified to serialize robot outputs.
+	"handleCapabilitiesV1":     "capabilities",
+	"handlePolicyDecisionsV1":  "policy_decisions",
+	"handleAgentSpawnV1":       "spawn",
+	"handleAgentSendV1":        "send",
+	"handleAgentInterruptV1":   "interrupt",
+	"handleAgentWaitV1":        "wait",
+	"handleGetRequestStatusV1": "action_status",
+	"handleWaitRequestV1":      "wait_request",
+	"handleCancelRequestV1":    "cancel_request",
 }
 
 // robotSchemaForHandler joins a handler name to a robot schema registry key
@@ -210,6 +214,9 @@ func GenerateOpenAPISpecFromRouter(version, serverURL string) (*OpenAPISpec, err
 }
 
 func buildRouterOpenAPISpec(router chi.Router, version, serverURL string) (*OpenAPISpec, error) {
+	if strings.TrimSpace(serverURL) == "" {
+		serverURL = DefaultOpenAPIServerURL
+	}
 	routes, err := WalkServedRoutes(router)
 	if err != nil {
 		return nil, err
@@ -270,9 +277,10 @@ func buildRouterOpenAPISpec(router chi.Router, version, serverURL string) (*Open
 		},
 	}
 
+	reflector := newOpenAPIReflector(spec.Components)
 	tagSet := make(map[string]bool)
 	for _, rt := range routes {
-		op := buildRouterOperation(rt, spec.Components)
+		op := buildRouterOperation(rt, spec.Components, reflector)
 		if op.Tags != nil {
 			for _, t := range op.Tags {
 				tagSet[t] = true
@@ -314,7 +322,7 @@ func buildRouterOpenAPISpec(router chi.Router, version, serverURL string) (*Open
 }
 
 // buildRouterOperation builds the OpenAPI operation for one walked route.
-func buildRouterOperation(rt RouterRoute, components *OpenAPIComponents) *Operation {
+func buildRouterOperation(rt RouterRoute, components *OpenAPIComponents, reflector *openapiReflector) *Operation {
 	responseRef := "#/components/schemas/SuccessEnvelope"
 	joined := false
 	if rt.RobotSchema != "" {
@@ -380,6 +388,26 @@ func buildRouterOperation(rt RouterRoute, components *OpenAPIComponents) *Operat
 	case "handleCancelJob":
 		op.Responses["409"] = errorResponse("Job is not cancellable in its current state")
 		op.Responses["503"] = errorResponse("Cancellation signalled but its receipt could not be checkpointed")
+	case "handleMetricsExportV1":
+		op.Parameters = append(op.Parameters,
+			Parameter{
+				Name:        "format",
+				In:          "query",
+				Description: "Export format: json (default), csv, md (alias: markdown), or prometheus (alias: prom).",
+				Schema:      &Schema{Type: "string"},
+			},
+			Parameter{
+				Name:        "session",
+				In:          "query",
+				Description: "Optional session identifier to scope exported metrics (defaults to 'default').",
+				Schema:      &Schema{Type: "string"},
+			},
+		)
+		okResp := op.Responses["200"]
+		okResp.Content["text/csv"] = MediaType{Schema: &Schema{Type: "string"}}
+		okResp.Content["text/markdown"] = MediaType{Schema: &Schema{Type: "string"}}
+		okResp.Content["text/plain"] = MediaType{Schema: &Schema{Type: "string"}}
+		op.Responses["200"] = okResp
 	case "handleResumePipeline":
 		op.Description += " By default this request waits for the resumed workflow and remains tied to the HTTP connection. Set background=true to continue the saved run in a detached worker that survives client disconnection and server exit. A 202 response acknowledges worker startup, not workflow completion; poll the existing run ID for status and use its cancel endpoint to stop it. Detached resume uses saved variables and rejects nonempty variable overrides. An omitted session is resolved from the checkpoint by the worker after it acquires run ownership."
 		synchronous := op.Responses["200"]
@@ -445,6 +473,7 @@ func buildRouterOperation(rt RouterRoute, components *OpenAPIComponents) *Operat
 			AdditionalProperties: false,
 		}}
 	}
+	applyReflectedRouteSchemas(rt, op, reflector, joined)
 	return op
 }
 

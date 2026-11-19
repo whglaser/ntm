@@ -659,3 +659,58 @@ func TestCreatedAtPreserved(t *testing.T) {
 		t.Error("UpdatedAt should be set")
 	}
 }
+
+func TestTruncate(t *testing.T) {
+	tests := []struct {
+		name   string
+		input  string
+		maxLen int
+		want   string
+	}{
+		{"short string", "hello", 10, "hello"},
+		{"exact length", "hello", 5, "hello"},
+		{"needs truncation", "hello world", 8, "hello..."},
+		{"maxLen 3", "hello", 3, "hel"},
+		{"maxLen 2", "hello", 2, "he"},
+		{"maxLen 1", "hello", 1, "h"},
+		{"maxLen 0", "hello", 0, ""},
+		{"maxLen negative", "hello", -1, ""},
+		{"empty string", "", 5, ""},
+		{"unicode truncation", "éclair", 4, "é..."},
+		{"unicode short max", "éclair", 2, "éc"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := truncate(tt.input, tt.maxLen)
+			if got != tt.want {
+				t.Errorf("truncate(%q, %d) = %q, want %q", tt.input, tt.maxLen, got, tt.want)
+			}
+			if !utf8.ValidString(got) {
+				t.Errorf("truncate(%q, %d) returned invalid UTF-8: %q", tt.input, tt.maxLen, got)
+			}
+		})
+	}
+}
+
+func (h *Handoff) ValidateMinimal() error {
+	if h.Goal == "" {
+		return ValidationError{
+			Field:   "goal",
+			Message: "required field missing",
+		}
+	}
+	if h.Now == "" {
+		return ValidationError{
+			Field:   "now",
+			Message: "required field missing",
+		}
+	}
+	return nil
+}
+
+func (h *Handoff) MustValidate() {
+	if errs := h.Validate(); len(errs) > 0 {
+		panic("handoff validation failed: " + errs.Error())
+	}
+}

@@ -305,70 +305,6 @@ func (s *Store) CreateAgent(agent *Agent) error {
 	return nil
 }
 
-// GetAgent retrieves an agent by ID.
-func (s *Store) GetAgent(id string) (*Agent, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	agent := &Agent{}
-	err := s.db.QueryRow(`
-		SELECT id, session_id, name, type, COALESCE(model, ''), COALESCE(tmux_pane_id, ''), last_seen, status, COALESCE(current_task_id, ''), COALESCE(performance_data, '')
-		FROM agents WHERE id = ?`, id,
-	).Scan(&agent.ID, &agent.SessionID, &agent.Name, &agent.Type, &agent.Model, &agent.TmuxPaneID, &agent.LastSeen, &agent.Status, &agent.CurrentTaskID, &agent.PerformanceData)
-
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("get agent: %w", err)
-	}
-	return agent, nil
-}
-
-// GetAgentByName retrieves an agent by session ID and name.
-func (s *Store) GetAgentByName(sessionID, name string) (*Agent, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	agent := &Agent{}
-	err := s.db.QueryRow(`
-		SELECT id, session_id, name, type, COALESCE(model, ''), COALESCE(tmux_pane_id, ''), last_seen, status, COALESCE(current_task_id, ''), COALESCE(performance_data, '')
-		FROM agents WHERE session_id = ? AND name = ?`, sessionID, name,
-	).Scan(&agent.ID, &agent.SessionID, &agent.Name, &agent.Type, &agent.Model, &agent.TmuxPaneID, &agent.LastSeen, &agent.Status, &agent.CurrentTaskID, &agent.PerformanceData)
-
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("get agent by name: %w", err)
-	}
-	return agent, nil
-}
-
-// UpdateAgent updates an existing agent.
-func (s *Store) UpdateAgent(agent *Agent) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	result, err := s.db.Exec(`
-		UPDATE agents SET name = ?, type = ?, model = ?, tmux_pane_id = ?, last_seen = ?, status = ?, current_task_id = ?, performance_data = ?
-		WHERE id = ?`,
-		agent.Name, agent.Type, agent.Model, agent.TmuxPaneID, agent.LastSeen, agent.Status, agent.CurrentTaskID, agent.PerformanceData, agent.ID,
-	)
-	if err != nil {
-		return fmt.Errorf("update agent: %w", err)
-	}
-
-	rows, rowsErr := result.RowsAffected()
-	if rowsErr != nil {
-		return fmt.Errorf("rows affected: %w", rowsErr)
-	}
-	if rows == 0 {
-		return fmt.Errorf("agent not found: %s", agent.ID)
-	}
-	return nil
-}
-
 // ListAgents returns agents for a session.
 func (s *Store) ListAgents(sessionID string) ([]Agent, error) {
 	s.mu.RLock()
@@ -394,258 +330,6 @@ func (s *Store) ListAgents(sessionID string) ([]Agent, error) {
 }
 
 // ========================
-// Task Operations
-// ========================
-
-// CreateTask creates a new task.
-func (s *Store) CreateTask(task *Task) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	_, err := s.db.Exec(`
-		INSERT INTO tasks (id, session_id, agent_id, bead_id, correlation_id, context_pack_id, status, created_at, assigned_at, completed_at, result)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		task.ID, task.SessionID, task.AgentID, task.BeadID, task.CorrelationID, task.ContextPackID, task.Status, task.CreatedAt, task.AssignedAt, task.CompletedAt, task.Result,
-	)
-	if err != nil {
-		return fmt.Errorf("create task: %w", err)
-	}
-	return nil
-}
-
-// GetTask retrieves a task by ID.
-func (s *Store) GetTask(id string) (*Task, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	task := &Task{}
-	err := s.db.QueryRow(`
-		SELECT id, session_id, COALESCE(agent_id, ''), COALESCE(bead_id, ''), COALESCE(correlation_id, ''), COALESCE(context_pack_id, ''), status, created_at, assigned_at, completed_at, result
-		FROM tasks WHERE id = ?`, id,
-	).Scan(&task.ID, &task.SessionID, &task.AgentID, &task.BeadID, &task.CorrelationID, &task.ContextPackID, &task.Status, &task.CreatedAt, &task.AssignedAt, &task.CompletedAt, &task.Result)
-
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("get task: %w", err)
-	}
-	return task, nil
-}
-
-// GetTaskByCorrelation retrieves a task by correlation ID.
-func (s *Store) GetTaskByCorrelation(correlationID string) (*Task, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	task := &Task{}
-	err := s.db.QueryRow(`
-		SELECT id, session_id, COALESCE(agent_id, ''), COALESCE(bead_id, ''), COALESCE(correlation_id, ''), COALESCE(context_pack_id, ''), status, created_at, assigned_at, completed_at, result
-		FROM tasks WHERE correlation_id = ?`, correlationID,
-	).Scan(&task.ID, &task.SessionID, &task.AgentID, &task.BeadID, &task.CorrelationID, &task.ContextPackID, &task.Status, &task.CreatedAt, &task.AssignedAt, &task.CompletedAt, &task.Result)
-
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("get task by correlation: %w", err)
-	}
-	return task, nil
-}
-
-// UpdateTask updates an existing task.
-func (s *Store) UpdateTask(task *Task) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	result, err := s.db.Exec(`
-		UPDATE tasks SET agent_id = ?, status = ?, assigned_at = ?, completed_at = ?, result = ?
-		WHERE id = ?`,
-		task.AgentID, task.Status, task.AssignedAt, task.CompletedAt, task.Result, task.ID,
-	)
-	if err != nil {
-		return fmt.Errorf("update task: %w", err)
-	}
-
-	rows, rowsErr := result.RowsAffected()
-	if rowsErr != nil {
-		return fmt.Errorf("rows affected: %w", rowsErr)
-	}
-	if rows == 0 {
-		return fmt.Errorf("task not found: %s", task.ID)
-	}
-	return nil
-}
-
-// ListTasks returns tasks for a session, optionally filtered by status.
-func (s *Store) ListTasks(sessionID string, status string) ([]Task, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	var rows *sql.Rows
-	var err error
-
-	if status == "" {
-		rows, err = s.db.Query(`
-			SELECT id, session_id, COALESCE(agent_id, ''), COALESCE(bead_id, ''), COALESCE(correlation_id, ''), COALESCE(context_pack_id, ''), status, created_at, assigned_at, completed_at, result
-			FROM tasks WHERE session_id = ? ORDER BY created_at DESC`, sessionID)
-	} else {
-		rows, err = s.db.Query(`
-			SELECT id, session_id, COALESCE(agent_id, ''), COALESCE(bead_id, ''), COALESCE(correlation_id, ''), COALESCE(context_pack_id, ''), status, created_at, assigned_at, completed_at, result
-			FROM tasks WHERE session_id = ? AND status = ? ORDER BY created_at DESC`, sessionID, status)
-	}
-
-	if err != nil {
-		return nil, fmt.Errorf("list tasks: %w", err)
-	}
-	defer rows.Close()
-
-	var tasks []Task
-	for rows.Next() {
-		var task Task
-		if err := rows.Scan(&task.ID, &task.SessionID, &task.AgentID, &task.BeadID, &task.CorrelationID, &task.ContextPackID, &task.Status, &task.CreatedAt, &task.AssignedAt, &task.CompletedAt, &task.Result); err != nil {
-			return nil, fmt.Errorf("scan task: %w", err)
-		}
-		tasks = append(tasks, task)
-	}
-	return tasks, rows.Err()
-}
-
-// ========================
-// Reservation Operations
-// ========================
-
-// CreateReservation creates a new file reservation.
-func (s *Store) CreateReservation(res *Reservation) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	result, err := s.db.Exec(`
-		INSERT INTO reservations (session_id, agent_id, path_pattern, exclusive, correlation_id, reason, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		res.SessionID, res.AgentID, res.PathPattern, res.Exclusive, res.CorrelationID, res.Reason, res.ExpiresAt,
-	)
-	if err != nil {
-		return fmt.Errorf("create reservation: %w", err)
-	}
-
-	id, err := result.LastInsertId()
-	if err != nil {
-		return fmt.Errorf("get reservation id: %w", err)
-	}
-	res.ID = id
-	return nil
-}
-
-// GetReservation retrieves a reservation by ID.
-func (s *Store) GetReservation(id int64) (*Reservation, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	res := &Reservation{}
-	err := s.db.QueryRow(`
-		SELECT id, session_id, agent_id, path_pattern, exclusive, COALESCE(correlation_id, ''), COALESCE(reason, ''), expires_at, released_at, COALESCE(force_released_by, '')
-		FROM reservations WHERE id = ?`, id,
-	).Scan(&res.ID, &res.SessionID, &res.AgentID, &res.PathPattern, &res.Exclusive, &res.CorrelationID, &res.Reason, &res.ExpiresAt, &res.ReleasedAt, &res.ForceReleasedBy)
-
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("get reservation: %w", err)
-	}
-	return res, nil
-}
-
-// UpdateReservation updates an existing reservation.
-func (s *Store) UpdateReservation(res *Reservation) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	result, err := s.db.Exec(`
-		UPDATE reservations SET expires_at = ?, released_at = ?, force_released_by = ?
-		WHERE id = ?`,
-		res.ExpiresAt, res.ReleasedAt, res.ForceReleasedBy, res.ID,
-	)
-	if err != nil {
-		return fmt.Errorf("update reservation: %w", err)
-	}
-
-	rows, rowsErr := result.RowsAffected()
-	if rowsErr != nil {
-		return fmt.Errorf("rows affected: %w", rowsErr)
-	}
-	if rows == 0 {
-		return fmt.Errorf("reservation not found: %d", res.ID)
-	}
-	return nil
-}
-
-// ListReservations returns reservations for a session, optionally only active ones.
-func (s *Store) ListReservations(sessionID string, activeOnly bool) ([]Reservation, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	var rows *sql.Rows
-	var err error
-
-	if activeOnly {
-		rows, err = s.db.Query(`
-			SELECT id, session_id, agent_id, path_pattern, exclusive, COALESCE(correlation_id, ''), COALESCE(reason, ''), expires_at, released_at, COALESCE(force_released_by, '')
-			FROM reservations WHERE session_id = ? AND released_at IS NULL AND expires_at > ?
-			ORDER BY expires_at`, sessionID, time.Now())
-	} else {
-		rows, err = s.db.Query(`
-			SELECT id, session_id, agent_id, path_pattern, exclusive, COALESCE(correlation_id, ''), COALESCE(reason, ''), expires_at, released_at, COALESCE(force_released_by, '')
-			FROM reservations WHERE session_id = ? ORDER BY expires_at DESC`, sessionID)
-	}
-
-	if err != nil {
-		return nil, fmt.Errorf("list reservations: %w", err)
-	}
-	defer rows.Close()
-
-	var reservations []Reservation
-	for rows.Next() {
-		var res Reservation
-		if err := rows.Scan(&res.ID, &res.SessionID, &res.AgentID, &res.PathPattern, &res.Exclusive, &res.CorrelationID, &res.Reason, &res.ExpiresAt, &res.ReleasedAt, &res.ForceReleasedBy); err != nil {
-			return nil, fmt.Errorf("scan reservation: %w", err)
-		}
-		reservations = append(reservations, res)
-	}
-	return reservations, rows.Err()
-}
-
-// FindConflicts finds active exclusive reservations that conflict with a path pattern.
-func (s *Store) FindConflicts(sessionID, pattern string) ([]Reservation, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	// SQLite GLOB for pattern matching
-	rows, err := s.db.Query(`
-		SELECT id, session_id, agent_id, path_pattern, exclusive, COALESCE(correlation_id, ''), COALESCE(reason, ''), expires_at, released_at, COALESCE(force_released_by, '')
-		FROM reservations
-		WHERE session_id = ? AND exclusive = 1 AND released_at IS NULL AND expires_at > ?
-		AND (path_pattern = ? OR ? GLOB path_pattern OR path_pattern GLOB ?)
-		ORDER BY expires_at`, sessionID, time.Now(), pattern, pattern, pattern)
-
-	if err != nil {
-		return nil, fmt.Errorf("find conflicts: %w", err)
-	}
-	defer rows.Close()
-
-	var conflicts []Reservation
-	for rows.Next() {
-		var res Reservation
-		if err := rows.Scan(&res.ID, &res.SessionID, &res.AgentID, &res.PathPattern, &res.Exclusive, &res.CorrelationID, &res.Reason, &res.ExpiresAt, &res.ReleasedAt, &res.ForceReleasedBy); err != nil {
-			return nil, fmt.Errorf("scan conflict: %w", err)
-		}
-		conflicts = append(conflicts, res)
-	}
-	return conflicts, rows.Err()
-}
-
-// ========================
 // Approval Operations
 // ========================
 
@@ -655,9 +339,9 @@ func (s *Store) CreateApproval(appr *Approval) error {
 	defer s.mu.Unlock()
 
 	_, err := s.db.Exec(`
-		INSERT INTO approvals (id, action, resource, reason, requested_by, correlation_id, requires_slb, created_at, expires_at, status)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		appr.ID, appr.Action, appr.Resource, appr.Reason, appr.RequestedBy, appr.CorrelationID, appr.RequiresSLB, appr.CreatedAt, appr.ExpiresAt, appr.Status,
+		INSERT INTO approvals (id, action, resource, reason, requested_by, requested_provenance, correlation_id, requires_slb, created_at, expires_at, status)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		appr.ID, appr.Action, appr.Resource, appr.Reason, appr.RequestedBy, appr.RequestedProvenance, appr.CorrelationID, appr.RequiresSLB, appr.CreatedAt, appr.ExpiresAt, appr.Status,
 	)
 	if err != nil {
 		return fmt.Errorf("create approval: %w", err)
@@ -672,9 +356,9 @@ func (s *Store) GetApproval(id string) (*Approval, error) {
 
 	appr := &Approval{}
 	err := s.db.QueryRow(`
-		SELECT id, action, resource, COALESCE(reason, ''), requested_by, COALESCE(correlation_id, ''), requires_slb, created_at, expires_at, status, COALESCE(approved_by, ''), approved_at, COALESCE(denied_reason, '')
+		SELECT id, action, resource, COALESCE(reason, ''), requested_by, COALESCE(requested_provenance, ''), COALESCE(correlation_id, ''), requires_slb, created_at, expires_at, status, COALESCE(approved_by, ''), COALESCE(approved_provenance, ''), approved_at, COALESCE(denied_reason, '')
 		FROM approvals WHERE id = ?`, id,
-	).Scan(&appr.ID, &appr.Action, &appr.Resource, &appr.Reason, &appr.RequestedBy, &appr.CorrelationID, &appr.RequiresSLB, &appr.CreatedAt, &appr.ExpiresAt, &appr.Status, &appr.ApprovedBy, &appr.ApprovedAt, &appr.DeniedReason)
+	).Scan(&appr.ID, &appr.Action, &appr.Resource, &appr.Reason, &appr.RequestedBy, &appr.RequestedProvenance, &appr.CorrelationID, &appr.RequiresSLB, &appr.CreatedAt, &appr.ExpiresAt, &appr.Status, &appr.ApprovedBy, &appr.ApprovedProvenance, &appr.ApprovedAt, &appr.DeniedReason)
 
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -723,9 +407,9 @@ func (s *Store) UpdateApprovalFrom(appr *Approval, from ApprovalStatus) (bool, e
 	defer s.mu.Unlock()
 
 	result, err := s.db.Exec(`
-		UPDATE approvals SET status = ?, approved_by = ?, approved_at = ?, denied_reason = ?
+		UPDATE approvals SET status = ?, approved_by = ?, approved_provenance = ?, approved_at = ?, denied_reason = ?
 		WHERE id = ? AND status = ?`,
-		appr.Status, appr.ApprovedBy, appr.ApprovedAt, appr.DeniedReason, appr.ID, from,
+		appr.Status, appr.ApprovedBy, appr.ApprovedProvenance, appr.ApprovedAt, appr.DeniedReason, appr.ID, from,
 	)
 	if err != nil {
 		return false, fmt.Errorf("update approval: %w", err)
@@ -743,9 +427,9 @@ func (s *Store) UpdateApproval(appr *Approval) error {
 	defer s.mu.Unlock()
 
 	result, err := s.db.Exec(`
-		UPDATE approvals SET status = ?, approved_by = ?, approved_at = ?, denied_reason = ?
+		UPDATE approvals SET status = ?, approved_by = ?, approved_provenance = ?, approved_at = ?, denied_reason = ?
 		WHERE id = ?`,
-		appr.Status, appr.ApprovedBy, appr.ApprovedAt, appr.DeniedReason, appr.ID,
+		appr.Status, appr.ApprovedBy, appr.ApprovedProvenance, appr.ApprovedAt, appr.DeniedReason, appr.ID,
 	)
 	if err != nil {
 		return fmt.Errorf("update approval: %w", err)
@@ -767,7 +451,7 @@ func (s *Store) ListPendingApprovals() ([]Approval, error) {
 	defer s.mu.RUnlock()
 
 	rows, err := s.db.Query(`
-		SELECT id, action, resource, COALESCE(reason, ''), requested_by, COALESCE(correlation_id, ''), requires_slb, created_at, expires_at, status, COALESCE(approved_by, ''), approved_at, COALESCE(denied_reason, '')
+		SELECT id, action, resource, COALESCE(reason, ''), requested_by, COALESCE(requested_provenance, ''), COALESCE(correlation_id, ''), requires_slb, created_at, expires_at, status, COALESCE(approved_by, ''), COALESCE(approved_provenance, ''), approved_at, COALESCE(denied_reason, '')
 		FROM approvals WHERE status = 'pending' AND expires_at > ?
 		ORDER BY created_at`, time.Now().UTC())
 
@@ -779,7 +463,7 @@ func (s *Store) ListPendingApprovals() ([]Approval, error) {
 	var approvals []Approval
 	for rows.Next() {
 		var appr Approval
-		if err := rows.Scan(&appr.ID, &appr.Action, &appr.Resource, &appr.Reason, &appr.RequestedBy, &appr.CorrelationID, &appr.RequiresSLB, &appr.CreatedAt, &appr.ExpiresAt, &appr.Status, &appr.ApprovedBy, &appr.ApprovedAt, &appr.DeniedReason); err != nil {
+		if err := rows.Scan(&appr.ID, &appr.Action, &appr.Resource, &appr.Reason, &appr.RequestedBy, &appr.RequestedProvenance, &appr.CorrelationID, &appr.RequiresSLB, &appr.CreatedAt, &appr.ExpiresAt, &appr.Status, &appr.ApprovedBy, &appr.ApprovedProvenance, &appr.ApprovedAt, &appr.DeniedReason); err != nil {
 			return nil, fmt.Errorf("scan approval: %w", err)
 		}
 		approvals = append(approvals, appr)
@@ -797,7 +481,7 @@ func (s *Store) ListApprovalHistory() ([]Approval, error) {
 	defer s.mu.RUnlock()
 
 	rows, err := s.db.Query(`
-		SELECT id, action, resource, COALESCE(reason, ''), requested_by, COALESCE(correlation_id, ''), requires_slb, created_at, expires_at, status, COALESCE(approved_by, ''), approved_at, COALESCE(denied_reason, '')
+		SELECT id, action, resource, COALESCE(reason, ''), requested_by, COALESCE(requested_provenance, ''), COALESCE(correlation_id, ''), requires_slb, created_at, expires_at, status, COALESCE(approved_by, ''), COALESCE(approved_provenance, ''), approved_at, COALESCE(denied_reason, '')
 		FROM approvals
 		ORDER BY created_at DESC, id DESC`)
 	if err != nil {
@@ -808,7 +492,7 @@ func (s *Store) ListApprovalHistory() ([]Approval, error) {
 	var approvals []Approval
 	for rows.Next() {
 		var appr Approval
-		if err := rows.Scan(&appr.ID, &appr.Action, &appr.Resource, &appr.Reason, &appr.RequestedBy, &appr.CorrelationID, &appr.RequiresSLB, &appr.CreatedAt, &appr.ExpiresAt, &appr.Status, &appr.ApprovedBy, &appr.ApprovedAt, &appr.DeniedReason); err != nil {
+		if err := rows.Scan(&appr.ID, &appr.Action, &appr.Resource, &appr.Reason, &appr.RequestedBy, &appr.RequestedProvenance, &appr.CorrelationID, &appr.RequiresSLB, &appr.CreatedAt, &appr.ExpiresAt, &appr.Status, &appr.ApprovedBy, &appr.ApprovedProvenance, &appr.ApprovedAt, &appr.DeniedReason); err != nil {
 			return nil, fmt.Errorf("scan approval: %w", err)
 		}
 		approvals = append(approvals, appr)
@@ -822,7 +506,7 @@ func (s *Store) ListExpiredPendingApprovals() ([]Approval, error) {
 	defer s.mu.RUnlock()
 
 	rows, err := s.db.Query(`
-		SELECT id, action, resource, COALESCE(reason, ''), requested_by, COALESCE(correlation_id, ''), requires_slb, created_at, expires_at, status, COALESCE(approved_by, ''), approved_at, COALESCE(denied_reason, '')
+		SELECT id, action, resource, COALESCE(reason, ''), requested_by, COALESCE(requested_provenance, ''), COALESCE(correlation_id, ''), requires_slb, created_at, expires_at, status, COALESCE(approved_by, ''), COALESCE(approved_provenance, ''), approved_at, COALESCE(denied_reason, '')
 		FROM approvals WHERE status = 'pending' AND expires_at <= ?
 		ORDER BY created_at`, time.Now().UTC())
 
@@ -834,81 +518,12 @@ func (s *Store) ListExpiredPendingApprovals() ([]Approval, error) {
 	var approvals []Approval
 	for rows.Next() {
 		var appr Approval
-		if err := rows.Scan(&appr.ID, &appr.Action, &appr.Resource, &appr.Reason, &appr.RequestedBy, &appr.CorrelationID, &appr.RequiresSLB, &appr.CreatedAt, &appr.ExpiresAt, &appr.Status, &appr.ApprovedBy, &appr.ApprovedAt, &appr.DeniedReason); err != nil {
+		if err := rows.Scan(&appr.ID, &appr.Action, &appr.Resource, &appr.Reason, &appr.RequestedBy, &appr.RequestedProvenance, &appr.CorrelationID, &appr.RequiresSLB, &appr.CreatedAt, &appr.ExpiresAt, &appr.Status, &appr.ApprovedBy, &appr.ApprovedProvenance, &appr.ApprovedAt, &appr.DeniedReason); err != nil {
 			return nil, fmt.Errorf("scan approval: %w", err)
 		}
 		approvals = append(approvals, appr)
 	}
 	return approvals, rows.Err()
-}
-
-// ========================
-// Tool Health Operations
-// ========================
-
-// UpsertToolHealth creates or updates tool health record.
-func (s *Store) UpsertToolHealth(th *ToolHealth) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	_, err := s.db.Exec(`
-		INSERT INTO tool_health (tool, version, capabilities, last_ok, last_error)
-		VALUES (?, ?, ?, ?, ?)
-		ON CONFLICT(tool) DO UPDATE SET
-			version = excluded.version,
-			capabilities = excluded.capabilities,
-			last_ok = excluded.last_ok,
-			last_error = excluded.last_error`,
-		th.Tool, th.Version, th.Capabilities, th.LastOK, th.LastError,
-	)
-	if err != nil {
-		return fmt.Errorf("upsert tool health: %w", err)
-	}
-	return nil
-}
-
-// GetToolHealth retrieves tool health by name.
-func (s *Store) GetToolHealth(tool string) (*ToolHealth, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	th := &ToolHealth{}
-	err := s.db.QueryRow(`
-		SELECT tool, COALESCE(version, ''), COALESCE(capabilities, ''), last_ok, COALESCE(last_error, '')
-		FROM tool_health WHERE tool = ?`, tool,
-	).Scan(&th.Tool, &th.Version, &th.Capabilities, &th.LastOK, &th.LastError)
-
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("get tool health: %w", err)
-	}
-	return th, nil
-}
-
-// ListToolHealth returns all tool health records.
-func (s *Store) ListToolHealth() ([]ToolHealth, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	rows, err := s.db.Query(`
-		SELECT tool, COALESCE(version, ''), COALESCE(capabilities, ''), last_ok, COALESCE(last_error, '')
-		FROM tool_health ORDER BY tool`)
-	if err != nil {
-		return nil, fmt.Errorf("list tool health: %w", err)
-	}
-	defer rows.Close()
-
-	var health []ToolHealth
-	for rows.Next() {
-		var th ToolHealth
-		if err := rows.Scan(&th.Tool, &th.Version, &th.Capabilities, &th.LastOK, &th.LastError); err != nil {
-			return nil, fmt.Errorf("scan tool health: %w", err)
-		}
-		health = append(health, th)
-	}
-	return health, rows.Err()
 }
 
 // ========================

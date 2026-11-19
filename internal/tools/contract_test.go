@@ -847,6 +847,13 @@ func TestBDAdapterFallsBackToBdWhenBrVersionFails(t *testing.T) {
 		t.Fatalf("Version() = %+v, want 1.2.3", version)
 	}
 
+	health, err := adapter.Health(ctx)
+	if err != nil {
+		t.Fatalf("Health() error: %v", err)
+	}
+	if !health.Healthy {
+		t.Fatalf("Health() should succeed using bd fallback, got %+v", health)
+	}
 }
 
 // TestCASSAdapterWithFakeTools tests the CASS adapter

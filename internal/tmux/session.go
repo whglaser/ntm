@@ -813,6 +813,54 @@ func (p Pane) IdleShell() bool {
 	return !shellHasLiveDescendant(p.PID, 4)
 }
 
+// ValidatePanePersistentShellContext verifies that the pane's root process is
+// an interactive shell which can outlive its foreground agent. A foreground
+// command or a positive pane PID alone cannot prove this: direct-exec agents,
+// shell scripts and "sh -c" command lists all lose the pane when they exit.
+// Process evidence is local to this client; remote PIDs must never be looked
+// up in the local process table.
+func (c *Client) ValidatePanePersistentShellContext(ctx context.Context, pane Pane) error {
+	if c.Remote != "" {
+		return errors.New("persistent shell verification requires local tmux")
+	}
+	if ctx == nil {
+		return errors.New("persistent shell verification requires a context")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if pane.PID <= 0 || pane.Dead || pane.IsServicePane() {
+		return fmt.Errorf("pane %s has no live agent shell with a known PID", pane.ID)
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, DefaultCommandTimeout)
+	defer cancel()
+	snapshot, err := process.SnapshotContext(probeCtx)
+	if err != nil {
+		return fmt.Errorf("verify pane %s root process: %w", pane.ID, err)
+	}
+	root, exists := snapshot[pane.PID]
+	if !exists || strings.ContainsAny(root.State[:1], "ZXx") {
+		return fmt.Errorf("pane %s root process is no longer alive", pane.ID)
+	}
+	// argv[0] alone is not executable identity: exec -a can make a direct
+	// agent appear to be bash. Require the kernel process name as well.
+	if !PaneCommandIsShell(root.Command) {
+		return fmt.Errorf("pane %s has no persistent interactive shell; exiting its root process could destroy the pane", pane.ID)
+	}
+	argv := process.GetCmdlineContext(probeCtx, pane.PID)
+	if err := probeCtx.Err(); err != nil {
+		return fmt.Errorf("verify pane %s root process: %w", pane.ID, err)
+	}
+	if len(argv) == 0 {
+		return fmt.Errorf("cannot verify a persistent shell for pane %s: root process arguments are unavailable", pane.ID)
+	}
+	name := strings.TrimPrefix(filepath.Base(strings.TrimSpace(argv[0])), "-")
+	if !PaneCommandIsShell(name) || !shellArgvLooksInteractive(argv) {
+		return fmt.Errorf("pane %s has no persistent interactive shell; exiting its root process could destroy the pane", pane.ID)
+	}
+	return nil
+}
+
 // ForegroundJobRunning reports whether a job other than the pane's root shell
 // owns the pane's terminal: the shell launched something with job control and
 // that process group is now in the foreground. This is the precise "the agent
@@ -823,8 +871,11 @@ func (p Pane) ForegroundJobRunning() bool {
 	if p.PID <= 0 {
 		return false
 	}
-	tpgid, pgrp, ok := process.TerminalForeground(p.PID)
-	return ok && tpgid > 0 && tpgid != pgrp
+	tpgid, pgrp, sid, ok := process.SessionTerminalForeground(p.PID)
+	// Every tmux pane's root process is the session leader of its PTY (sid == p.PID).
+	// When sid != p.PID (e.g. a non-PTY test fixture shell inheriting the test
+	// runner's terminal), tpgid belongs to the outer session rather than p.PID.
+	return ok && sid == p.PID && tpgid > 0 && tpgid != pgrp
 }
 
 // paneProcessStarted reports whether an observation shows a launched process
@@ -887,12 +938,28 @@ func shellArgvLooksInteractive(argv []string) bool {
 	if len(argv) == 0 {
 		return true // unreadable (no /proc, process gone): the command decides
 	}
-	for _, arg := range argv[1:] {
+	for i, arg := range argv[1:] {
 		arg = strings.TrimSpace(arg)
 		if arg == "" {
 			continue
 		}
-		if arg == "-c" || !strings.HasPrefix(arg, "-") {
+		if arg == "--" {
+			return i == len(argv)-2 // A following operand is a script, not a prompt.
+		}
+		if !strings.HasPrefix(arg, "-") {
+			return false
+		}
+		if strings.HasPrefix(arg, "--") {
+			name, _, _ := strings.Cut(strings.ToLower(arg), "=")
+			if name == "--command" || name == "--file" {
+				return false
+			}
+			continue
+		}
+		// Command flags also occur in clusters such as -lc and -ic. An
+		// interactive flag does not make a -c shell persistent. The -s
+		// flag still permits interactive stdin and is not a command string.
+		if strings.ContainsRune(arg[1:], 'c') {
 			return false
 		}
 	}
@@ -907,8 +974,28 @@ func shellHasLiveDescendant(pid, maxDepth int) bool {
 	if pid <= 0 {
 		return false
 	}
-	_ = maxDepth
-	return len(process.GetChildPIDs(pid, 8)) > 0
+	if maxDepth <= 0 {
+		maxDepth = 1
+	}
+	seen := map[int]bool{pid: true}
+	frontier := []int{pid}
+	for depth := 0; depth < maxDepth && len(frontier) > 0; depth++ {
+		var next []int
+		for _, parent := range frontier {
+			for _, child := range process.GetChildPIDs(parent, 8) {
+				if child <= 0 || seen[child] {
+					continue
+				}
+				seen[child] = true
+				if process.IsAlive(child) {
+					return true
+				}
+				next = append(next, child)
+			}
+		}
+		frontier = next
+	}
+	return false
 }
 
 func isAgentWrapperCommand(command string) bool {
@@ -2151,11 +2238,6 @@ func (c *Client) PasteKeysContext(ctx context.Context, target, content string, e
 	return c.SendKeysContext(ctx, target, content, enter)
 }
 
-// PasteKeysWithDelay pastes content to a pane with a configurable delay before Enter.
-func (c *Client) PasteKeysWithDelay(target, content string, enter bool, enterDelay time.Duration) error {
-	return c.PasteKeysWithDelayContext(context.Background(), target, content, enter, enterDelay)
-}
-
 // PasteKeysWithDelayContext pastes content with a cancellable Enter delay.
 func (c *Client) PasteKeysWithDelayContext(ctx context.Context, target, content string, enter bool, enterDelay time.Duration) error {
 	return c.SendKeysWithDelayContext(ctx, target, content, enter, enterDelay)
@@ -2168,7 +2250,7 @@ func PasteKeys(target, content string, enter bool) error {
 
 // PasteKeysWithDelay pastes content to a pane with a configurable delay (default client)
 func PasteKeysWithDelay(target, content string, enter bool, enterDelay time.Duration) error {
-	return DefaultClient.PasteKeysWithDelay(target, content, enter, enterDelay)
+	return DefaultClient.PasteKeysWithDelayContext(context.Background(), target, content, enter, enterDelay)
 }
 
 // PasteKeysWithDelayContext pastes content with a cancellable delay (default client).
@@ -2651,7 +2733,8 @@ const boxRuleRunes = "─━╌┄┈╰╯└┘╭╮┌┐┏┓┗┛"
 // continuation rows inside its bordered composer. Keep empty rows so payload
 // matching cannot silently bridge a blank line.
 func composerBlockRows(capture string, markers []string) (rows []string, bordered, found bool) {
-	lines := strings.Split(capture, "\n")
+	clean := strings.ReplaceAll(antigravityANSIRe.ReplaceAllString(capture, ""), "\r\n", "\n")
+	lines := strings.Split(clean, "\n")
 	for i := len(lines) - 1; i >= 0; i-- {
 		idx, marker := indexAnyMarker(lines[i], markers)
 		if idx < 0 {
@@ -2810,6 +2893,10 @@ var queuedMessagesMarkers = []string{
 // scrolled away hours ago.
 const queuedMarkerTailLines = 10
 
+func isPiAgentType(agentType AgentType) bool {
+	return strings.EqualFold(strings.TrimSpace(string(agentType)), "pi")
+}
+
 // InspectComposer derives the message-independent composer state from a
 // pane capture. The composer is bottom-pinned in both Claude Code and
 // codex, so the bottom-most marker line is the live input box even in a
@@ -2832,10 +2919,38 @@ func InspectComposer(capture string, agentType AgentType) ComposerState {
 		// line box, whose bottom border is the draft's input row. omp steers
 		// a message sent mid-turn straight into the running turn, so it never
 		// holds queued messages outside the composer.
-		composer := agent.ParseOmpComposer(capture)
 		state.QueuedMessages = false
+		if agent.TrustDialogVisible(capture) || agent.HasTrailingShellExitPrompt(capture) {
+			return state
+		}
+		composer := agent.ParseOmpComposer(capture)
 		state.MarkerVisible = composer.Found
 		state.HoldsText = composer.Found && composer.Draft != ""
+		return state
+	}
+	if isPiAgentType(agentType) {
+		state.QueuedMessages = false
+		if agent.TrustDialogVisible(capture) || agent.HasTrailingShellExitPrompt(capture) {
+			return state
+		}
+		if _, gated := agent.DetectInteractiveGate(capture, 0); gated {
+			return state
+		}
+		composer := agent.ParsePiComposer(capture)
+		state.MarkerVisible = composer.Found
+		state.HoldsText = composer.Found && composer.Draft != ""
+		return state
+	}
+	if agentType.Canonical() == AgentOpencode {
+		draft, found := opencodeComposerDraft(capture)
+		state.MarkerVisible = found
+		state.HoldsText = found && draft != ""
+		return state
+	}
+	if agentType.Canonical() == AgentAntigravity {
+		draft, found := antigravityComposerDraft(capture)
+		state.MarkerVisible = found
+		state.HoldsText = found && draft != ""
 		return state
 	}
 	if agentType.Canonical() == AgentCodex && codexTranscriptBrowsing(capture) {
@@ -2843,6 +2958,9 @@ func InspectComposer(capture string, agentType AgentType) ComposerState {
 	}
 	markers := composerMarkersForAgent(agentType)
 	if len(markers) == 0 {
+		return state
+	}
+	if !composerVisibleForDelivery(capture, markers) {
 		return state
 	}
 	// Block-aware: a Claude entry long enough to wrap puts its tail on the
@@ -2873,6 +2991,9 @@ func (c *Client) ComposerReadyForDelivery(ctx context.Context, target string, ag
 	canonical := agentType.Canonical()
 	if canonical == AgentOmp {
 		return c.ompComposerReadyForDelivery(ctx, target)
+	}
+	if canonical == AgentAntigravity {
+		return c.antigravityComposerReadyForDelivery(ctx, target, paneWidth)
 	}
 	markers := composerMarkersForAgent(canonical)
 	if len(markers) == 0 {
@@ -2930,6 +3051,88 @@ func (c *Client) ompComposerReadyForDelivery(ctx context.Context, target string)
 	}
 }
 
+const (
+	antigravityComposerScanLines   = 16
+	antigravityPromptAboveScanRows = 8
+)
+
+var antigravityANSIRe = regexp.MustCompile(`\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\a\x1b]*(?:\a|\x1b\\)`)
+
+// antigravityComposerDraft extracts any unsubmitted draft from a visible
+// Antigravity (agy) pane capture. At idle, Antigravity renders a `>` prompt row
+// anchored above its `? for shortcuts` and model footer rows; trust/approval
+// dialogs reuse `>` as a selection cursor without `? for shortcuts`, so both
+// the interactive-gate veto and the footer anchor are required.
+func antigravityComposerDraft(capture string) (draft string, found bool) {
+	clean := strings.ReplaceAll(antigravityANSIRe.ReplaceAllString(capture, ""), "\r\n", "\n")
+	if strings.TrimSpace(clean) == "" || agent.HasTrailingShellExitPrompt(clean) {
+		return "", false
+	}
+	if _, gated := agent.DetectInteractiveGate(clean, 0); gated {
+		return "", false
+	}
+	lines := strings.Split(clean, "\n")
+	footerIdx := -1
+	start := max(0, len(lines)-antigravityComposerScanLines)
+	for i := len(lines) - 1; i >= start; i-- {
+		if strings.Contains(strings.ToLower(lines[i]), "? for shortcuts") {
+			footerIdx = i
+			break
+		}
+	}
+	if footerIdx < 1 {
+		return "", false
+	}
+	promptFloor := max(0, footerIdx-antigravityPromptAboveScanRows)
+	for i := footerIdx - 1; i >= promptFloor; i-- {
+		trimmed := strings.TrimLeft(lines[i], " \t")
+		if trimmed != ">" && !strings.HasPrefix(trimmed, "> ") && !strings.HasPrefix(trimmed, ">\t") {
+			continue
+		}
+		head := strings.TrimSpace(trimmed[1:])
+		if dialogOptionLineRe.MatchString(head) {
+			return "", false
+		}
+		parts := make([]string, 0, footerIdx-i)
+		if head != "" {
+			parts = append(parts, head)
+		}
+		for j := i + 1; j < footerIdx; j++ {
+			cont := strings.TrimSpace(lines[j])
+			if cont == "" {
+				continue
+			}
+			if strings.TrimLeft(cont, boxRuleRunes) == "" {
+				break
+			}
+			parts = append(parts, cont)
+		}
+		return strings.Join(parts, "\n"), true
+	}
+	return "", false
+}
+
+// AntigravityComposerVisible reports whether an Antigravity (agy) capture
+// positively shows its live `>` input composer anchored above `? for shortcuts`.
+func AntigravityComposerVisible(capture string) bool {
+	_, found := antigravityComposerDraft(capture)
+	return found
+}
+
+func (c *Client) antigravityComposerReadyForDelivery(ctx context.Context, target string, paneWidth int) (bool, string) {
+	capture, err := c.CapturePaneVisibleContext(ctx, target)
+	if err != nil || strings.TrimSpace(capture) == "" {
+		return true, ""
+	}
+	if gate, found := agent.DetectInteractiveGate(capture, paneWidth); found {
+		return false, fmt.Sprintf("agy composer blocked by %s; resolve the interactive prompt before sending", gate)
+	}
+	if AntigravityComposerVisible(capture) || agent.AntigravityActivelyWorking(capture, paneWidth) {
+		return true, ""
+	}
+	return false, "agy composer not visible: pane appears to be initializing or showing a dialog; a typed prompt would be swallowed"
+}
+
 // ComposerReadyForDelivery checks delivery readiness (default client).
 func ComposerReadyForDelivery(ctx context.Context, target string, agentType AgentType, paneWidth int) (bool, string) {
 	return DefaultClient.ComposerReadyForDelivery(ctx, target, agentType, paneWidth)
@@ -2975,6 +3178,28 @@ func codexTranscriptBrowsing(capture string) bool {
 // browsing. Empty captures and agent types without a known marker return
 // false. Held draft text is allowed; this check does not establish emptiness.
 func ComposerVisibleForDelivery(capture string, agentType AgentType) bool {
+	if isPiAgentType(agentType) {
+		if agent.TrustDialogVisible(capture) || agent.HasTrailingShellExitPrompt(capture) {
+			return false
+		}
+		if _, gated := agent.DetectInteractiveGate(capture, 0); gated {
+			return false
+		}
+		composer := agent.ParsePiComposer(capture)
+		return composer.Found && composer.CompletionRows == 0
+	}
+	switch agentType.Canonical() {
+	case AgentAntigravity:
+		return AntigravityComposerVisible(capture)
+	case AgentOpencode:
+		return OpencodeComposerVisible(capture)
+	case AgentOmp:
+		if agent.TrustDialogVisible(capture) {
+			return false
+		}
+		composer := agent.ParseOmpComposer(capture)
+		return composer.Found && composer.RowsBelow == 0
+	}
 	return composerVisibleForDelivery(capture, composerMarkersForAgent(agentType))
 }
 
@@ -2986,12 +3211,19 @@ func ComposerVisibleForDelivery(capture string, agentType AgentType) bool {
 // enter to continue" at or just below the marker, is a selection cursor, not
 // an input box (GH#273 root cause 3).
 func composerVisibleForDelivery(capture string, markers []string) bool {
+	if len(markers) == 0 {
+		return false
+	}
+	clean := strings.ReplaceAll(antigravityANSIRe.ReplaceAllString(capture, ""), "\r\n", "\n")
+	if agent.TrustDialogVisible(clean) || agent.HasTrailingShellExitPrompt(clean) {
+		return false
+	}
 	for _, marker := range markers {
-		if (marker == "›" || marker == "»") && codexTranscriptBrowsing(capture) {
+		if (marker == "›" || marker == "»") && codexTranscriptBrowsing(clean) {
 			return false
 		}
 	}
-	lines := strings.Split(capture, "\n")
+	lines := strings.Split(clean, "\n")
 	for i := len(lines) - 1; i >= 0; i-- {
 		idx, marker := indexAnyMarker(lines[i], markers)
 		if idx < 0 {
@@ -3725,15 +3957,17 @@ func SendInterrupt(target string) error {
 }
 
 // InterruptKeyForAgent returns the tmux key that interrupts an in-flight turn
-// for agentType. Oh My Pi binds interrupt to Escape: Ctrl+C there only clears
-// the draft (a running turn keeps going) and two Ctrl+C presses on an empty
-// draft quit omp — both verified live against omp v18.2.3. Every other
-// supported agent TUI interrupts on Ctrl+C.
+// for agentType. Oh My Pi (omp) and OpenCode (oc) bind generation interrupt to
+// Escape ("esc interrupt"): Ctrl+C in omp clears the draft or double-press
+// quits, and Ctrl+C in OpenCode exits or opens quit confirmation rather than
+// cancelling generation. Every other supported agent TUI interrupts on Ctrl+C.
 func InterruptKeyForAgent(agentType AgentType) string {
-	if agentType.Canonical() == AgentOmp {
+	switch agentType.Canonical() {
+	case AgentOmp, AgentOpencode:
 		return "Escape"
+	default:
+		return "C-c"
 	}
-	return "C-c"
 }
 
 // InterruptKeyLabel is the human-readable name of InterruptKeyForAgent's key
@@ -3986,12 +4220,22 @@ func (c *Client) CapturePaneOutput(target string, lines int) (string, error) {
 }
 
 // CapturePaneOutputContext captures the output of a pane with cancellation support.
+// When lines == 0, captures the currently visible viewport without -S scrollback
+// offset instead of formatting `-S -0`; negative values capture -lines of history.
 func (c *Client) CapturePaneOutputContext(ctx context.Context, target string, lines int) (string, error) {
 	if lines < 0 {
 		lines = -lines
 	}
 	started := time.Now()
-	output, err := c.RunContext(ctx, "capture-pane", "-t", ExactTarget(target), "-p", "-S", fmt.Sprintf("-%d", lines))
+	var (
+		output string
+		err    error
+	)
+	if lines == 0 {
+		output, err = c.RunContext(ctx, "capture-pane", "-t", ExactTarget(target), "-p")
+	} else {
+		output, err = c.RunContext(ctx, "capture-pane", "-t", ExactTarget(target), "-p", "-S", fmt.Sprintf("-%d", lines))
+	}
 	c.recordCaptureBackpressure(target, lines, time.Since(started), err)
 	return output, err
 }
@@ -4339,14 +4583,9 @@ func ParsePaneAgentTypeOption(raw string) AgentType {
 	return AgentUnknown
 }
 
-// SetPaneAgentType records agentType on the pane as the @ntm_agent_type user
-// option (see PaneAgentTypeOption). Unlike SetPaneTitle it never touches the
-// title, so it is safe to call for panes whose program owns its own title.
-func (c *Client) SetPaneAgentType(paneID string, agentType AgentType) error {
-	return c.SetPaneAgentTypeContext(context.Background(), paneID, agentType)
-}
-
-// SetPaneAgentTypeContext is SetPaneAgentType with caller cancellation.
+// SetPaneAgentTypeContext records agentType on the pane as the @ntm_agent_type user
+// option (see PaneAgentTypeOption) with caller cancellation. Unlike SetPaneTitle it
+// never touches the title, so it is safe to call for panes whose program owns its own title.
 func (c *Client) SetPaneAgentTypeContext(ctx context.Context, paneID string, agentType AgentType) error {
 	if ctx == nil {
 		return errors.New("tmux pane agent type context is required")
@@ -4370,11 +4609,6 @@ func (c *Client) SetPaneAgentTypeIfCurrentContext(ctx context.Context, paneID st
 	}
 	return c.runPaneMutationIfCurrentContext(ctx, paneID, expectedPID, paneMutationShell,
 		"set-option", "-p", "-t", ExactTarget(paneID), PaneAgentTypeOption, string(recorded))
-}
-
-// SetPaneAgentType records the agent type on a pane (default client).
-func SetPaneAgentType(paneID string, agentType AgentType) error {
-	return DefaultClient.SetPaneAgentType(paneID, agentType)
 }
 
 // SetPaneAgentTypeContext records the agent type on a pane with caller

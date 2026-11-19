@@ -354,6 +354,16 @@ type EnsembleSession struct {
 	// SynthesisStrategy is how outputs will be combined.
 	SynthesisStrategy SynthesisStrategy `json:"synthesis_strategy"`
 
+	// Budget is the resolved budget at spawn time. Nil identifies sessions
+	// created before effective configuration was persisted; a present zero
+	// value must not be replaced with defaults during a later operation.
+	Budget *BudgetConfig `json:"budget,omitempty"`
+
+	// Synthesis preserves the resolved synthesis settings independently of
+	// subsequent configuration or preset edits. SynthesisStrategy remains the
+	// selected strategy when an operator explicitly changes it after spawn.
+	Synthesis *SynthesisConfig `json:"synthesis,omitempty"`
+
 	// CreatedAt is when the ensemble was started.
 	CreatedAt time.Time `json:"created_at"`
 
@@ -1252,6 +1262,9 @@ type SynthesisConfig struct {
 
 	// IncludeExplanation generates detailed reasoning for each conclusion.
 	IncludeExplanation bool `json:"include_explanation,omitempty" toml:"include_explanation" yaml:"include_explanation,omitempty"`
+
+	// MaxSynthesisTokens caps token usage for synthesis prompt/output when > 0.
+	MaxSynthesisTokens int `json:"max_synthesis_tokens,omitempty" toml:"-" yaml:"max_synthesis_tokens,omitempty"`
 }
 
 // DefaultSynthesisConfig returns sensible default synthesis settings.

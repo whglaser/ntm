@@ -3444,7 +3444,7 @@ func TestFleetCount_Consistent(t *testing.T) {
 	}
 
 	// Verify agent type counts sum correctly
-	sumAgentTypes := m.claudeCount + m.codexCount + m.geminiCount + m.grokCount + m.cursorCount + m.windsurfCount + m.aiderCount + m.ollamaCount + m.userCount
+	sumAgentTypes := m.claudeCount + m.codexCount + m.geminiCount + m.grokCount + m.ompCount + m.opencodeCount + m.antigravityCount + m.cursorCount + m.windsurfCount + m.aiderCount + m.ollamaCount + m.userCount
 	if sumAgentTypes != totalPanes {
 		t.Errorf("agent type counts (%d) should equal total panes (%d)", sumAgentTypes, totalPanes)
 	}
@@ -3539,17 +3539,19 @@ func TestFleetCount_AgentTypesSumCorrectly(t *testing.T) {
 		codexCount    int
 		geminiCount   int
 		grokCount     int
+		opencodeCount int
 		cursorCount   int
 		windsurfCount int
 		aiderCount    int
 		ollamaCount   int
 		userCount     int
 	}{
-		{"all_claude", 5, 0, 0, 0, 0, 0, 0, 0, 0},
-		{"all_grok", 0, 0, 0, 4, 0, 0, 0, 0, 0},
-		{"mixed_agents", 2, 2, 1, 1, 1, 1, 1, 1, 1},
-		{"all_user", 0, 0, 0, 0, 0, 0, 0, 0, 4},
-		{"empty", 0, 0, 0, 0, 0, 0, 0, 0, 0},
+		{"all_claude", 5, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+		{"all_grok", 0, 0, 0, 4, 0, 0, 0, 0, 0, 0},
+		{"all_opencode", 0, 0, 0, 0, 3, 0, 0, 0, 0, 0},
+		{"mixed_agents", 2, 2, 1, 1, 2, 1, 1, 1, 1, 1},
+		{"all_user", 0, 0, 0, 0, 0, 0, 0, 0, 0, 4},
+		{"empty", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
 	}
 
 	for _, tc := range tests {
@@ -3586,6 +3588,13 @@ func TestFleetCount_AgentTypesSumCorrectly(t *testing.T) {
 			for i := 0; i < tc.grokCount; i++ {
 				m.panes = append(m.panes, tmux.Pane{
 					ID: fmt.Sprintf("%d", idx), Index: idx, Type: tmux.AgentType("grok-build"),
+				})
+				idx++
+			}
+			// Add OpenCode panes
+			for i := 0; i < tc.opencodeCount; i++ {
+				m.panes = append(m.panes, tmux.Pane{
+					ID: fmt.Sprintf("%d", idx), Index: idx, Type: tmux.AgentOpencode,
 				})
 				idx++
 			}
@@ -3627,15 +3636,18 @@ func TestFleetCount_AgentTypesSumCorrectly(t *testing.T) {
 
 			m.updateStats()
 
-			expectedTotal := tc.claudeCount + tc.codexCount + tc.geminiCount + tc.grokCount + tc.cursorCount + tc.windsurfCount + tc.aiderCount + tc.ollamaCount + tc.userCount
-			actualSum := m.claudeCount + m.codexCount + m.geminiCount + m.grokCount + m.cursorCount + m.windsurfCount + m.aiderCount + m.ollamaCount + m.userCount
+			expectedTotal := tc.claudeCount + tc.codexCount + tc.geminiCount + tc.grokCount + tc.opencodeCount + tc.cursorCount + tc.windsurfCount + tc.aiderCount + tc.ollamaCount + tc.userCount
+			actualSum := m.claudeCount + m.codexCount + m.geminiCount + m.grokCount + m.opencodeCount + m.cursorCount + m.windsurfCount + m.aiderCount + m.ollamaCount + m.userCount
 
 			if actualSum != expectedTotal {
-				t.Errorf("expected sum %d, got %d (claude=%d codex=%d gemini=%d grok=%d cursor=%d windsurf=%d aider=%d ollama=%d user=%d)",
-					expectedTotal, actualSum, m.claudeCount, m.codexCount, m.geminiCount, m.grokCount, m.cursorCount, m.windsurfCount, m.aiderCount, m.ollamaCount, m.userCount)
+				t.Errorf("expected sum %d, got %d (claude=%d codex=%d gemini=%d grok=%d opencode=%d cursor=%d windsurf=%d aider=%d ollama=%d user=%d)",
+					expectedTotal, actualSum, m.claudeCount, m.codexCount, m.geminiCount, m.grokCount, m.opencodeCount, m.cursorCount, m.windsurfCount, m.aiderCount, m.ollamaCount, m.userCount)
 			}
 			if m.grokCount != tc.grokCount {
 				t.Errorf("grokCount = %d, want %d", m.grokCount, tc.grokCount)
+			}
+			if m.opencodeCount != tc.opencodeCount {
+				t.Errorf("opencodeCount = %d, want %d", m.opencodeCount, tc.opencodeCount)
 			}
 			if m.ollamaCount != tc.ollamaCount {
 				t.Errorf("ollamaCount = %d, want %d", m.ollamaCount, tc.ollamaCount)
@@ -4075,5 +4087,127 @@ func BenchmarkPaneListView(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_ = l.View()
+	}
+}
+
+func TestAgentBorderAndRowColors_AllCanonicalSemanticAgents(t *testing.T) {
+	m := newTestModel(140)
+	sem := m.theme.Semantic()
+
+	canonical := []tmux.AgentType{
+		tmux.AgentClaude,
+		tmux.AgentCodex,
+		tmux.AgentGemini,
+		tmux.AgentAntigravity,
+		tmux.AgentGrok,
+		tmux.AgentOmp,
+		tmux.AgentCursor,
+		tmux.AgentWindsurf,
+		tmux.AgentAider,
+		tmux.AgentOpencode,
+		tmux.AgentOllama,
+		tmux.AgentUser,
+	}
+
+	for _, ag := range canonical {
+		want := sem.AgentColor(string(ag))
+		if got := AgentBorderColor(string(ag), m.theme); got != want {
+			t.Errorf("AgentBorderColor(%q) = %q, want semantic %q", ag, got, want)
+		}
+		gotRowColor, gotIcon := agentRowTypePresentation(string(ag), m.theme)
+		if gotRowColor != want {
+			t.Errorf("agentRowTypePresentation(%q) color = %q, want semantic %q", ag, gotRowColor, want)
+		}
+		if gotIcon == "" {
+			t.Errorf("agentRowTypePresentation(%q) returned empty icon", ag)
+		}
+	}
+}
+
+func TestDashboardSpawnProgressToastAndToastHistoryClear(t *testing.T) {
+	m := newTestModel(120)
+	gen := m.nextGen(refreshSpawn)
+
+	updated, _ := m.Update(SpawnUpdateMsg{
+		Gen: gen,
+		Data: panels.SpawnData{
+			Active:         true,
+			BatchID:        "batch-42",
+			TotalAgents:    2,
+			StaggerSeconds: 10,
+			Prompts: []panels.SpawnPromptStatus{
+				{Pane: "cc_1", Order: 1, Sent: true},
+				{Pane: "cod_1", Order: 2, Sent: false},
+			},
+		},
+	})
+	m = updated.(Model)
+	if m.toasts.Count() != 1 {
+		t.Fatalf("expected active spawn progress toast, got %d", m.toasts.Count())
+	}
+
+	gen2 := m.nextGen(refreshSpawn)
+	updated, _ = m.Update(SpawnUpdateMsg{
+		Gen: gen2,
+		Data: panels.SpawnData{
+			Active:      true,
+			BatchID:     "batch-42",
+			TotalAgents: 2,
+			CompletedAt: time.Now(),
+			Prompts: []panels.SpawnPromptStatus{
+				{Pane: "cc_1", Order: 1, Sent: true},
+				{Pane: "cod_1", Order: 2, Sent: true},
+			},
+		},
+	})
+	m = updated.(Model)
+
+	m.toasts.DismissNewest()
+	if m.toasts.HistoryCount() == 0 {
+		t.Fatal("expected dismissed spawn toast in history")
+	}
+	m.showToastHistory = true
+	if view := m.renderToastHistoryContent(); !strings.Contains(view, "Press c to clear") {
+		t.Fatalf("expected clear hint in toast history content, got %q", view)
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	m = updated.(Model)
+	if m.toasts.HistoryCount() != 0 {
+		t.Fatalf("expected toast history cleared after pressing c, got %d", m.toasts.HistoryCount())
+	}
+}
+
+func TestDashboardSpawnWizardHintsAndSizeSync(t *testing.T) {
+	m := newTestModel(120)
+	m.showSpawnWizard = true
+	m.spawnWizard = panels.NewSpawnWizard("test", 80, 20)
+
+	hints := m.getFocusedPanelHints()
+	if len(hints) == 0 {
+		t.Fatal("expected spawn wizard keybinding hints when wizard overlay is active")
+	}
+
+	_ = m.View()
+	w, h := m.spawnWizard.Size()
+	if w != m.width || h != m.height {
+		t.Fatalf("expected spawnWizard size (%d, %d) to sync to (%d, %d)", w, h, m.width, m.height)
+	}
+}
+
+func TestDashboardSidebarHasErrorAndBoundedPanelView(t *testing.T) {
+	m := newTestModel(220)
+	if m.sidebarHasError() {
+		t.Fatal("expected clean sidebar to report no error initially")
+	}
+
+	m.cassPanel.SetData(nil, errors.New("cass unavailable"))
+	if !m.sidebarHasError() {
+		t.Fatal("expected sidebarHasError() to reflect cassPanel error")
+	}
+
+	m.timelinePanel.SetSize(60, 8)
+	out := renderBoundedPanelView(m.timelinePanel, 3)
+	if lines := strings.Split(out, "\n"); len(lines) > 3 {
+		t.Fatalf("expected non-viewport panel output bounded to 3 lines, got %d", len(lines))
 	}
 }

@@ -930,7 +930,14 @@ func spawnAgentCommandTemplate(agentType AgentType, pluginMap map[string]plugins
 	case AgentTypeCursor:
 		return cfg.Agents.Cursor, nil, nil
 	case AgentTypeWindsurf:
-		return cfg.Agents.Windsurf, nil, nil
+		configured := ""
+		if cfg != nil {
+			configured = cfg.Agents.Windsurf
+		}
+		if err := config.ValidateWindsurfTerminalHarness(configured); err != nil {
+			return "", nil, markCLIInvalidInput(err)
+		}
+		return configured, nil, nil
 	case AgentTypeAider:
 		return cfg.Agents.Aider, nil, nil
 	case AgentTypeOpencode:
@@ -2225,7 +2232,7 @@ Examples:
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeClaude, &agentSpecs), "cc", "Claude agents (N, N:model, N:model:effort, or N:model@effort)")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeCodex, &agentSpecs), "cod", "Codex agents (N, N:model, N:model:effort, or N:model@effort)")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeGemini, &agentSpecs), "gmi", "Gemini agents (N or N:model, model charset: a-zA-Z0-9._/@:+-)")
-	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeAntigravity, &agentSpecs), "agy", "Antigravity (agy) agents (N; model is pinned to Gemini 4 Argon (High))")
+	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeAntigravity, &agentSpecs), "agy", fmt.Sprintf("Antigravity (agy) agents (N; default model %s via [models] default_antigravity)", models.DefaultAntigravityModel))
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeGrok, &agentSpecs), "grok", "Grok Build agents (N, N:model, N:model:effort, or N:model@effort)")
 	cmd.Flags().IntVar(&localCount, "local", 0, "Local agents via Ollama (alias: --ollama)")
 	cmd.Flags().IntVar(&ollamaCount, "ollama", 0, "Alias for --local (explicit Ollama)")
@@ -4621,8 +4628,25 @@ func preflightOllamaSpawnContext(ctx context.Context, opts SpawnOptions) (string
 // registerSessionAgent registers the session-level identity `ntm lock` acts
 // as and returns its name ("" when disabled or failed). It logs but never
 // fails when Agent Mail is unavailable.
+type suppressCLIIdentityOutputKey struct{}
+
+func withSuppressedCLIIdentityOutput(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, suppressCLIIdentityOutputKey{}, true)
+}
+
+func isCLIIdentityOutputSuppressed(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	suppressed, _ := ctx.Value(suppressCLIIdentityOutputKey{}).(bool)
+	return suppressed
+}
+
 func registerSessionAgent(parentCtx context.Context, sessionName, workingDir string) string {
-	return spawnidentity.RegisterSession(parentCtx, workingDir, sessionName, spawnIdentityOptions())
+	return spawnidentity.RegisterSession(parentCtx, workingDir, sessionName, spawnIdentityOptionsForContext(parentCtx))
 }
 
 // The per-pane Agent Mail identity coordinator (gh#255, ntm#256, ntm#257,
@@ -4655,8 +4679,14 @@ func (cliIdentityReporter) Warnf(format string, args ...any) {
 // configuration (registration gate, endpoint, badges), human output, and the
 // cli's tmux ports.
 func spawnIdentityOptions() spawnidentity.Options {
+	return spawnIdentityOptionsForContext(nil)
+}
+
+func spawnIdentityOptionsForContext(ctx context.Context) spawnidentity.Options {
 	opts := spawnidentity.ConfigOptions(cfg)
-	opts.Reporter = cliIdentityReporter{}
+	if !isCLIIdentityOutputSuppressed(ctx) {
+		opts.Reporter = cliIdentityReporter{}
+	}
 	opts.ListPanes = spawnIdentityPaneProbe
 	opts.BadgeTmux = paneBadgeTmux
 	return opts
@@ -4677,7 +4707,7 @@ func newSpawnIdentityCoordinator(workingDir, sessionName string, preLaunch bool)
 // before launch instead (gh#255). Agent Mail unavailability never fails the
 // caller.
 func registerSpawnedAgents(parentCtx context.Context, workingDir, sessionName string, agents []spawnidentity.Agent) *spawnidentity.AgentMailSpawnStatus {
-	return spawnidentity.RegisterBatch(parentCtx, workingDir, sessionName, agents, spawnIdentityOptions())
+	return spawnidentity.RegisterBatch(parentCtx, workingDir, sessionName, agents, spawnIdentityOptionsForContext(parentCtx))
 }
 
 // Identity file path helpers moved to internal/agentmail/pane_identity.go so

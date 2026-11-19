@@ -276,6 +276,18 @@ func TestBatchInjectionResult(t *testing.T) {
 	}
 }
 
+func TestInjectSwarmNilPlan(t *testing.T) {
+	injector := NewPromptInjector()
+	result, err := injector.InjectSwarmWithContext(context.Background(), nil, "test prompt")
+
+	if err == nil {
+		t.Error("expected error for nil plan")
+	}
+	if result != nil {
+		t.Error("expected nil result for nil plan")
+	}
+}
+
 func TestInjectBatchEmpty(t *testing.T) {
 	injector := NewPromptInjector()
 	result, err := injector.InjectBatchWithContext(context.Background(), []InjectionTarget{}, "test prompt")
@@ -312,7 +324,7 @@ func TestPromptInjector_GrokDirectPathsDeliverViaTmux(t *testing.T) {
 		inject func() error
 	}{
 		{name: "public", inject: func() error {
-			return injector.InjectPrompt("proj:1.2", "grok-build", "continue")
+			return injector.InjectPromptContext(context.Background(), "proj:1.2", "grok-build", "continue")
 		}},
 		{name: "direct helper", inject: func() error {
 			return injector.sendToPane(context.Background(), "proj:1.2", "xai_grok_build", "continue")

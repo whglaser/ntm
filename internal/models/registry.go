@@ -5,6 +5,7 @@
 package models
 
 import (
+	"fmt"
 	"log/slog"
 	"regexp"
 	"sort"
@@ -16,6 +17,10 @@ import (
 
 // DefaultContextLimit is the fallback when a model is not recognized.
 const DefaultContextLimit = 128000
+
+// DefaultAntigravityModel is the default display model identifier for the
+// Antigravity CLI (agy).
+const DefaultAntigravityModel = "Gemini 4 Argon (High)"
 
 // dateSuffixRe strips date suffixes like -20260101 from model names.
 var dateSuffixRe = regexp.MustCompile(`-\d{8}$`)
@@ -81,6 +86,19 @@ var ContextLimits = map[string]int{
 	// the input limit when agy was pinned to it (2026-10-13).
 	"gemini-4-argon": 1000000,
 	"gemini-pro":     32000,
+
+	// xAI Grok models
+	"grok-4":      256000,
+	"grok-4-6":    256000,
+	"grok-4.6":    256000,
+	"grok-4-fast": 2000000,
+	"grok-3":      131072,
+	"grok-3-mini": 131072,
+	"grok-2":      131072,
+
+	// Common local / Ollama models
+	"llama3":    128000,
+	"codellama": 16384,
 }
 
 // Aliases maps short names and common variants to canonical model names.
@@ -112,14 +130,19 @@ var Aliases = map[string]string{
 	"gpt5":       "gpt-5",
 	"codex":      "gpt-5-codex",
 
-	// Gemini aliases
-	"gemini":       "gemini-2.0-flash",
-	"pro":          "gemini-1.5-pro",
-	"flash":        "gemini-2.0-flash",
-	"flash2":       "gemini-2.0-flash",
-	"ultra":        "gemini-2.0-flash",
-	"gemini-flash": "gemini-2.0-flash",
-	"gemini-ultra": "gemini-2.0-flash",
+	// Gemini & Antigravity aliases
+	"gemini":                "gemini-2.0-flash",
+	"pro":                   "gemini-1.5-pro",
+	"flash":                 "gemini-2.0-flash",
+	"flash2":                "gemini-2.0-flash",
+	"ultra":                 "gemini-2.0-flash",
+	"gemini-flash":          "gemini-2.0-flash",
+	"gemini-ultra":          "gemini-2.0-flash",
+	"gemini 4 argon (high)": "gemini-4-argon",
+	"gemini-4-argon-high":   "gemini-4-argon",
+
+	// Grok aliases
+	"grok": "grok-4",
 }
 
 var (
@@ -151,6 +174,11 @@ func ApplyOverrides(overrides map[string]int) {
 	defer registryMu.Unlock()
 
 	for model, limit := range overrides {
+		model = strings.ToLower(strings.TrimSpace(model))
+		if model == "" {
+			slog.Warn("ignoring context limit override with an empty model")
+			continue
+		}
 		if limit <= 0 {
 			// A non-positive limit is a division-by-zero waiting to happen in
 			// every usage-percentage computation, and the resulting NaN/+Inf
@@ -160,7 +188,7 @@ func ApplyOverrides(overrides map[string]int) {
 				"model", model, "limit", limit)
 			continue
 		}
-		ContextLimits[strings.ToLower(model)] = limit
+		ContextLimits[model] = limit
 	}
 
 	// Force rebuild of sorted keys cache
@@ -173,10 +201,43 @@ func ApplyOverrides(overrides map[string]int) {
 //  2. Alias resolution → exact match
 //  3. Strip date suffix (e.g., -20260101) → exact match
 //  4. Longest-prefix match in ContextLimits
-//  5. DefaultContextLimit fallback
+//  5. Repeat for the model after each provider namespace (e.g.,
+//     openrouter/anthropic/claude-opus-4-6 → anthropic/claude-opus-4-6
+//     → claude-opus-4-6), keeping qualified overrides ahead of the fallback
+//  6. DefaultContextLimit fallback
 func GetContextLimit(model string) int {
+	if limit, ok := LookupContextLimit(model); ok {
+		return limit
+	}
+	return DefaultContextLimit
+}
+
+// KnownModel reports whether a model identifier resolves to a real registry
+// value through the same rules GetContextLimit uses, including provider
+// namespaces. The default limit is not evidence of a known model.
+func KnownModel(model string) bool {
+	_, ok := LookupContextLimit(model)
+	return ok
+}
+
+// LookupContextLimit resolves a model through the canonical registry without
+// inventing capacity for an unknown model. It returns (0, false) when no
+// positive window is known. Admission and automatic actions must use this
+// result instead of treating GetContextLimit's display fallback as evidence.
+// Provider namespaces are stripped only during lookup, never from stored or
+// native identity.
+func LookupContextLimit(model string) (int, bool) {
+	model = strings.ToLower(strings.TrimSpace(model))
 	if model == "" {
-		return DefaultContextLimit
+		return 0, false
+	}
+	// An empty namespace or leaf is not a provider-qualified model. In
+	// particular, do not turn "provider//model" into a known model by
+	// repeatedly discarding invalid path segments.
+	for _, part := range strings.Split(model, "/") {
+		if part == "" || strings.TrimSpace(part) != part {
+			return 0, false
+		}
 	}
 
 	registryMu.RLock()
@@ -192,17 +253,34 @@ func GetContextLimit(model string) int {
 	}
 	defer registryMu.RUnlock()
 
-	lower := strings.ToLower(model)
+	for {
+		if limit, ok := lookupModelLocked(model); ok {
+			if limit <= 0 {
+				return 0, false
+			}
+			return limit, true
+		}
+		_, unqualified, qualified := strings.Cut(model, "/")
+		if !qualified {
+			return 0, false
+		}
+		model = unqualified
+	}
+}
+
+// lookupModelLocked resolves one spelling without changing its namespace.
+// registryMu must be held and sortedKeys initialized by the caller.
+func lookupModelLocked(lower string) (int, bool) {
 
 	// 1. Exact match
 	if limit, ok := ContextLimits[lower]; ok {
-		return limit
+		return limit, true
 	}
 
 	// 2. Alias resolution
 	if canonical, ok := Aliases[lower]; ok {
 		if limit, ok := ContextLimits[canonical]; ok {
-			return limit
+			return limit, true
 		}
 	}
 
@@ -210,62 +288,24 @@ func GetContextLimit(model string) int {
 	stripped := dateSuffixRe.ReplaceAllString(lower, "")
 	if stripped != lower {
 		if limit, ok := ContextLimits[stripped]; ok {
-			return limit
+			return limit, true
 		}
 		if canonical, ok := Aliases[stripped]; ok {
 			if limit, ok := ContextLimits[canonical]; ok {
-				return limit
+				return limit, true
 			}
 		}
 	}
 
-	// 4. Longest-prefix match
+	// 4. Longest-prefix match within this namespace. A model-like provider
+	// name such as "gpt-4/unknown" must not resolve to the provider's prefix.
 	for _, key := range sortedKeys {
-		if strings.HasPrefix(lower, key) || strings.HasPrefix(stripped, key) {
-			return ContextLimits[key]
+		if strings.HasPrefix(lower, key) && !strings.Contains(lower[len(key):], "/") {
+			return ContextLimits[key], true
 		}
 	}
 
-	return DefaultContextLimit
-}
-
-// KnownModel reports whether a model identifier resolves in the registry
-// through the same rules GetContextLimit uses (exact match, alias, date-suffix
-// strip, or longest-prefix match) — i.e. whether GetContextLimit would return
-// a real registry value rather than the DefaultContextLimit fallback.
-func KnownModel(model string) bool {
-	if model == "" {
-		return false
-	}
-	registryMu.RLock()
-	defer registryMu.RUnlock()
-
-	lower := strings.ToLower(model)
-	if _, ok := ContextLimits[lower]; ok {
-		return true
-	}
-	if canonical, ok := Aliases[lower]; ok {
-		if _, ok := ContextLimits[canonical]; ok {
-			return true
-		}
-	}
-	stripped := dateSuffixRe.ReplaceAllString(lower, "")
-	if stripped != lower {
-		if _, ok := ContextLimits[stripped]; ok {
-			return true
-		}
-		if canonical, ok := Aliases[stripped]; ok {
-			if _, ok := ContextLimits[canonical]; ok {
-				return true
-			}
-		}
-	}
-	for key := range ContextLimits {
-		if strings.HasPrefix(lower, key) || strings.HasPrefix(stripped, key) {
-			return true
-		}
-	}
-	return false
+	return 0, false
 }
 
 // SuggestModel returns the canonical registry identifier closest to an
@@ -366,18 +406,20 @@ func editDistance(a, b string) int {
 	return prev[len(b)]
 }
 
-// agentTypeBudgetPct defines what fraction of the model's context limit
-// to allocate as a safe working budget per agent type. The remainder is
-// reserved for system prompts, tool definitions, and overhead.
-var agentTypeBudgetPct = map[string]float64{
-	"cc":       0.90, // Claude: 90% of limit (well-documented system prompt overhead)
-	"cod":      0.94, // Codex: 94% of limit
-	"gmi":      0.10, // Gemini: 10% of 1M (still 100K tokens, avoids excessive context)
-	"agy":      0.10, // Antigravity (Gemini successor): mirrors Gemini's budget
-	"cursor":   0.85, // Cursor
-	"windsurf": 0.85, // Windsurf
-	"aider":    0.85, // Aider
-	"ollama":   0.90, // Ollama
+// agentTypeBudgetPct defines the fraction of an available context window
+// allocated to one pack. It leaves headroom and applies each agent's
+// conservative pack-size policy; it is not a maximum session occupancy.
+var agentTypeBudgetPct = map[string]int{
+	"cc":       90, // Claude: 90% of limit (well-documented system prompt overhead)
+	"cod":      94, // Codex: 94% of limit
+	"gmi":      10, // Gemini: 10% of 1M (still 100K tokens, avoids excessive context)
+	"agy":      10, // Antigravity (Gemini successor): mirrors Gemini's budget
+	"grok":     85, // Grok Build
+	"oc":       85, // OpenCode
+	"cursor":   85, // Cursor
+	"windsurf": 85, // Windsurf
+	"aider":    85, // Aider
+	"ollama":   90, // Ollama
 }
 
 // agentTypeDefaultModels maps agent types to their default model for budget calculation.
@@ -385,7 +427,10 @@ var agentTypeDefaultModels = map[string]string{
 	"cc":       "claude-opus-4",
 	"cod":      "gpt-5-codex",
 	"gmi":      "gemini-2.0-flash",
-	"agy":      "gemini-4-argon", // Antigravity pins Gemini 4 Argon (High)
+	"agy":      "gemini-4-argon", // Antigravity default: Gemini 4 Argon (High)
+	"grok":     "grok-4",
+	"oc":       "claude-sonnet-4",
+	"omp":      "claude-sonnet-4",
 	"cursor":   "claude-3.5-sonnet",
 	"windsurf": "claude-3.5-sonnet",
 	"aider":    "claude-3.5-sonnet",
@@ -396,17 +441,45 @@ var agentTypeDefaultModels = map[string]string{
 // This is derived from the model's context limit and a per-agent-type
 // overhead percentage.
 func GetTokenBudget(agentType string) int {
-	agentType = string(agent.AgentType(agentType).Canonical())
-	model, ok := agentTypeDefaultModels[agentType]
-	if !ok {
-		return 100000 // Safe default
+	budget, err := GetTokenBudgetForModel(agentType, "", 0)
+	if err != nil {
+		return 0
 	}
+	return budget
+}
 
-	limit := GetContextLimit(model)
+// GetTokenBudgetForModel sizes a context pack for the actual target window.
+// A positive reported window takes precedence over the model registry. An
+// explicit unknown model requires a reported window instead of silently using
+// the registry fallback. Empty model/window inputs retain the agent defaults.
+// The percentage limits the pack size, not the session's total occupancy.
+func GetTokenBudgetForModel(agentType, model string, contextWindow int) (int, error) {
+	if contextWindow < 0 {
+		return 0, fmt.Errorf("context window must be nonnegative, got %d", contextWindow)
+	}
+	agentType = string(agent.AgentType(agentType).Canonical())
+	model = strings.ToLower(strings.TrimSpace(model))
+	if contextWindow == 0 {
+		if model == "" {
+			var ok bool
+			model, ok = agentTypeDefaultModels[agentType]
+			if !ok {
+				return 100000, nil
+			}
+		} else if !KnownModel(model) {
+			return 0, fmt.Errorf("unknown model %q: provide an explicit context window", model)
+		}
+		contextWindow = GetContextLimit(model)
+	}
 	pct, ok := agentTypeBudgetPct[agentType]
 	if !ok {
-		pct = 0.78 // Conservative default
+		pct = 78
 	}
-
-	return int(float64(limit) * pct)
+	// Divide before multiplying: even a valid int-sized custom window must
+	// not overflow or become negative during percentage allocation.
+	budget := contextWindow/100*pct + contextWindow%100*pct/100
+	if budget <= 0 {
+		return 0, fmt.Errorf("context window %d leaves no working token budget", contextWindow)
+	}
+	return budget, nil
 }

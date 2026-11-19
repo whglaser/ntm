@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 	"unicode"
+
+	"github.com/Dicklesworthstone/ntm/internal/process"
 )
 
 func TestMain(m *testing.M) {
@@ -1552,6 +1554,36 @@ func TestCapturePaneOutputWithContent(t *testing.T) {
 	if !strings.Contains(output, "LINE1") {
 		t.Logf("output: %q", output)
 		t.Error("output should contain LINE1")
+	}
+}
+
+func TestCapturePaneOutputZeroAndNegativeBoundaries(t *testing.T) {
+	skipIfNoTmux(t)
+
+	session := createTestSession(t)
+	panes, err := GetPanes(session)
+	if err != nil || len(panes) == 0 {
+		t.Fatalf("GetPanes(%s): %v", session, err)
+	}
+	target := panes[0].ID
+
+	if err := SendKeys(target, "printf 'ZERO_TOP\\nZERO_MID\\nZERO_BOT\\n'", true); err != nil {
+		t.Fatalf("SendKeys: %v", err)
+	}
+	time.Sleep(250 * time.Millisecond)
+
+	for _, lines := range []int{0, -10, 1, 500} {
+		out, err := CapturePaneOutput(target, lines)
+		if err != nil {
+			t.Fatalf("CapturePaneOutput(lines=%d) failed: %v", lines, err)
+		}
+		if lines == 0 || lines == -10 || lines == 500 {
+			for _, want := range []string{"ZERO_TOP", "ZERO_MID", "ZERO_BOT"} {
+				if !strings.Contains(out, want) {
+					t.Errorf("CapturePaneOutput(lines=%d) missing %q; got:\n%s", lines, want, out)
+				}
+			}
+		}
 	}
 }
 
@@ -3444,5 +3476,104 @@ esac
 				})
 			}
 		})
+	}
+}
+
+func TestShellArgvLooksInteractiveRejectsCommandModes(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		argv []string
+		want bool
+	}{
+		{"login shell", []string{"-zsh"}, true},
+		{"interactive shell", []string{"/bin/sh", "-i"}, true},
+		{"interactive noclobber", []string{"bash", "-iC"}, true},
+		{"interactive login flags", []string{"bash", "--noprofile", "--norc", "-il"}, true},
+		{"command", []string{"sh", "-c", "agent"}, false},
+		{"combined command flags", []string{"bash", "-lc", "agent"}, false},
+		{"interactive command still exits", []string{"sh", "-ic", "agent"}, false},
+		{"long command", []string{"fish", "--command=agent"}, false},
+		{"script", []string{"sh", "/tmp/agent-wrapper"}, false},
+		{"script after separator", []string{"sh", "--", "/tmp/agent-wrapper"}, false},
+		{"stdin shell on pane terminal", []string{"bash", "-s"}, true},
+		{"explicit interactive stdin", []string{"sh", "-is"}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := shellArgvLooksInteractive(tc.argv); got != tc.want {
+				t.Fatalf("shellArgvLooksInteractive(%q) = %t, want %t", tc.argv, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidatePanePersistentShellRootIdentity(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("persistent shell verification requires Linux or macOS")
+	}
+	for _, tc := range []struct {
+		name  string
+		file  string
+		args  []string
+		argv0 string
+		want  bool
+	}{
+		{name: "interactive shell", file: "sh", args: []string{"-i"}, want: true},
+		{name: "direct process", file: "sleep", args: []string{"30"}},
+		{name: "direct process with shell argv zero", file: "sleep", args: []string{"30"}, argv0: "bash"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := exec.Command(tc.file, tc.args...)
+			process.DetachControllingTerminal(cmd)
+			if tc.argv0 != "" {
+				cmd.Args[0] = tc.argv0
+			}
+			stdin, err := cmd.StdinPipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stdin.Close()
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				_ = cmd.Process.Kill()
+				_ = cmd.Wait()
+			}()
+			pane := Pane{ID: "%99", PID: cmd.Process.Pid, Type: AgentCodex, Command: "codex"}
+			err = NewClient("").ValidatePanePersistentShellContext(t.Context(), pane)
+			if (err == nil) != tc.want {
+				t.Fatalf("persistent shell proof error = %v, want success=%t", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidatePanePersistentShellRejectsGoneRoot(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("persistent shell verification requires Linux or macOS")
+	}
+	cmd := exec.Command("sh", "-c", "exit 0")
+	if err := cmd.Run(); err != nil {
+		t.Fatal(err)
+	}
+	pane := Pane{ID: "%99", PID: cmd.Process.Pid, Type: AgentCodex, Command: "sh"}
+	if err := NewClient("").ValidatePanePersistentShellContext(t.Context(), pane); err == nil {
+		t.Fatal("an exited root process was accepted as a persistent shell")
+	}
+}
+
+func TestValidatePanePersistentShellRejectsFailedObservation(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("persistent shell verification requires Linux or macOS")
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "ps"), []byte("#!/bin/sh\nexit 1\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	pane := Pane{ID: "%99", PID: os.Getpid(), Type: AgentCodex, Command: "sh"}
+	err := NewClient("").ValidatePanePersistentShellContext(t.Context(), pane)
+	if err == nil || !strings.Contains(err.Error(), "process snapshot") {
+		t.Fatalf("failed process observation was not reported: %v", err)
 	}
 }

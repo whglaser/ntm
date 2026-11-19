@@ -24,6 +24,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -39,17 +40,118 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/state"
 )
 
-var errServeTestAgentSpawnDisabled = errors.New("agent spawning disabled in serve unit tests")
+var (
+	errServeTestAgentSpawnDisabled = errors.New("agent spawning disabled in serve unit tests")
+
+	deadMailURLOnce sync.Once
+	deadMailBaseURL string
+
+	serveSchemaBootstrapOnce sync.Once
+	serveSchemaSnapshotBytes []byte
+	serveSchemaBootstrapErr  error
+)
+
+type sqliteConnSerializer interface {
+	Serialize() ([]byte, error)
+}
+
+type sqliteConnDeserializer interface {
+	Deserialize([]byte) error
+}
 
 // deadAgentMailClient returns a client whose base URL points at a closed
 // local port so every call fails immediately (agent mail disabled in serve
-// unit tests). The former transport-injection option WithHTTPClient was
-// removed as dead code.
+// unit tests). Resolving the closed port once avoids 1,500+ ephemeral TCP
+// bind/close cycles across the package test suite.
 func deadAgentMailClient(t *testing.T) *agentmail.Client {
 	t.Helper()
-	ts := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-	ts.Close()
-	return agentmail.NewClient(agentmail.WithBaseURL(ts.URL + "/"))
+	deadMailURLOnce.Do(func() {
+		ts := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+		deadMailBaseURL = ts.URL + "/"
+		ts.Close()
+	})
+	return agentmail.NewClient(agentmail.WithBaseURL(deadMailBaseURL))
+}
+
+// buildSerializedMigratedStateImage runs state.Migrate() once on an isolated
+// in-memory store and captures its binary B-tree page image via sqlite3_serialize.
+// Restoring that pre-migrated image into each test's ":memory:" connection via
+// sqlite3_deserialize (SQLITE_DESERIALIZE_RESIZEABLE|SQLITE_DESERIALIZE_FREEONCLOSE)
+// eliminates 31 incremental migration scripts, ~22 ALTER TABLE schema re-parses,
+// and 140 CREATE TABLE / CREATE INDEX statements per setupTestServer call while
+// preserving store.Path() == ":memory:", foreign_keys = ON, and 100% bit-exact
+// schema + _migrations parity.
+func buildSerializedMigratedStateImage() ([]byte, error) {
+	refStore, err := state.Open(":memory:")
+	if err != nil {
+		return nil, fmt.Errorf("open reference memory store: %w", err)
+	}
+	defer refStore.Close()
+
+	if err := refStore.Migrate(); err != nil {
+		return nil, fmt.Errorf("migrate reference memory store: %w", err)
+	}
+
+	sqlConn, err := refStore.DB().Conn(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("checkout reference sqlite conn: %w", err)
+	}
+	defer sqlConn.Close()
+
+	var snapshot []byte
+	if err := sqlConn.Raw(func(driverConn any) error {
+		ser, ok := driverConn.(sqliteConnSerializer)
+		if !ok {
+			return fmt.Errorf("sqlite driver connection %T does not implement Serialize()", driverConn)
+		}
+		var sErr error
+		snapshot, sErr = ser.Serialize()
+		return sErr
+	}); err != nil {
+		return nil, fmt.Errorf("serialize reference memory store: %w", err)
+	}
+	if len(snapshot) == 0 {
+		return nil, errors.New("serialized sqlite image is empty")
+	}
+	return snapshot, nil
+}
+
+func openFastMigratedMemoryStore(t testing.TB) *state.Store {
+	t.Helper()
+	serveSchemaBootstrapOnce.Do(func() {
+		serveSchemaSnapshotBytes, serveSchemaBootstrapErr = buildSerializedMigratedStateImage()
+	})
+	if serveSchemaBootstrapErr != nil {
+		t.Fatalf("build serialized state schema image: %v", serveSchemaBootstrapErr)
+	}
+
+	store, err := state.Open(":memory:")
+	if err != nil {
+		t.Fatalf("Failed to open store: %v", err)
+	}
+
+	sqlConn, err := store.DB().Conn(context.Background())
+	if err != nil {
+		store.Close()
+		t.Fatalf("Failed to checkout sqlite conn: %v", err)
+	}
+	rawErr := sqlConn.Raw(func(driverConn any) error {
+		deser, ok := driverConn.(sqliteConnDeserializer)
+		if !ok {
+			return fmt.Errorf("sqlite driver connection %T does not implement Deserialize()", driverConn)
+		}
+		return deser.Deserialize(serveSchemaSnapshotBytes)
+	})
+	_ = sqlConn.Close()
+	if rawErr != nil {
+		store.Close()
+		t.Fatalf("Failed to deserialize state schema image: %v", rawErr)
+	}
+	if _, err := store.DB().Exec("PRAGMA foreign_keys = ON"); err != nil {
+		store.Close()
+		t.Fatalf("Failed to enable foreign_keys on deserialized store: %v", err)
+	}
+	return store
 }
 
 // setForceReleasePolicy points HOME at a hermetic dir whose policy pins
@@ -98,16 +200,10 @@ func setupTestServer(t *testing.T) (*Server, *state.Store) {
 	t.Setenv("TMUX_TMPDIR", socketRoot)
 
 	// Most serve tests only exercise handler logic and do not need a file-backed
-	// database. Use an isolated in-memory store to avoid repeated disk-backed
-	// open+migrate cycles across the large package test suite.
-	store, err := state.Open(":memory:")
-	if err != nil {
-		t.Fatalf("Failed to open store: %v", err)
-	}
-
-	if err := store.Migrate(); err != nil {
-		t.Fatalf("Failed to migrate: %v", err)
-	}
+	// database. Use an isolated in-memory store bootstrapped from the once-built
+	// consolidated migration DDL to avoid repeating 31 incremental migrations
+	// and ~22 ALTER TABLE schema re-parses across ~1,500 tests.
+	store := openFastMigratedMemoryStore(t)
 
 	t.Cleanup(func() {
 		store.Close()
@@ -172,6 +268,82 @@ func TestSetupTestServerIsolatesTMUXAndAgentSpawn(t *testing.T) {
 	if !agentmail.IsServerUnavailable(err) {
 		t.Fatalf("agent mail health error = %v, want server unavailable", err)
 	}
+}
+
+func TestSetupTestServerConsolidatedSchemaEquivalenceAndSpeedup(t *testing.T) {
+	// 1. Verify exact schema & _migrations parity against live state.Open(":memory:") + Migrate()
+	incumbent, err := state.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open incumbent store: %v", err)
+	}
+	defer incumbent.Close()
+	if err := incumbent.Migrate(); err != nil {
+		t.Fatalf("migrate incumbent store: %v", err)
+	}
+
+	fast := openFastMigratedMemoryStore(t)
+	defer fast.Close()
+
+	// Running Migrate() on top of fast store must be a clean no-op.
+	if err := fast.Migrate(); err != nil {
+		t.Fatalf("fast.Migrate() idempotency check failed: %v", err)
+	}
+
+	dumpSchema := func(st *state.Store) string {
+		rows, qErr := st.DB().Query(`
+			SELECT type, name, tbl_name, COALESCE(sql, '')
+			FROM sqlite_master
+			WHERE name NOT LIKE 'sqlite_%'
+			ORDER BY type, name
+		`)
+		if qErr != nil {
+			t.Fatalf("query schema: %v", qErr)
+		}
+		defer rows.Close()
+		var out strings.Builder
+		for rows.Next() {
+			var typ, name, tbl, ddl string
+			if sErr := rows.Scan(&typ, &name, &tbl, &ddl); sErr != nil {
+				t.Fatalf("scan schema: %v", sErr)
+			}
+			fmt.Fprintf(&out, "%s|%s|%s|%s\n", typ, name, tbl, strings.TrimSpace(ddl))
+		}
+		return out.String()
+	}
+
+	if got, want := dumpSchema(fast), dumpSchema(incumbent); got != want {
+		t.Fatalf("consolidated schema mismatch vs incumbent Migrate():\ngot:\n%s\nwant:\n%s", got, want)
+	}
+
+	// 2. Measure incumbent vs consolidated bootstrap live in the SAME invocation.
+	const samples = 5
+	incStart := time.Now()
+	for i := 0; i < samples; i++ {
+		s, oErr := state.Open(":memory:")
+		if oErr != nil {
+			t.Fatalf("incumbent open: %v", oErr)
+		}
+		if mErr := s.Migrate(); mErr != nil {
+			s.Close()
+			t.Fatalf("incumbent migrate: %v", mErr)
+		}
+		_ = s.Close()
+	}
+	incElapsed := time.Since(incStart)
+
+	fastStart := time.Now()
+	for i := 0; i < samples; i++ {
+		s := openFastMigratedMemoryStore(t)
+		_ = s.Close()
+	}
+	fastElapsed := time.Since(fastStart)
+
+	t.Logf("setupTestServer SQLite bootstrap (%d iterations): incumbent=%s (%s/iter), consolidated=%s (%s/iter), speedup=%.2fx",
+		samples,
+		incElapsed, incElapsed/samples,
+		fastElapsed, fastElapsed/samples,
+		float64(incElapsed)/float64(max(fastElapsed, time.Nanosecond)),
+	)
 }
 
 func TestHandleAgentWaitV1ReturnsTimeoutObservation(t *testing.T) {
@@ -490,7 +662,7 @@ func TestServerProjectDirScopesMailAtStartup(t *testing.T) {
 // response code and the project_dir the response reports.
 func patchProjectDir(t *testing.T, srv *Server, rawProjectDir string) (int, string) {
 	t.Helper()
-	body := `{"allowed_origins":["http://localhost:7337"]}`
+	body := `{}`
 	if rawProjectDir != "" {
 		body = `{"project_dir":` + rawProjectDir + `}`
 	}
@@ -561,9 +733,19 @@ func TestPatchConfigResetsProjectDirToStartupValue(t *testing.T) {
 			if code, got := patchProjectDir(t, srv, string(otherJSON)); code != http.StatusOK || got != other {
 				t.Fatalf("select other project: %d %q", code, got)
 			}
-			// A PATCH that omits project_dir leaves the selection alone.
+			// A PATCH that omits project_dir leaves the selection alone (both empty
+			// body in local auth mode and unrelated field patch in authenticated mode).
 			if code, got := patchProjectDir(t, srv, ""); code != http.StatusOK || got != other {
 				t.Fatalf("PATCH without project_dir changed the project: %d %q, want %q", code, got, other)
+			}
+			srv.auth = AuthConfig{Mode: AuthModeAPIKey, APIKey: "reset-test-key"}
+			authReq := httptest.NewRequest(http.MethodPatch, "/api/v1/config", strings.NewReader(`{"allowed_origins":["http://localhost:7337"]}`))
+			authReq.Header.Set("Authorization", "Bearer reset-test-key")
+			authRec := httptest.NewRecorder()
+			srv.Router().ServeHTTP(authRec, authReq)
+			srv.auth = AuthConfig{}
+			if authRec.Code != http.StatusOK || srv.projectDirSnapshot() != other {
+				t.Fatalf("authenticated PATCH omitting project_dir = %d (project=%q), want 200 %q", authRec.Code, srv.projectDirSnapshot(), other)
 			}
 			if client, err := srv.getMailClient(); err != nil || client == nil || client.ProjectKey() != other {
 				t.Fatalf("mail client not scoped to the selected project: client=%v err=%v", client, err)
@@ -4656,7 +4838,7 @@ func TestHealthV1Endpoint(t *testing.T) {
 }
 
 func TestPerformDoctorCheckAPI_DaemonList(t *testing.T) {
-	report := performDoctorCheckAPI(context.Background())
+	report := performDoctorCheckAPIWithOptions(context.Background(), robot.DoctorOptions{})
 
 	daemonsAny, ok := report["daemons"]
 	if !ok {

@@ -342,26 +342,11 @@ func (e *Executor) SetTmuxClient(client TmuxClient) {
 	e.resetPaneMetadataLoader()
 }
 
-// SetDetector swaps the agent-state detector backing completion waits.
-// Tests use this to drive waitForIdle without a live tmux server; a nil
-// detector restores the default.
-func (e *Executor) SetDetector(detector status.Detector) {
-	if detector == nil {
-		detector = status.NewDetector()
-	}
-	e.detector = detector
-}
-
 func (e *Executor) tmuxClient() TmuxClient {
 	if e.tmux == nil {
 		return realTmuxClient{}
 	}
 	return e.tmux
-}
-
-// SetNotifier sets the notifier for sending notifications on workflow events.
-func (e *Executor) SetNotifier(n *Notifier) {
-	e.notifier = n
 }
 
 // Run executes a workflow with the given initial variables.
@@ -805,10 +790,7 @@ func (e *Executor) runOnCancelSteps(workflow *Workflow) {
 
 		if step.OutputVar != "" && result.Status == StatusCompleted {
 			e.varMu.Lock()
-			e.state.Variables[step.OutputVar] = result.Output
-			if result.ParsedData != nil {
-				e.state.Variables[step.OutputVar+"_parsed"] = result.ParsedData
-			}
+			storeOutputVar(e.state, step.OutputVar, result.Output, result.ParsedData)
 			StoreStepOutput(e.state, step.ID, result.Output, result.ParsedData)
 			e.varMu.Unlock()
 		}
@@ -931,10 +913,7 @@ func (e *Executor) executeWorkflow(ctx context.Context, workflow *Workflow) erro
 		// and downstream consumers read a status string instead of the data.
 		if step.OutputVar != "" && result.Status == StatusCompleted && !stepOwnsForeachOutputVar(step) {
 			e.varMu.Lock()
-			e.state.Variables[step.OutputVar] = result.Output
-			if result.ParsedData != nil {
-				e.state.Variables[step.OutputVar+"_parsed"] = result.ParsedData
-			}
+			storeOutputVar(e.state, step.OutputVar, result.Output, result.ParsedData)
 			StoreStepOutput(e.state, stepID, result.Output, result.ParsedData)
 			e.varMu.Unlock()
 		} else if result.Status == StatusCompleted && stepOwnsForeachOutputVar(step) {
@@ -1638,7 +1617,20 @@ func (e *Executor) executeCommand(ctx context.Context, step *Step, workflow *Wor
 			return e.completeCommandResult(step, result)
 		}
 		if prior.Result.Status == StatusCompleted && !prior.Result.RerunOnResume {
+			if prior.Reconciled && prior.Result.ParsedData == nil && step.OutputParse.Type != "" && step.OutputParse.Type != "none" {
+				return e.completeCommandResult(step, prior.Result)
+			}
 			return prior.Result
+		}
+		if prior.Reconciled && prior.Result.Status == StatusFailed && !prior.Result.RerunOnResume {
+			e.stateMu.RLock()
+			_, alreadyPublished := e.state.Steps[step.ID]
+			e.stateMu.RUnlock()
+			if !alreadyPublished {
+				prior.Reconciled = false
+				_ = e.saveCommandExecution(prior)
+				return prior.Result
+			}
 		}
 		if (!prior.Background || prior.ProcessID == 0) && prior.Result.Status == StatusFailed {
 			if delivery, pending := e.pendingOnFailureDelivery(step); pending {
@@ -1834,16 +1826,25 @@ func (e *Executor) executeCommand(ctx context.Context, step *Step, workflow *Wor
 		waitCondition = WaitCompletion
 	}
 
-	record := CommandExecutionState{
-		Version: commandExecutionVersion, StepID: step.ID, StepHash: stepHash,
-		Status: commandExecutionStarting, Background: waitCondition == WaitNone,
-		StartedAt: result.StartedAt,
-	}
 	// Explicit bounded on_cancel cleanup is allowed after storage failure
 	// (checkpointCleanupKey). Preserve that existing best-effort release path;
 	// ordinary command dispatch always requires a durable launch intent.
 	cleanupAfterCheckpointFailure, _ := ctx.Value(checkpointCleanupKey{}).(bool)
 	journalCommand := !(cleanupAfterCheckpointFailure && e.checkpointFailure() != nil)
+	var exitCodeFile string
+	if journalCommand && e.config.ProjectDir != "" && waitCondition != WaitNone {
+		exitCodeFile = stepExitReceiptPath(e.config.ProjectDir, e.state.RunID, step.ID, result.StartedAt)
+	}
+	record := CommandExecutionState{
+		Version:         commandExecutionVersion,
+		StepID:          step.ID,
+		StepHash:        stepHash,
+		Status:          commandExecutionStarting,
+		ContainmentTier: previewContainmentTier(cmdCtx),
+		ExitCodeFile:    exitCodeFile,
+		Background:      waitCondition == WaitNone,
+		StartedAt:       result.StartedAt,
+	}
 	if journalCommand {
 		if err := e.saveCommandExecution(record); err != nil {
 			result.Status, result.FinishedAt = StatusFailed, time.Now()
@@ -1876,7 +1877,16 @@ func (e *Executor) executeCommand(ctx context.Context, step *Step, workflow *Wor
 	if e.stopBeforeDispatch(cmdCtx, &result) {
 		return result
 	}
-	if err := cmd.Start(); err != nil {
+	if exitCodeFile != "" {
+		_ = os.MkdirAll(filepath.Dir(exitCodeFile), 0o700)
+	}
+	launchMeta, err := startCommandWithContainment(cmdCtx, cmd, commandStartOptions{
+		RecordLaunchMetadata: journalCommand,
+		ExitCodeFile:         exitCodeFile,
+		StepID:               step.ID,
+		StepHash:             stepHash,
+	})
+	if err != nil {
 		result.Status = StatusFailed
 		result.Error = stepRuntimeError(step, "command", "command",
 			fmt.Sprintf("start failed: %v", err),
@@ -1891,7 +1901,13 @@ func (e *Executor) executeCommand(ctx context.Context, step *Step, workflow *Wor
 		return result
 	}
 	commandSettled = false
-	record.Status, record.ProcessID = commandExecutionRunning, cmd.Process.Pid
+	record.Status = commandExecutionRunning
+	record.ProcessID = cmd.Process.Pid
+	record.LeaderPID = launchMeta.LeaderPID
+	record.LeaderStartTimeTicks = launchMeta.LeaderStartTimeTicks
+	record.ContainmentTier = launchMeta.Tier
+	record.CgroupPath = launchMeta.CgroupPath
+	record.ExitCodeFile = launchMeta.ExitCodeFile
 	if hook, _ := ctx.Value(commandStartedTestHookKey{}).(func(int)); hook != nil {
 		hook(cmd.Process.Pid)
 	}
@@ -4873,6 +4889,9 @@ func (e *Executor) snapshotState() *ExecutionState {
 	}
 	e.stateMu.RUnlock()
 
+	if e.state.TerminalVariables != nil {
+		snapshot.TerminalVariables = maps.Clone(e.state.TerminalVariables)
+	}
 	if e.state.Variables != nil {
 		snapshot.Variables = make(map[string]interface{}, len(e.state.Variables))
 		for key, value := range e.state.Variables {
@@ -5199,10 +5218,7 @@ func (e *Executor) applyStartFrom(workflow *Workflow) error {
 		if result.Output != "" || result.ParsedData != nil {
 			StoreStepOutput(e.state, id, result.Output, result.ParsedData)
 			if step, ok := e.graph.GetStep(id); ok && step.OutputVar != "" {
-				e.state.Variables[step.OutputVar] = result.Output
-				if result.ParsedData != nil {
-					e.state.Variables[step.OutputVar+"_parsed"] = result.ParsedData
-				}
+				storeOutputVar(e.state, step.OutputVar, result.Output, result.ParsedData)
 			}
 		}
 	}

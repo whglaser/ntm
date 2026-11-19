@@ -142,7 +142,7 @@ func GetEnsemble(session string) (*EnsembleOutput, error) {
 		Status:   synthesisStatus(state.Status, state.Assignments),
 	}
 
-	budget := resolveEnsembleBudget(state.PresetUsed)
+	budget := state.EffectiveBudget(resolveEnsembleBudget(state.PresetUsed))
 	output.Ensemble.Budget = EnsembleBudget{
 		TotalTokens:     budget.MaxTotalTokens,
 		SpentTokens:     0,
@@ -196,6 +196,12 @@ func GetEnsemble(session string) (*EnsembleOutput, error) {
 	output.Summary.TotalModes = len(state.Assignments)
 	output.Summary.CoreModes = coreCount
 	output.Summary.AdvancedModes = advancedCount
+
+	if collected, err := ensemble.CollectModeOutputs(state, nil); err == nil && len(collected.Outputs) >= 2 {
+		if redundancy := ensemble.AnalyzeRedundancy(collected.Outputs, catalog); redundancy != nil {
+			output.Ensemble.Metrics.RedundancyScore = redundancy.OverallScore
+		}
+	}
 
 	output.AgentHints = buildEnsembleHints(*output)
 
@@ -273,7 +279,7 @@ func synthesisStatus(status ensemble.EnsembleStatus, assignments []ensemble.Mode
 		if assignment.Status == ensemble.AssignmentError {
 			return "error"
 		}
-		if assignment.Status == ensemble.AssignmentPending || assignment.Status == ensemble.AssignmentInjecting || assignment.Status == ensemble.AssignmentActive {
+		if !assignment.Status.IsTerminal() {
 			return "not_started"
 		}
 	}

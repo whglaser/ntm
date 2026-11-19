@@ -1,19 +1,16 @@
-//go:build ensemble_experimental
-// +build ensemble_experimental
-
 // Package robot provides machine-readable output for AI agents.
 // ensemble_spawn.go implements --robot-ensemble-spawn for creating ensembles.
 package robot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/config"
@@ -21,18 +18,9 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
-// Availability markers consumed by the capabilities catalog so operators
-// learn up front (not at call time) whether this build can spawn ensembles.
-const (
-	ensembleSpawnAvailable         = true
-	ensembleSpawnUnavailableReason = ""
-)
-
 func init() {
-	// The experimental build's EnsembleSpawnOutput is list-shaped (Modes,
-	// Warnings); the stub build's output has no list fields, so this flag is
-	// declared here rather than in schema_pagination.go to keep both build
-	// flavors violation-free.
+	// EnsembleSpawnOutput is list-shaped (Modes, Warnings); register its bounded
+	// pagination exemption alongside the spawn payload definition.
 	MustRegisterSchemaPagination("ensemble_spawn", SchemaPaginationFlag{
 		Reason: "bounded: per-request spawn echo (one row per spawned mode)",
 	})
@@ -86,7 +74,10 @@ type EnsembleSpawnBudget struct {
 
 // GetEnsembleSpawn spawns a reasoning ensemble session and returns the result.
 // This function returns the data struct directly, enabling CLI/REST parity.
-func GetEnsembleSpawn(opts EnsembleSpawnOptions, cfg *config.Config) (*EnsembleSpawnOutput, error) {
+func GetEnsembleSpawn(ctx context.Context, opts EnsembleSpawnOptions, cfg *config.Config) (*EnsembleSpawnOutput, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("ensemble spawn context is required")
+	}
 	opts = applyEnsembleSpawnDefaults(opts, cfg)
 
 	output := &EnsembleSpawnOutput{
@@ -98,6 +89,11 @@ func GetEnsembleSpawn(opts EnsembleSpawnOptions, cfg *config.Config) (*EnsembleS
 		Assignment:    normalizeEnsembleAssignment(opts.Assignment),
 		Modes:         []EnsembleSpawnMode{},
 		Budget:        EnsembleSpawnBudget{},
+	}
+
+	if err := ctx.Err(); err != nil {
+		output.RobotResponse = NewErrorResponse(err, ErrCodeTimeout, "Ensemble spawn was canceled; no panes were created")
+		return output, nil
 	}
 
 	if output.Session == "" {
@@ -116,7 +112,17 @@ func GetEnsembleSpawn(opts EnsembleSpawnOptions, cfg *config.Config) (*EnsembleS
 		output.RobotResponse = NewErrorResponse(err, ErrCodeDependencyMissing, "Install tmux to spawn ensembles")
 		return output, nil
 	}
-	if tmux.SessionExists(output.Session) {
+	exists, err := tmux.SessionExistsContext(ctx, output.Session)
+	if err != nil {
+		code := ErrCodeInternalError
+		if ctx.Err() != nil {
+			err = ctx.Err()
+			code = ErrCodeTimeout
+		}
+		output.RobotResponse = NewErrorResponse(err, code, "Failed to check existing tmux sessions")
+		return output, nil
+	}
+	if exists {
 		output.RobotResponse = NewErrorResponse(
 			fmt.Errorf("session '%s' already exists", output.Session),
 			ErrCodeInvalidFlag,
@@ -262,6 +268,7 @@ func GetEnsembleSpawn(opts EnsembleSpawnOptions, cfg *config.Config) (*EnsembleS
 	if cfg == nil {
 		cfg = config.Default()
 	}
+	manager.ConfigureAgentCommands("", cfg.Agents)
 	applyEnsembleConfigOverrides(ensembleCfg, cfg.Ensemble)
 
 	if opts.NoCache {
@@ -273,26 +280,37 @@ func GetEnsembleSpawn(opts EnsembleSpawnOptions, cfg *config.Config) (*EnsembleS
 	}
 	if opts.BudgetTotal > 0 {
 		ensembleCfg.Budget.MaxTotalTokens = opts.BudgetTotal
+		if ensembleCfg.Budget.SynthesisReserveTokens+ensembleCfg.Budget.ContextReserveTokens > opts.BudgetTotal {
+			ensembleCfg.Budget.SynthesisReserveTokens = opts.BudgetTotal / 4
+			ensembleCfg.Budget.ContextReserveTokens = opts.BudgetTotal / 8
+			ensembleCfg.Synthesis.MaxSynthesisTokens = ensembleCfg.Budget.SynthesisReserveTokens
+		}
 	}
 
 	output.Budget = resolveEnsembleSpawnBudget(ensembleCfg, registry)
 
-	state, spawnErr := manager.SpawnEnsemble(context.Background(), ensembleCfg)
+	state, spawnErr := manager.SpawnEnsemble(ctx, ensembleCfg)
 	if state != nil {
 		output.Status = state.Status.String()
 		output.Modes = buildSpawnModes(state.Assignments, catalog)
 	}
 
 	if spawnErr != nil {
-		output.RobotResponse = NewErrorResponse(spawnErr, ErrCodeInternalError, "Ensemble spawn encountered errors")
+		code := ErrCodeInternalError
+		hint := "Ensemble spawn encountered errors"
+		if errors.Is(spawnErr, context.Canceled) || errors.Is(spawnErr, context.DeadlineExceeded) {
+			code = ErrCodeTimeout
+			hint = "Ensemble spawn was interrupted; inspect the preserved session before retrying"
+		}
+		output.RobotResponse = NewErrorResponse(spawnErr, code, hint)
 	}
 
 	return output, nil
 }
 
 // PrintEnsembleSpawn spawns a reasoning ensemble session and returns structured JSON.
-func PrintEnsembleSpawn(opts EnsembleSpawnOptions, cfg *config.Config) error {
-	output, err := GetEnsembleSpawn(opts, cfg)
+func PrintEnsembleSpawn(ctx context.Context, opts EnsembleSpawnOptions, cfg *config.Config) error {
+	output, err := GetEnsembleSpawn(ctx, opts, cfg)
 	if err != nil {
 		return err
 	}
@@ -336,55 +354,7 @@ func applyEnsembleSpawnDefaults(opts EnsembleSpawnOptions, cfg *config.Config) E
 }
 
 func applyEnsembleConfigOverrides(target *ensemble.EnsembleConfig, ensCfg config.EnsembleConfig) {
-	if target == nil {
-		return
-	}
-
-	if target.Synthesis.Strategy == "" && strings.TrimSpace(ensCfg.Synthesis.Strategy) != "" {
-		target.Synthesis.Strategy = ensemble.SynthesisStrategy(strings.TrimSpace(ensCfg.Synthesis.Strategy))
-	}
-	if ensCfg.Synthesis.MinConfidence > 0 {
-		target.Synthesis.MinConfidence = ensemble.Confidence(ensCfg.Synthesis.MinConfidence)
-	}
-	if ensCfg.Synthesis.MaxFindings > 0 {
-		target.Synthesis.MaxFindings = ensCfg.Synthesis.MaxFindings
-	}
-	if ensCfg.Synthesis.IncludeRawOutputs {
-		target.Synthesis.IncludeRawOutputs = true
-	}
-	if strings.TrimSpace(ensCfg.Synthesis.ConflictResolution) != "" {
-		target.Synthesis.ConflictResolution = strings.TrimSpace(ensCfg.Synthesis.ConflictResolution)
-	}
-
-	if ensCfg.Budget.Synthesis > 0 {
-		target.Budget.SynthesisReserveTokens = ensCfg.Budget.Synthesis
-	}
-	if ensCfg.Budget.ContextPack > 0 {
-		target.Budget.ContextReserveTokens = ensCfg.Budget.ContextPack
-	}
-
-	target.Cache.Enabled = ensCfg.Cache.Enabled
-	if ensCfg.Cache.TTLMinutes > 0 {
-		target.Cache.TTL = time.Duration(ensCfg.Cache.TTLMinutes) * time.Minute
-	}
-	if strings.TrimSpace(ensCfg.Cache.CacheDir) != "" {
-		target.Cache.CacheDir = config.ExpandHome(strings.TrimSpace(ensCfg.Cache.CacheDir))
-	}
-	if ensCfg.Cache.MaxEntries > 0 {
-		target.Cache.MaxEntries = ensCfg.Cache.MaxEntries
-	}
-	target.Cache.ShareAcrossModes = ensCfg.Cache.ShareAcrossModes
-	if ensCfg.Cache.CacheDir != "" || ensCfg.Cache.TTLMinutes > 0 || ensCfg.Cache.MaxEntries > 0 || !ensCfg.Cache.Enabled {
-		target.CacheOverride = true
-	}
-
-	target.EarlyStop = ensemble.EarlyStopConfig{
-		Enabled:             ensCfg.EarlyStop.Enabled,
-		MinAgentsBeforeStop: ensCfg.EarlyStop.MinAgents,
-		FindingsThreshold:   ensCfg.EarlyStop.FindingsThreshold,
-		SimilarityThreshold: ensCfg.EarlyStop.SimilarityThreshold,
-		WindowSize:          ensCfg.EarlyStop.WindowSize,
-	}
+	ensemble.ApplyTOMLConfig(target, ensCfg)
 }
 
 func resolveEnsembleSpawnBudget(cfg *ensemble.EnsembleConfig, registry *ensemble.EnsembleRegistry) EnsembleSpawnBudget {

@@ -221,7 +221,14 @@ func resolveAddAgentCommandTemplate(agentType AgentType, pluginMap map[string]pl
 	case AgentTypeCursor:
 		return cfg.Agents.Cursor, nil, nil
 	case AgentTypeWindsurf:
-		return cfg.Agents.Windsurf, nil, nil
+		configured := ""
+		if cfg != nil {
+			configured = cfg.Agents.Windsurf
+		}
+		if err := config.ValidateWindsurfTerminalHarness(configured); err != nil {
+			return "", nil, markCLIInvalidInput(err)
+		}
+		return configured, nil, nil
 	case AgentTypeAider:
 		return cfg.Agents.Aider, nil, nil
 	case AgentTypeOpencode:
@@ -374,7 +381,7 @@ func newAddCmd() *cobra.Command {
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeClaude, &agentSpecs), "cc", "Claude agents (N or N:model)")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeCodex, &agentSpecs), "cod", "Codex agents (N or N:model)")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeGemini, &agentSpecs), "gmi", "Gemini agents (N or N:model)")
-	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeAntigravity, &agentSpecs), "agy", "Antigravity (agy) agents (N; model pinned to Gemini 4 Argon (High))")
+	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeAntigravity, &agentSpecs), "agy", fmt.Sprintf("Antigravity (agy) agents (N; default model %s via [models] default_antigravity)", config.AntigravityRequiredModel))
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeGrok, &agentSpecs), "grok", "Grok Build agents (N or N:model[:effort])")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeOllama, &agentSpecs), "ollama", "Ollama agents (N or N:model)")
 	cmd.Flags().Var(NewAgentSpecsValue(AgentTypeCursor, &agentSpecs), "cursor", "Cursor agents (N or N:model)")
@@ -496,6 +503,17 @@ func executeAdd(ctx context.Context, opts AddOptions, emitResult bool) error {
 	if err := validateGrokPhaseOneAdd(opts); err != nil {
 		return outputError(err)
 	}
+	for _, spec := range opts.Agents {
+		if spec.Count > 0 && spec.Type == AgentTypeWindsurf {
+			configured := ""
+			if cfg != nil {
+				configured = cfg.Agents.Windsurf
+			}
+			if err := config.ValidateWindsurfTerminalHarness(configured); err != nil {
+				return outputError(markCLIInvalidInput(err))
+			}
+		}
+	}
 
 	if err := tmux.EnsureInstalled(); err != nil {
 		return outputError(err)
@@ -539,9 +557,10 @@ func executeAdd(ctx context.Context, opts AddOptions, emitResult bool) error {
 	}
 
 	// Initialize hook executor
+	emitHuman := emitResult && !IsJSONOutput()
 	hookExec, err := hooks.NewExecutorFromConfig()
 	if err != nil {
-		if !IsJSONOutput() {
+		if emitHuman {
 			fmt.Printf("⚠ Warning: could not load hooks config: %v\n", err)
 		}
 		hookExec = hooks.NewExecutor(nil)
@@ -554,7 +573,7 @@ func executeAdd(ctx context.Context, opts AddOptions, emitResult bool) error {
 
 	// Run pre-add hooks
 	if hookExec.HasHooksForEvent(hooks.EventPreAdd) {
-		if !IsJSONOutput() {
+		if emitHuman {
 			fmt.Println("Running pre-add hooks...")
 		}
 		results, err := hookExec.RunHooksForEvent(ctx, hooks.EventPreAdd, hookCtx)
@@ -580,13 +599,13 @@ func executeAdd(ctx context.Context, opts AddOptions, emitResult bool) error {
 	}
 	defer releaseAdmission()
 
-	if !IsJSONOutput() {
+	if emitHuman {
 		fmt.Printf("Adding %d agent(s) to session '%s'...\n", totalAgents, session)
 	}
 
 	// Auto-checkpoint before adding many agents
 	if cfg.Checkpoints.Enabled && cfg.Checkpoints.BeforeAddAgents > 0 && totalAgents >= cfg.Checkpoints.BeforeAddAgents {
-		if !IsJSONOutput() {
+		if emitHuman {
 			fmt.Println("Creating auto-checkpoint before adding agents...")
 		}
 		autoCP := checkpoint.NewAutoCheckpointer()
@@ -600,10 +619,10 @@ func executeAdd(ctx context.Context, opts AddOptions, emitResult bool) error {
 		})
 		if err != nil {
 			// Log warning but continue - auto-checkpoint is best-effort
-			if !IsJSONOutput() {
+			if emitHuman {
 				fmt.Printf("⚠ Auto-checkpoint failed: %v\n", err)
 			}
-		} else if !IsJSONOutput() {
+		} else if emitHuman {
 			fmt.Printf("✓ Auto-checkpoint created: %s\n", cp.ID)
 		}
 	}
@@ -681,7 +700,7 @@ func executeAdd(ctx context.Context, opts AddOptions, emitResult bool) error {
 
 	if needsCodexTracker {
 		rateLimitTracker = ratelimit.NewRateLimitTracker(dir)
-		if err := rateLimitTracker.LoadFromDir(dir); err != nil && !IsJSONOutput() {
+		if err := rateLimitTracker.LoadFromDir(dir); err != nil && emitHuman {
 			output.PrintWarningf("Failed to load rate limit history: %v", err)
 		}
 	}
@@ -732,7 +751,7 @@ func executeAdd(ctx context.Context, opts AddOptions, emitResult bool) error {
 				Provider:  decision.Provider,
 				Reason:    reason,
 			})
-			if !IsJSONOutput() {
+			if emitHuman {
 				output.PrintWarningf("%s", caamSeatSkipMessage(agent.Type, reason))
 			}
 			continue
@@ -799,7 +818,7 @@ func executeAdd(ctx context.Context, opts AddOptions, emitResult bool) error {
 		var claudeLaunch policy.ClaudeAgentLaunch
 		if agent.Type == AgentTypeClaude {
 			claudeLaunch = policy.ClaudeAgentLaunchSettings(cfg)
-			if !IsJSONOutput() {
+			if emitHuman {
 				for _, warning := range claudeLaunch.Warnings {
 					output.PrintWarningf("Agent %d: %s", num, warning)
 				}
@@ -864,7 +883,7 @@ func executeAdd(ctx context.Context, opts AddOptions, emitResult bool) error {
 						))
 					}
 					systemPromptFile = promptFile
-				} else if seat.TypeMismatch && !IsJSONOutput() {
+				} else if seat.TypeMismatch && emitHuman {
 					output.PrintWarningf("%s", caamSeatTypeMismatchMessage(agent.Type, seat.Persona))
 				}
 			}
@@ -890,10 +909,10 @@ func executeAdd(ctx context.Context, opts AddOptions, emitResult bool) error {
 			finalCmd = agentsession.PinPiLaunchSession(finalCmd)
 		}
 		if warning := policy.LogClaudeHooksNotApplied("add", finalCmd, claudeLaunch.Settings); warning != "" {
-			if !IsJSONOutput() {
+			if emitHuman {
 				output.PrintWarningf("Agent %d: %s", num, warning)
 			}
-		} else if len(claudeLaunch.Sources) > 0 && !IsJSONOutput() {
+		} else if len(claudeLaunch.Sources) > 0 && emitHuman {
 			output.PrintInfof("Claude hooks configured for agent %d (%s)", num, strings.Join(claudeLaunch.Sources, ", "))
 		}
 		launchSpec, err := captureAgentLaunchSpec(agent.Type, finalCmd, resolvedModel, agent.Model, personaName, resolvedReasoningEffort, systemPromptFile, envVars)
@@ -944,7 +963,7 @@ func executeAdd(ctx context.Context, opts AddOptions, emitResult bool) error {
 			var cooldown time.Duration
 			cooldown, openAICooldownWaited = codexCooldownRemaining(rateLimitTracker, openAICooldownWaited)
 			if cooldown > 0 {
-				if !IsJSONOutput() {
+				if emitHuman {
 					output.PrintWarningf("Codex cooldown active; waiting %s before launching", ratelimit.FormatDelay(cooldown))
 				}
 				if err := waitContextDelay(ctx, cooldown); err != nil {
@@ -999,7 +1018,7 @@ func executeAdd(ctx context.Context, opts AddOptions, emitResult bool) error {
 		}
 		if rateLimitTracker != nil && agent.Type == AgentTypeCodex {
 			rateLimitTracker.RecordSuccess("openai")
-			if err := rateLimitTracker.SaveToDir(dir); err != nil && !IsJSONOutput() {
+			if err := rateLimitTracker.SaveToDir(dir); err != nil && emitHuman {
 				output.PrintWarningf("Failed to persist rate limit history: %v", err)
 			}
 		}
@@ -1019,13 +1038,13 @@ func executeAdd(ctx context.Context, opts AddOptions, emitResult bool) error {
 			func() {
 				defer setupCancel()
 				if err := gemini.PostSpawnSetup(setupCtx, paneID, geminiCfg); err != nil {
-					if !IsJSONOutput() {
+					if emitHuman {
 						fmt.Printf("⚠ Warning: Gemini Pro model setup failed: %v\n", err)
 						fmt.Printf("  (Agent is running with default model. To disable auto-setup: set gemini_setup.auto_select_pro_model = false in config)\n")
 					}
 					// Don't fail spawn
 				} else {
-					if !IsJSONOutput() && cfg.GeminiSetup.Verbose {
+					if emitHuman && cfg.GeminiSetup.Verbose {
 						fmt.Printf("✓ Gemini %d configured for Pro model\n", num)
 					}
 				}
@@ -1042,7 +1061,7 @@ func executeAdd(ctx context.Context, opts AddOptions, emitResult bool) error {
 				if ctxErr := ctx.Err(); ctxErr != nil {
 					return outputError(fmt.Errorf("CASS context injection canceled: %w", ctxErr))
 				}
-				if !IsJSONOutput() {
+				if emitHuman {
 					fmt.Printf("⚠ Warning: failed to inject context: %v\n", err)
 				}
 			}
@@ -1149,18 +1168,19 @@ func executeAdd(ctx context.Context, opts AddOptions, emitResult bool) error {
 
 	// Run post-add hooks
 	if hookExec.HasHooksForEvent(hooks.EventPostAdd) {
-		if !IsJSONOutput() {
+		if emitHuman {
 			fmt.Println("Running post-add hooks...")
 		}
 		// Update context with new pane info? Optional.
 		_, _ = hookExec.RunHooksForEvent(ctx, hooks.EventPostAdd, hookCtx)
 	}
 
+	if !emitResult {
+		return nil
+	}
+
 	// JSON output mode
 	if IsJSONOutput() {
-		if !emitResult {
-			return nil
-		}
 		livePanes, err := tmux.GetPanesContext(ctx, session)
 		if err != nil {
 			return outputError(fmt.Errorf("refreshing added panes for JSON output: %w", err))

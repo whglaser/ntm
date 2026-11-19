@@ -7,9 +7,11 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/agent"
 	ntmctx "github.com/Dicklesworthstone/ntm/internal/context"
+	"github.com/Dicklesworthstone/ntm/internal/dispatch"
 	"github.com/Dicklesworthstone/ntm/internal/state"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
@@ -165,7 +167,7 @@ func TestContextUniformRobotInjectionReturnsPartialFailure(t *testing.T) {
 	t.Parallel()
 	failure := errors.New("pane unavailable")
 	panes := []tmux.Pane{{ID: "%1", Index: 1, Type: tmux.AgentClaude}, {ID: "%2", Index: 2, Type: tmux.AgentCodex}}
-	injected, err := injectContextIntoPanes(t.Context(), "demo", panes, "context", false, func(_ context.Context, pane tmux.Pane, text string) error {
+	result, err := injectContextIntoPanes(t.Context(), "demo", panes, "context", 0, false, func(_ context.Context, pane tmux.Pane, text string) error {
 		if text != "context" {
 			t.Fatalf("context payload changed: %q", text)
 		}
@@ -174,8 +176,8 @@ func TestContextUniformRobotInjectionReturnsPartialFailure(t *testing.T) {
 		}
 		return nil
 	})
-	if !errors.Is(err, failure) || !reflect.DeepEqual(injected, []int{1}) {
-		t.Fatalf("robot injection swallowed partial failure: %v, %v", injected, err)
+	if !errors.Is(err, failure) || !reflect.DeepEqual(result.PanesInjected, []int{1}) || result.Deliveries[1].Status != "uncertain" {
+		t.Fatalf("robot injection swallowed partial failure: %+v, %v", result, err)
 	}
 }
 
@@ -203,6 +205,15 @@ func packInjectionTestDeps(t *testing.T) contextInjectDeps {
 					"cm":  {Error: "cm not installed"},
 				},
 			}, nil
+		},
+		usage: func(_ context.Context, pane tmux.Pane) (*ntmctx.TranscriptUsage, bool) {
+			model := "claude-opus-4"
+			if agent.AgentType(pane.Type).Canonical() == agent.AgentTypeCodex {
+				model = "gpt-5-codex"
+			}
+			return &ntmctx.TranscriptUsage{
+				Path: "/test/" + pane.ID, Model: model, UpdatedAt: time.Now(),
+			}, true
 		},
 		send: func(context.Context, tmux.Pane, string) error { t.Fatal("unexpected send"); return nil },
 	}
@@ -447,5 +458,30 @@ func TestContextPackPersistenceCancellationPreventsWrite(t *testing.T) {
 	err := persistContextPack(ctx, store, &state.ContextPack{ID: "pack-test"})
 	if !errors.Is(err, context.Canceled) || store.writes != 0 {
 		t.Fatalf("canceled persistence mutated storage: %v writes=%d", err, store.writes)
+	}
+}
+
+func TestContextDeliveryKeepsProvenRefusalsDistinctFromUncertainWrites(t *testing.T) {
+	t.Parallel()
+	refusal := errors.New("workspace decision required")
+	var called []string
+	receipts, err := dispatchContextRequests(t.Context(), "demo", deliveryTestRequests(), false,
+		func(_ context.Context, pane tmux.Pane, _ string) error {
+			called = append(called, pane.ID)
+			if pane.ID == "%2" {
+				return dispatch.GuaranteeNoDeliveryActuation(refusal)
+			}
+			return nil
+		})
+	if !errors.Is(err, refusal) || !reflect.DeepEqual(called, []string{"%1", "%2", "%3"}) {
+		t.Fatalf("refusal lost its cause or retried independent work: called=%v error=%v", called, err)
+	}
+	if len(receipts) != 3 || receipts[0].Status != "delivered" ||
+		receipts[1].Status != "not_attempted" || receipts[1].Error == "" || receipts[2].Status != "delivered" {
+		t.Fatalf("proven preflight refusal was marked outcome-unknown: %+v", receipts)
+	}
+	result := contextInjectionResult("demo", nil, 28, false, false, receipts, err)
+	if result.Success || !reflect.DeepEqual(result.PanesInjected, []int{1, 3}) {
+		t.Fatalf("partial batch lost actual delivery outcomes: %+v", result)
 	}
 }

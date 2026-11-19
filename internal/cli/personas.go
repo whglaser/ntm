@@ -12,7 +12,9 @@ import (
 	"github.com/spf13/cobra"
 
 	agentpkg "github.com/Dicklesworthstone/ntm/internal/agent"
+	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/persona"
+	"github.com/Dicklesworthstone/ntm/internal/robot"
 	"github.com/Dicklesworthstone/ntm/internal/tui/icons"
 	"github.com/Dicklesworthstone/ntm/internal/tui/theme"
 )
@@ -32,15 +34,16 @@ Persona sources (later overrides earlier):
   3. Project: .ntm/personas.toml
 
 Examples:
-  ntm personas list              # List all personas
-  ntm personas list --json       # JSON output
-  ntm personas show architect    # Show persona details
-  ntm personas show architect --json`,
+  ntm personas list                      # List all personas
+  ntm personas list --json               # JSON output
+  ntm personas show architect            # Show persona details
+  ntm personas resolve architect coder:2 # Expand persona specs`,
 	}
 
 	cmd.AddCommand(
 		newPersonasListCmd(),
 		newPersonasShowCmd(),
+		newPersonasResolveCmd(),
 		newProfileSwitchCmd(),
 	)
 
@@ -62,60 +65,30 @@ func newPersonasListCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&filterAgent, "agent", "", "Filter by agent type alias (claude|cc, codex|cod, gemini|gmi, cursor, windsurf|ws, aider, ollama)")
+	cmd.Flags().StringVar(&filterAgent, "agent", "", "Filter by agent type alias (claude|cc, codex|cod, gemini|gmi, antigravity|agy, grok, cursor, windsurf|ws, aider, opencode|oc, omp, ollama)")
 	cmd.Flags().StringVar(&filterTag, "tag", "", "Filter by tag")
 
 	return cmd
 }
 
 func runPersonasList(filterAgent, filterTag string) error {
-	// Get project directory (current working directory)
 	cwd, _ := os.Getwd()
 
-	registry, err := persona.LoadRegistry(cwd)
+	robotOut, err := robot.GetPersonas(robot.PersonasOptions{
+		ProjectDir: cwd,
+		Agent:      filterAgent,
+		Tag:        filterTag,
+	})
 	if err != nil {
 		return err
 	}
-
-	personas := registry.List()
-
-	// Sort by name
-	sort.Slice(personas, func(i, j int) bool {
-		return personas[i].Name < personas[j].Name
-	})
-
-	// Apply filters
-	filtered := make([]*persona.Persona, 0, len(personas))
-	for _, p := range personas {
-		// Agent type filter
-		if !matchesPersonaAgentFilter(p.AgentType, filterAgent) {
-			continue
-		}
-
-		// Tag filter
-		if filterTag != "" {
-			hasTag := false
-			for _, tag := range p.Tags {
-				if strings.EqualFold(tag, filterTag) {
-					hasTag = true
-					break
-				}
-			}
-			if !hasTag {
-				continue
-			}
-		}
-
-		filtered = append(filtered, p)
+	if !robotOut.Success {
+		return fmt.Errorf("%s", robotOut.Error)
 	}
+	filtered := robotOut.Personas
+	sets := robotOut.ProfileSets
 
 	if jsonOutput {
-		// Ensure profile sets is never null in JSON output
-		sets := registry.ListSets()
-		if sets == nil {
-			sets = []*persona.PersonaSet{}
-		}
-		// Include both personas and profile sets in JSON output
 		output := struct {
 			Personas    []*persona.Persona    `json:"personas"`
 			ProfileSets []*persona.PersonaSet `json:"profile_sets"`
@@ -154,12 +127,10 @@ func runPersonasList(filterAgent, filterTag string) error {
 		)
 	}
 
-	builtinCount := len(persona.BuiltinPersonas())
-	table.WithFooter(fmt.Sprintf("  %s %d profiles (%d built-in)", ic.Info, len(filtered), builtinCount))
+	table.WithFooter(fmt.Sprintf("  %s %d profiles (%d built-in)", ic.Info, len(filtered), robotOut.BuiltinCount))
 	fmt.Print(table.Render())
 
 	// Show profile sets
-	sets := registry.ListSets()
 	if len(sets) > 0 {
 		fmt.Println()
 		renderProfileSets(sets, th, ic)
@@ -175,13 +146,6 @@ func formatAgentType(agentType string, th theme.Theme, ic icons.IconSet) string 
 	return style.Render(icon + " " + label)
 }
 
-func matchesPersonaAgentFilter(agentType, filter string) bool {
-	if strings.TrimSpace(filter) == "" {
-		return true
-	}
-	return normalizePersonaAgentType(agentType) == normalizePersonaAgentType(filter)
-}
-
 func personaAgentPresentation(agentType string, th theme.Theme, ic icons.IconSet) (string, lipgloss.Color, string) {
 	canonical := normalizePersonaAgentType(agentType)
 	switch canonical {
@@ -191,12 +155,20 @@ func personaAgentPresentation(agentType string, th theme.Theme, ic icons.IconSet
 		return ic.Codex, th.Codex, "cod"
 	case "gmi":
 		return ic.Gemini, th.Gemini, "gmi"
+	case "agy":
+		return ic.Gemini, th.Sapphire, "agy"
+	case "grok":
+		return ic.Robot, th.Peach, "grok"
 	case "cursor":
 		return ic.Cursor, th.Cursor, "cursor"
 	case "windsurf":
 		return ic.Windsurf, th.Windsurf, "windsurf"
 	case "aider":
 		return ic.Aider, th.Aider, "aider"
+	case "oc":
+		return ic.Robot, th.Opencode, "oc"
+	case "omp":
+		return ic.Robot, th.Sky, "omp"
 	case "ollama":
 		return ic.Ollama, th.Ollama, "ollama"
 	case "user":
@@ -211,7 +183,7 @@ func personaAgentPresentation(agentType string, th theme.Theme, ic icons.IconSet
 }
 
 func normalizePersonaAgentType(agentType string) string {
-	return string(agentpkg.AgentType(agentType).Canonical())
+	return robot.NormalizePersonaAgentType(agentType)
 }
 
 // renderProfileSets renders profile sets section with styling
@@ -234,12 +206,111 @@ func renderProfileSets(sets []*persona.PersonaSet, th theme.Theme, ic icons.Icon
 		}
 		desc = truncateRunes(desc, 60, "...")
 
+		var setSpecs PersonaSpecs
+		for _, entry := range s.Personas {
+			if sp, err := ParsePersonaSpec(entry); err == nil {
+				setSpecs = append(setSpecs, sp)
+			}
+		}
+		totalAgents := setSpecs.TotalCount()
+		if totalAgents == 0 {
+			totalAgents = len(s.Personas)
+		}
+
 		fmt.Printf("  %s %s %s\n",
 			nameStyle.Render(s.Name),
-			countStyle.Render(fmt.Sprintf("(%d)", len(s.Personas))),
+			countStyle.Render(fmt.Sprintf("(%d)", totalAgents)),
 			descStyle.Render(desc),
 		)
 	}
+}
+
+func newPersonasResolveCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "resolve <spec>...",
+		Short: "Expand persona specifications (e.g., architect coder:2)",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runPersonasResolve(args)
+		},
+	}
+}
+
+func runPersonasResolve(rawSpecs []string) error {
+	var specs PersonaSpecs
+	for _, raw := range rawSpecs {
+		if err := specs.Set(raw); err != nil {
+			return err
+		}
+	}
+
+	cwd, _ := os.Getwd()
+	activeCfg := cfg
+	if activeCfg == nil {
+		activeCfg = config.Default()
+	}
+
+	resolved, err := ResolvePersonas(specs, cwd)
+	if err != nil {
+		return err
+	}
+	flat := FlattenPersonas(resolved)
+	totalCount := specs.TotalCount()
+
+	type resolvedAgentRow struct {
+		Persona     string `json:"persona"`
+		AgentType   string `json:"agent_type"`
+		DisplayName string `json:"display_name"`
+		Model       string `json:"model,omitempty"`
+		Index       int    `json:"index"`
+		Configured  bool   `json:"configured"`
+	}
+
+	rows := make([]resolvedAgentRow, 0, len(flat))
+	for _, item := range flat {
+		canon := agentpkg.AgentType(item.AgentType).Canonical()
+		rows = append(rows, resolvedAgentRow{
+			Persona:     item.PersonaName,
+			AgentType:   string(canon),
+			DisplayName: canon.DisplayName(),
+			Model:       item.Model,
+			Index:       item.Index,
+			Configured:  activeCfg.IsPersonaName(item.PersonaName),
+		})
+	}
+
+	if jsonOutput {
+		return json.NewEncoder(os.Stdout).Encode(struct {
+			Spec       string             `json:"spec"`
+			TotalCount int                `json:"total_count"`
+			Agents     []resolvedAgentRow `json:"agents"`
+		}{
+			Spec:       specs.String(),
+			TotalCount: totalCount,
+			Agents:     rows,
+		})
+	}
+
+	th := theme.Current()
+	ic := icons.Current()
+	table := NewStyledTable("PERSONA", "AGENT", "DISPLAY", "MODEL", "INDEX")
+	table.WithTitle(ic.Profile + " Resolved Persona Plan")
+	for _, r := range rows {
+		model := r.Model
+		if model == "" {
+			model = "(default)"
+		}
+		table.AddRow(
+			r.Persona,
+			formatAgentType(r.AgentType, th, ic),
+			r.DisplayName,
+			model,
+			fmt.Sprintf("#%d", r.Index),
+		)
+	}
+	table.WithFooter(fmt.Sprintf("  %s %d total agent(s) from %s", ic.Info, totalCount, specs.String()))
+	fmt.Print(table.Render())
+	return nil
 }
 
 func newPersonasShowCmd() *cobra.Command {
@@ -475,6 +546,7 @@ Examples:
 	cmd.AddCommand(
 		newPersonasListCmd(),
 		newPersonasShowCmd(),
+		newPersonasResolveCmd(),
 		newProfileSwitchCmd(),
 	)
 

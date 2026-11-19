@@ -20,6 +20,8 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+
+	"github.com/Dicklesworthstone/ntm/internal/robot"
 )
 
 // ---------------------------------------------------------------------------
@@ -440,17 +442,28 @@ func TestHandleGetConfigV1(t *testing.T) {
 func TestHandlePatchConfigV1(t *testing.T) {
 	srv, _ := setupTestServer(t)
 
-	t.Run("update allowed origins", func(t *testing.T) {
+	t.Run("rejects allowed origins in local auth mode and allows in authenticated mode", func(t *testing.T) {
 		body := `{"allowed_origins":["http://new.example.com"]}`
 		req := httptest.NewRequest(http.MethodPatch, "/api/v1/config", strings.NewReader(body))
 		rec := httptest.NewRecorder()
 		srv.handlePatchConfigV1(rec, req)
 
-		if rec.Code != http.StatusOK {
-			t.Fatalf("status = %d, want 200", rec.Code)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("local auth mode status = %d, want 403 (%s)", rec.Code, rec.Body.String())
+		}
+
+		srv.auth = AuthConfig{Mode: AuthModeAPIKey, APIKey: "config-patch-test-key"}
+		t.Cleanup(func() { srv.auth = AuthConfig{} })
+
+		reqAuth := httptest.NewRequest(http.MethodPatch, "/api/v1/config", strings.NewReader(body))
+		recAuth := httptest.NewRecorder()
+		srv.handlePatchConfigV1(recAuth, reqAuth)
+
+		if recAuth.Code != http.StatusOK {
+			t.Fatalf("authenticated mode status = %d, want 200 (%s)", recAuth.Code, recAuth.Body.String())
 		}
 		var resp map[string]interface{}
-		json.NewDecoder(rec.Body).Decode(&resp)
+		json.NewDecoder(recAuth.Body).Decode(&resp)
 		if resp["updated"] != true {
 			t.Error("expected updated=true")
 		}
@@ -985,7 +998,7 @@ func TestHandleDeleteCheckpoint(t *testing.T) {
 
 func TestPerformDoctorCheckAPI(t *testing.T) {
 	ctx := context.Background()
-	report := performDoctorCheckAPI(ctx)
+	report := performDoctorCheckAPIWithOptions(ctx, robot.DoctorOptions{})
 
 	if report["timestamp"] == nil {
 		t.Error("expected timestamp in report")

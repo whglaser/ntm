@@ -172,3 +172,36 @@ func (h *Handoff) SetDefaults() {
 		"session", h.Session,
 	)
 }
+
+// ValidateAndSetDefaults combines SetDefaults and Validate for convenience.
+// Returns validation errors after setting defaults.
+func (h *Handoff) ValidateAndSetDefaults() ValidationErrors {
+	h.SetDefaults()
+	errs := h.Validate()
+
+	if len(errs) == 0 {
+		slog.Info("handoff validation passed",
+			"session", h.Session,
+			"goal", truncate(h.Goal, 50),
+			"status", h.Status,
+		)
+	}
+
+	return errs
+}
+
+// truncate shortens a string for logging purposes.
+func truncate(s string, maxLen int) string {
+	if maxLen <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= maxLen {
+		return s
+	}
+	// Need at least 4 chars to fit content + "..." (1 char + 3 for ellipsis)
+	if maxLen <= 3 {
+		return string(runes[:maxLen])
+	}
+	return string(runes[:maxLen-3]) + "..."
+}

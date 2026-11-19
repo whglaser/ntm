@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"time"
 
@@ -62,11 +63,46 @@ func (f *SynthesisFormatter) FormatResult(w io.Writer, result *SynthesisResult, 
 
 // formatJSON outputs the result as JSON.
 func (f *SynthesisFormatter) formatJSON(w io.Writer, result *SynthesisResult, audit *AuditReport) error {
+	synth := f.prepareResultForOutput(result)
+
+	type jsonSynthesisResult struct {
+		*SynthesisResult
+		Explanation   json.RawMessage `json:"explanation,omitempty"`
+		Contributions json.RawMessage `json:"contributions,omitempty"`
+	}
+
+	var encodedSynth *jsonSynthesisResult
+	if synth != nil {
+		base := *synth
+		var explRaw, contribRaw json.RawMessage
+		if synth.Explanation != nil {
+			data, err := synth.Explanation.JSON()
+			if err != nil {
+				return fmt.Errorf("marshal explanation: %w", err)
+			}
+			explRaw = json.RawMessage(data)
+			base.Explanation = nil
+		}
+		if synth.Contributions != nil {
+			data, err := synth.Contributions.JSON()
+			if err != nil {
+				return fmt.Errorf("marshal contributions: %w", err)
+			}
+			contribRaw = json.RawMessage(data)
+			base.Contributions = nil
+		}
+		encodedSynth = &jsonSynthesisResult{
+			SynthesisResult: &base,
+			Explanation:     explRaw,
+			Contributions:   contribRaw,
+		}
+	}
+
 	output := struct {
-		Synthesis *SynthesisResult `json:"synthesis"`
-		Audit     *AuditReport     `json:"audit,omitempty"`
+		Synthesis *jsonSynthesisResult `json:"synthesis"`
+		Audit     *AuditReport         `json:"audit,omitempty"`
 	}{
-		Synthesis: result,
+		Synthesis: encodedSynth,
 	}
 
 	if f.IncludeAudit && audit != nil {
@@ -80,11 +116,12 @@ func (f *SynthesisFormatter) formatJSON(w io.Writer, result *SynthesisResult, au
 
 // formatYAML outputs the result as YAML.
 func (f *SynthesisFormatter) formatYAML(w io.Writer, result *SynthesisResult, audit *AuditReport) error {
+	synth := f.prepareResultForOutput(result)
 	output := struct {
 		Synthesis *SynthesisResult `yaml:"synthesis"`
 		Audit     *AuditReport     `yaml:"audit,omitempty"`
 	}{
-		Synthesis: result,
+		Synthesis: synth,
 	}
 
 	if f.IncludeAudit && audit != nil {
@@ -94,6 +131,19 @@ func (f *SynthesisFormatter) formatYAML(w io.Writer, result *SynthesisResult, au
 	encoder := yaml.NewEncoder(w)
 	encoder.SetIndent(2)
 	return encoder.Encode(output)
+}
+
+func (f *SynthesisFormatter) prepareResultForOutput(result *SynthesisResult) *SynthesisResult {
+	if result == nil || f.IncludeRaw {
+		return result
+	}
+	if result.RawOutput == "" && len(result.RawOutputs) == 0 {
+		return result
+	}
+	sanitized := *result
+	sanitized.RawOutput = ""
+	sanitized.RawOutputs = nil
+	return &sanitized
 }
 
 // formatMarkdown outputs the result as formatted Markdown.
@@ -316,6 +366,31 @@ func (f *SynthesisFormatter) formatMarkdown(w io.Writer, result *SynthesisResult
 				}
 			}
 		}
+	}
+
+	// Raw Mode Outputs
+	if f.IncludeRaw && (len(result.RawOutputs) > 0 || result.RawOutput != "") {
+		b.WriteString("## Raw Mode Outputs\n\n")
+		if len(result.RawOutputs) > 0 {
+			modes := make([]string, 0, len(result.RawOutputs))
+			for modeID := range result.RawOutputs {
+				modes = append(modes, modeID)
+			}
+			sort.Strings(modes)
+			for _, modeID := range modes {
+				b.WriteString(fmt.Sprintf("### %s\n\n```yaml\n%s\n```\n\n", modeID, strings.TrimSpace(result.RawOutputs[modeID])))
+			}
+		}
+		if result.RawOutput != "" {
+			b.WriteString(fmt.Sprintf("### Lead Synthesizer\n\n```yaml\n%s\n```\n\n", strings.TrimSpace(result.RawOutput)))
+		}
+	}
+
+	// Redundancy & Diversity Analysis
+	if result.Redundancy != nil {
+		b.WriteString("## Mode Diversity & Redundancy\n\n")
+		b.WriteString(result.Redundancy.Render())
+		b.WriteString("\n")
 	}
 
 	// Footer

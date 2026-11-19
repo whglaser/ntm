@@ -25,9 +25,8 @@ type AccountsData struct {
 // AccountsPanel displays CAAM account status and switching information
 type AccountsPanel struct {
 	PanelBase
-	data    AccountsData
-	theme   theme.Theme
-	adapter *tools.CAAMAdapter
+	data  AccountsData
+	theme theme.Theme
 }
 
 // accountsConfig returns the configuration for the accounts panel
@@ -48,7 +47,6 @@ func NewAccountsPanel() *AccountsPanel {
 	return &AccountsPanel{
 		PanelBase: NewPanelBase(accountsConfig()),
 		theme:     theme.Current(),
-		adapter:   tools.NewCAAMAdapter(),
 	}
 }
 
@@ -193,16 +191,10 @@ func (a *AccountsPanel) View() string {
 			continue
 		}
 
-		// Provider color
-		var providerColor lipgloss.Color
-		switch strings.ToLower(provider) {
-		case "claude", "anthropic":
-			providerColor = t.Claude
-		case "openai", "gpt", "codex":
-			providerColor = t.Codex
-		case "gemini", "google":
-			providerColor = t.Gemini
-		default:
+		// Provider color via semantic palette
+		sem := t.Semantic()
+		providerColor := sem.AgentColor(semanticProviderAgentKey(provider))
+		if providerColor == sem.AgentUnknown {
 			providerColor = t.Green
 		}
 
@@ -223,7 +215,7 @@ func (a *AccountsPanel) View() string {
 		// Status indicator
 		statusStr := ""
 		if cooldownCount > 0 {
-			statusStr = lipgloss.NewStyle().Foreground(t.Yellow).Render(fmt.Sprintf(" [%d cooldown]", cooldownCount))
+			statusStr = lipgloss.NewStyle().Foreground(sem.StatusColor("warning")).Render(fmt.Sprintf(" [%d cooldown]", cooldownCount))
 		}
 
 		// Account info
@@ -298,4 +290,19 @@ func (a *AccountsPanel) View() string {
 	}
 
 	return boxStyle.Render(FitToHeight(content.String(), h-4))
+}
+
+func semanticProviderAgentKey(provider string) string {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "anthropic":
+		return "claude"
+	case "openai", "gpt":
+		return "codex"
+	case "google":
+		return "gemini"
+	case "xai":
+		return "grok"
+	default:
+		return provider
+	}
 }

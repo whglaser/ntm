@@ -88,12 +88,6 @@ type OrchestrationResult struct {
 	Errors          []error
 }
 
-// CreateSessions creates all sessions defined in the SwarmPlan.
-// It creates sessions, splits panes, sets titles, and applies tiled layout.
-func (o *SessionOrchestrator) CreateSessions(plan *SwarmPlan) (*OrchestrationResult, error) {
-	return o.CreateSessionsContext(context.Background(), plan)
-}
-
 // CreateSessionsContext preserves completed creations if cancellation interrupts
 // the workflow. Sessions and panes remain available for inspection and recovery.
 func (o *SessionOrchestrator) CreateSessionsContext(ctx context.Context, plan *SwarmPlan) (*OrchestrationResult, error) {
@@ -276,7 +270,6 @@ func (o *SessionOrchestrator) DestroySession(sessionName string) error {
 	return client.KillSession(sessionName)
 }
 
-// DestroySessions destroys all sessions created from a SwarmPlan.
 // SessionExists checks if a session with the given name exists.
 func (o *SessionOrchestrator) SessionExists(sessionName string) bool {
 	return o.tmuxClient().SessionExists(sessionName)
@@ -326,6 +319,125 @@ func (o *SessionOrchestrator) resolveTargeting(ctx context.Context, sessionName 
 
 	o.targetingCache[sessionName] = targeting
 	return targeting, nil
+}
+
+// TmuxBinaryPath returns the resolved path to the tmux binary being used.
+// This uses an explicit binary path (preferring /usr/bin/tmux) to avoid
+// issues with shell plugins that may intercept tmux commands.
+func (o *SessionOrchestrator) TmuxBinaryPath() string {
+	return tmux.BinaryPath()
+}
+
+// VerifyTmuxBinary checks if the tmux binary is accessible and functional.
+// Returns the binary path if successful, or an error if tmux is not available.
+func (o *SessionOrchestrator) VerifyTmuxBinary() (string, error) {
+	if err := tmux.EnsureInstalled(); err != nil {
+		return "", err
+	}
+	return o.TmuxBinaryPath(), nil
+}
+
+// TmuxBinaryInfo contains information about the tmux binary being used.
+type TmuxBinaryInfo struct {
+	Path      string `json:"path"`
+	Available bool   `json:"available"`
+	IsRemote  bool   `json:"is_remote"`
+}
+
+// GetTmuxBinaryInfo returns detailed information about the tmux binary configuration.
+func (o *SessionOrchestrator) GetTmuxBinaryInfo() *TmuxBinaryInfo {
+	client := o.tmuxClient()
+	isRemote := client.Remote != ""
+
+	info := &TmuxBinaryInfo{
+		Path:      o.TmuxBinaryPath(),
+		Available: tmux.IsInstalled(),
+		IsRemote:  isRemote,
+	}
+
+	return info
+}
+
+// IsRemote returns true if the orchestrator is configured for remote SSH execution.
+func (o *SessionOrchestrator) IsRemote() bool {
+	return o.tmuxClient().Remote != ""
+}
+
+// RemoteHost returns the remote host string (e.g., "user@host") if configured,
+// or an empty string if the orchestrator operates locally.
+func (o *SessionOrchestrator) RemoteHost() string {
+	return o.tmuxClient().Remote
+}
+
+// TestConnection verifies connectivity to the remote host (or local tmux).
+// For remote orchestrators, this tests SSH connectivity.
+// For local orchestrators, this verifies tmux is installed and accessible.
+// Returns nil if the connection test succeeds, or an error describing the failure.
+func (o *SessionOrchestrator) TestConnection() error {
+	client := o.tmuxClient()
+
+	if client.Remote == "" {
+		// Local: verify tmux is installed
+		if !tmux.IsInstalled() {
+			return fmt.Errorf("tmux is not installed locally")
+		}
+		return nil
+	}
+
+	// Remote: verify SSH connectivity and tmux availability
+	if !client.IsInstalled() {
+		return fmt.Errorf("cannot connect to remote host %q or tmux is not installed", client.Remote)
+	}
+	return nil
+}
+
+// VerifyRemoteTmux checks if tmux is available and functional on the target host.
+// For local orchestrators, this behaves the same as VerifyTmuxBinary.
+// For remote orchestrators, this verifies the remote tmux installation.
+// Returns the tmux version string if successful, or an error if tmux is not available.
+func (o *SessionOrchestrator) VerifyRemoteTmux() (string, error) {
+	client := o.tmuxClient()
+
+	// Get tmux version to verify it's working
+	version, err := client.Run("-V")
+	if err != nil {
+		if client.Remote != "" {
+			return "", fmt.Errorf("failed to verify tmux on remote host %q: %w", client.Remote, err)
+		}
+		return "", fmt.Errorf("failed to verify local tmux: %w", err)
+	}
+
+	return version, nil
+}
+
+// RemoteConnectionInfo contains detailed information about the remote connection.
+type RemoteConnectionInfo struct {
+	Host        string `json:"host"`            // Remote host (user@host) or empty for local
+	IsRemote    bool   `json:"is_remote"`       // Whether this is a remote connection
+	Connected   bool   `json:"connected"`       // Whether connection test succeeded
+	TmuxVersion string `json:"tmux_version"`    // tmux version string if available
+	Error       string `json:"error,omitempty"` // Error message if connection failed
+}
+
+// GetRemoteConnectionInfo returns detailed information about the remote connection status.
+// This is useful for diagnostics and status reporting.
+func (o *SessionOrchestrator) GetRemoteConnectionInfo() *RemoteConnectionInfo {
+	client := o.tmuxClient()
+	info := &RemoteConnectionInfo{
+		Host:     client.Remote,
+		IsRemote: client.Remote != "",
+	}
+
+	version, err := o.VerifyRemoteTmux()
+	if err != nil {
+		info.Connected = false
+		info.Error = err.Error()
+	} else {
+		info.Connected = true
+		info.TmuxVersion = version
+	}
+
+	return info
 }
 
 func (o *SessionOrchestrator) setPaneIdentityWithRetry(ctx context.Context, client *tmux.Client, paneID, title, agentType string) error {

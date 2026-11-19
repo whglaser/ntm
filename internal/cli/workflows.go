@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -16,42 +17,21 @@ import (
 )
 
 // WorkflowsListResult is the JSON output for workflows list command.
-type WorkflowsListResult struct {
-	Workflows []WorkflowInfo `json:"workflows"`
-	Total     int            `json:"total"`
-}
+type WorkflowsListResult = robot.WorkflowsListResult
 
 // WorkflowInfo is a workflow summary for JSON output.
-type WorkflowInfo struct {
-	Name         string `json:"name"`
-	Description  string `json:"description"`
-	Source       string `json:"source"`
-	Coordination string `json:"coordination"`
-	AgentCount   int    `json:"agent_count"`
-}
+type WorkflowInfo = robot.WorkflowInfo
+
+// WorkflowTransitionDiagnostic reports runtime trigger validation for a flow transition.
+type WorkflowTransitionDiagnostic = robot.WorkflowTransitionDiagnostic
 
 // WorkflowShowResult is the JSON output for workflows show command.
-type WorkflowShowResult struct {
-	Name          string                   `json:"name"`
-	Description   string                   `json:"description"`
-	Source        string                   `json:"source"`
-	Coordination  string                   `json:"coordination"`
-	AgentCount    int                      `json:"agent_count"`
-	Agents        []workflow.WorkflowAgent `json:"agents"`
-	Flow          *workflow.FlowConfig     `json:"flow,omitempty"`
-	Prompts       []workflow.SetupPrompt   `json:"prompts,omitempty"`
-	ErrorHandling *workflow.ErrorConfig    `json:"error_handling,omitempty"`
-}
+type WorkflowShowResult = robot.WorkflowShowResult
 
 // RobotSequenceOutput is the durable per-pane prompt-sequence response. A
 // create action returns Sequence; next and advance return Pane with the prompt
 // currently assigned to that pane.
-type RobotSequenceOutput struct {
-	robot.RobotResponse
-	Action   string                         `json:"action"`
-	Sequence *workflow.PaneSequence         `json:"sequence,omitempty"`
-	Pane     *workflow.PaneSequencePosition `json:"pane,omitempty"`
-}
+type RobotSequenceOutput = robot.SequenceOutput
 
 // robotSequenceExpectedPositionFlag is the root --sequence-expected-position
 // flag. It is looked up once in init rather than through rootCmd inside
@@ -71,57 +51,24 @@ func init() {
 }
 
 func printRobotSequence(projectDir, name, action, pane, rawSteps string) error {
-	store, err := workflow.NewPaneSequenceStore(projectDir)
-	if err != nil {
-		return err
-	}
-	action = strings.ToLower(strings.TrimSpace(action))
-	if action == "" {
-		action = "next"
-	}
-	var expectedPosition []int
+	var expectedPosition *int
 	if robotSequenceExpectedPositionFlag != nil && robotSequenceExpectedPositionFlag.Changed {
 		expected, err := strconv.Atoi(robotSequenceExpectedPositionFlag.Value.String())
 		if err != nil {
 			return fmt.Errorf("--sequence-expected-position: %w", err)
 		}
-		if expected < 0 {
-			return fmt.Errorf("--sequence-expected-position must be non-negative")
-		}
-		if action != "advance" {
-			return fmt.Errorf("--sequence-expected-position requires --sequence-action=advance")
-		}
-		expectedPosition = []int{expected}
+		expectedPosition = &expected
 	}
-	output := RobotSequenceOutput{
-		RobotResponse: robot.NewRobotResponse(true),
-		Action:        action,
-	}
-	switch action {
-	case "create":
-		var steps []string
-		if err := json.Unmarshal([]byte(rawSteps), &steps); err != nil {
-			return fmt.Errorf("decode --sequence-steps as a JSON string array: %w", err)
-		}
-		sequence, err := store.Create(name, steps)
-		if err != nil {
-			return err
-		}
-		output.Sequence = sequence
-	case "next":
-		position, err := store.Next(name, pane)
-		if err != nil {
-			return err
-		}
-		output.Pane = &position
-	case "advance":
-		position, err := store.Advance(name, pane, expectedPosition...)
-		if err != nil {
-			return err
-		}
-		output.Pane = &position
-	default:
-		return fmt.Errorf("invalid sequence action %q: use create, next, or advance", action)
+	output, err := robot.ExecuteSequence(robot.SequenceOptions{
+		ProjectDir:       projectDir,
+		Name:             name,
+		Action:           action,
+		Pane:             pane,
+		RawStepsJSON:     rawSteps,
+		ExpectedPosition: expectedPosition,
+	})
+	if err != nil {
+		return err
 	}
 	return json.NewEncoder(os.Stdout).Encode(output)
 }
@@ -167,52 +114,67 @@ Examples:
 }
 
 func newWorkflowsListCmd() *cobra.Command {
+	var roleFilter string
+
 	cmd := &cobra.Command{
 		Use:   "list",
 		Short: "List available workflow templates",
 		Long: `List all available workflow templates from all sources.
 
-Templates are shown with name, description, coordination type, and agent count.
+Templates are shown with name, description, coordination type, roles, and agent count.
 
 Examples:
-  ntm workflows list           # Human-readable table
-  ntm workflows list --json    # JSON output for scripts`,
+  ntm workflows list                  # Human-readable table
+  ntm workflows list --role=reviewer  # Filter workflows declaring a role
+  ntm workflows list --json           # JSON output for scripts`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runWorkflowsList()
+			return runWorkflowsListFiltered(roleFilter)
 		},
 	}
+
+	cmd.Flags().StringVar(&roleFilter, "role", "", "Filter workflow templates by agent role")
 
 	return cmd
 }
 
-func runWorkflowsList() error {
-	loader := workflow.NewLoader()
-	workflows, err := loader.LoadAll()
-	if err != nil {
-		if jsonOutput {
+func runWorkflowsListFiltered(roleFilter string) error {
+	if jsonOutput {
+		out, err := robot.GetWorkflows(robot.WorkflowsOptions{Role: roleFilter})
+		if err != nil {
 			return emitJSONFailureEnvelopeWithCause(map[string]interface{}{
 				"success": false,
 				"error":   err.Error(),
 			}, err)
 		}
+		if !out.Success {
+			cause := errors.New(out.Error)
+			return emitJSONFailureEnvelopeWithCause(map[string]interface{}{
+				"success": false,
+				"error":   out.Error,
+			}, cause)
+		}
+		result := WorkflowsListResult{
+			Workflows: out.Workflows,
+			Total:     len(out.Workflows),
+		}
+		return json.NewEncoder(os.Stdout).Encode(result)
+	}
+
+	loader := workflow.NewLoader()
+	workflows, err := loader.LoadAll()
+	if err != nil {
 		return err
 	}
 
-	if jsonOutput {
-		result := WorkflowsListResult{
-			Workflows: make([]WorkflowInfo, len(workflows)),
-			Total:     len(workflows),
-		}
-		for i, w := range workflows {
-			result.Workflows[i] = WorkflowInfo{
-				Name:         w.Name,
-				Description:  w.Description,
-				Source:       w.Source,
-				Coordination: string(w.Coordination),
-				AgentCount:   w.GetAgentCount(),
+	roleFilter = strings.TrimSpace(roleFilter)
+	if roleFilter != "" {
+		filtered := make([]workflow.WorkflowTemplate, 0, len(workflows))
+		for _, w := range workflows {
+			if len(w.GetAgentsByRole(roleFilter)) > 0 {
+				filtered = append(filtered, w)
 			}
 		}
-		return json.NewEncoder(os.Stdout).Encode(result)
+		workflows = filtered
 	}
 
 	if len(workflows) == 0 {
@@ -247,11 +209,17 @@ func runWorkflowsList() error {
 		fmt.Printf("  %s%s:%s\n", colorize(t.Info), sourceLabels[source], "\033[0m")
 		for _, w := range group {
 			coordIcon := coordinationIcon(w.Coordination)
+			roles := w.GetRoles()
 			fmt.Printf("    %s%-20s%s %s  %s\n",
 				colorize(t.Primary), w.Name, "\033[0m",
 				coordIcon, w.Description)
-			fmt.Printf("    %s                     [%d agents, %s]%s\n",
-				"\033[2m", w.GetAgentCount(), w.Coordination, "\033[0m")
+			if len(roles) > 0 {
+				fmt.Printf("    %s                     [%d agents, %s, roles: %s]%s\n",
+					"\033[2m", w.GetAgentCount(), w.Coordination, strings.Join(roles, ", "), "\033[0m")
+			} else {
+				fmt.Printf("    %s                     [%d agents, %s]%s\n",
+					"\033[2m", w.GetAgentCount(), w.Coordination, "\033[0m")
+			}
 		}
 		fmt.Println()
 	}
@@ -277,50 +245,63 @@ func coordinationIcon(coord workflow.CoordinationType) string {
 }
 
 func newWorkflowsShowCmd() *cobra.Command {
+	var roleFilter string
+
 	cmd := &cobra.Command{
 		Use:   "show <template-name>",
 		Short: "Show details of a workflow template",
 		Long: `Show detailed information about a specific workflow template.
 
 Examples:
-  ntm workflows show red-green        # Show red-green TDD template
+  ntm workflows show red-green              # Show red-green TDD template
+  ntm workflows show red-green --role=red   # Filter agents to a single role
   ntm workflows show review-pipeline --json`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runWorkflowsShow(args[0])
+			return runWorkflowsShowFiltered(args[0], roleFilter)
 		},
 	}
+
+	cmd.Flags().StringVar(&roleFilter, "role", "", "Filter displayed agents by role")
 
 	return cmd
 }
 
-func runWorkflowsShow(name string) error {
-	loader := workflow.NewLoader()
-	w, err := loader.Get(name)
-	if err != nil {
-		if jsonOutput {
+func runWorkflowsShowFiltered(name, roleFilter string) error {
+	if jsonOutput {
+		out, err := robot.GetWorkflows(robot.WorkflowsOptions{
+			Name: name,
+			Role: roleFilter,
+		})
+		if err != nil {
 			return emitJSONFailureEnvelopeWithCause(map[string]interface{}{
 				"success": false,
 				"error":   err.Error(),
 			}, err)
 		}
+		if !out.Success || out.Workflow == nil {
+			cause := errors.New(out.Error)
+			return emitJSONFailureEnvelopeWithCause(map[string]interface{}{
+				"success": false,
+				"error":   out.Error,
+			}, cause)
+		}
+		return json.NewEncoder(os.Stdout).Encode(out.Workflow)
+	}
+
+	loader := workflow.NewLoader()
+	w, err := loader.Get(name)
+	if err != nil {
 		return err
 	}
 
-	if jsonOutput {
-		result := WorkflowShowResult{
-			Name:          w.Name,
-			Description:   w.Description,
-			Source:        w.Source,
-			Coordination:  string(w.Coordination),
-			AgentCount:    w.GetAgentCount(),
-			Agents:        w.Agents,
-			Flow:          w.Flow,
-			Prompts:       w.Prompts,
-			ErrorHandling: w.ErrorHandling,
-		}
-		return json.NewEncoder(os.Stdout).Encode(result)
+	roles := w.GetRoles()
+	displayAgents := w.Agents
+	roleFilter = strings.TrimSpace(roleFilter)
+	if roleFilter != "" {
+		displayAgents = w.GetAgentsByRole(roleFilter)
 	}
+	triggerDiagnostics := robot.InspectWorkflowTransitions(w.Flow)
 
 	t := theme.Current()
 	fmt.Printf("%sWorkflow Template: %s%s\n", "\033[1m", w.Name, "\033[0m")
@@ -329,11 +310,14 @@ func runWorkflowsShow(name string) error {
 	fmt.Printf("  Description:  %s\n", w.Description)
 	fmt.Printf("  Source:       %s\n", workflow.SourceDescription(w.Source))
 	fmt.Printf("  Coordination: %s\n", w.Coordination)
+	if len(roles) > 0 {
+		fmt.Printf("  Roles:        %s\n", strings.Join(roles, ", "))
+	}
 	fmt.Printf("  Total Agents: %d\n\n", w.GetAgentCount())
 
 	// Agents section
 	fmt.Printf("  %sAgents:%s\n", "\033[1m", "\033[0m")
-	for _, a := range w.Agents {
+	for _, a := range displayAgents {
 		count := a.Count
 		if count == 0 {
 			count = 1
@@ -365,8 +349,11 @@ func runWorkflowsShow(name string) error {
 
 		if len(w.Flow.Transitions) > 0 {
 			fmt.Printf("    Transitions:\n")
-			for _, tr := range w.Flow.Transitions {
+			for i, tr := range w.Flow.Transitions {
 				triggerDesc := formatTrigger(tr.Trigger)
+				if i < len(triggerDiagnostics) && !triggerDiagnostics[i].Valid {
+					triggerDesc += fmt.Sprintf(" [invalid: %s]", triggerDiagnostics[i].Error)
+				}
 				fmt.Printf("      %s → %s [%s]\n", tr.From, tr.To, triggerDesc)
 			}
 		}

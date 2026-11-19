@@ -1419,6 +1419,98 @@ func TestRoundRobinAvailableEdgeCase(t *testing.T) {
 	})
 }
 
+func TestRouteWithRelaxationNoEffect(t *testing.T) {
+	router := NewRouter()
+
+	t.Run("relaxation has no effect on non-THINKING agents", func(t *testing.T) {
+		agents := []ScoredAgent{
+			{PaneID: "cc_1", State: StateGenerating, Excluded: true, ExcludeReason: "agent is currently generating"},
+		}
+
+		result := router.RouteWithRelaxation(agents, StrategyLeastLoaded, RoutingContext{})
+		// GENERATING (not THINKING) should not be relaxed
+		if result.Selected != nil {
+			t.Error("Relaxation should not affect GENERATING agents")
+		}
+	})
+}
+
+func TestRouteWithRelaxationProvenanceAndSafety(t *testing.T) {
+	router := NewRouter()
+
+	t.Run("strict selection preserves Relaxed=false and non-nil empty RelaxedConstraints", func(t *testing.T) {
+		agents := []ScoredAgent{
+			BuildRelaxableScoredAgent("%1", 1, "claude", StateWaiting, false, ""),
+		}
+		result := router.RouteWithRelaxation(agents, StrategyLeastLoaded, RoutingContext{})
+		if result.Selected == nil || result.Selected.PaneID != "%1" {
+			t.Fatalf("Selected = %+v, want %%1", result.Selected)
+		}
+		if result.Relaxed {
+			t.Fatalf("Relaxed = true, want false when strict candidate succeeded")
+		}
+		if result.RelaxedConstraints == nil || len(result.RelaxedConstraints) != 0 {
+			t.Fatalf("RelaxedConstraints = %#v, want non-nil empty slice", result.RelaxedConstraints)
+		}
+		if result.OriginalScore <= 0 || result.OriginalScore != result.RelaxedScore {
+			t.Fatalf("scores = (%v, %v), want positive identical strict scores", result.OriginalScore, result.RelaxedScore)
+		}
+	})
+
+	t.Run("thinking agent with zero excluded score is relaxed and rescored", func(t *testing.T) {
+		agents := []ScoredAgent{
+			BuildRelaxableScoredAgent("%2", 2, "claude", StateThinking, true, "not_idle"),
+		}
+		strict := router.Route(agents, StrategyLeastLoaded, RoutingContext{})
+		if strict.Selected != nil {
+			t.Fatalf("strict Route() selected excluded thinking agent: %+v", strict.Selected)
+		}
+
+		relaxed := router.RouteWithRelaxation(agents, StrategyLeastLoaded, RoutingContext{})
+		if relaxed.Selected == nil || relaxed.Selected.PaneID != "%2" {
+			t.Fatalf("RouteWithRelaxation() Selected = %+v, want %%2", relaxed.Selected)
+		}
+		if !relaxed.Relaxed {
+			t.Fatal("Relaxed = false, want true")
+		}
+		if len(relaxed.RelaxedConstraints) != 1 || relaxed.RelaxedConstraints[0] != "thinking_state" {
+			t.Fatalf("RelaxedConstraints = %#v, want [\"thinking_state\"]", relaxed.RelaxedConstraints)
+		}
+		if relaxed.OriginalScore != 0 {
+			t.Fatalf("OriginalScore = %v, want 0", relaxed.OriginalScore)
+		}
+		if relaxed.RelaxedScore <= 0 {
+			t.Fatalf("RelaxedScore = %v, want > 0", relaxed.RelaxedScore)
+		}
+	})
+
+	t.Run("unsafe thinking agents are never relaxed", func(t *testing.T) {
+		cases := []struct {
+			name   string
+			mutate func(*ScoredAgent)
+		}{
+			{name: "rate_limited", mutate: func(a *ScoredAgent) { a.RateLimited = true }},
+			{name: "unsubmitted_input", mutate: func(a *ScoredAgent) { a.UnsubmittedInput = true }},
+			{name: "queued_messages", mutate: func(a *ScoredAgent) { a.QueuedMessages = true }},
+			{name: "blocked_health", mutate: func(a *ScoredAgent) { a.HealthState = HealthBlocked }},
+			{name: "bare_shell_exit", mutate: func(a *ScoredAgent) { a.ExcludeReason = "agent CLI exited to a bare shell" }},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				agent := BuildRelaxableScoredAgent("%9", 9, "claude", StateThinking, true, "not_idle")
+				tc.mutate(&agent)
+				res := router.RouteWithRelaxation([]ScoredAgent{agent}, StrategyLeastLoaded, RoutingContext{})
+				if res.Selected != nil || res.Relaxed {
+					t.Fatalf("unsafe thinking agent relaxed (%s): %+v", tc.name, res)
+				}
+				if res.RelaxedConstraints == nil || len(res.RelaxedConstraints) != 0 {
+					t.Fatalf("RelaxedConstraints = %#v, want non-nil empty slice", res.RelaxedConstraints)
+				}
+			})
+		}
+	})
+}
+
 func TestEmptyAgentsListAllStrategies(t *testing.T) {
 	router := NewRouter()
 
@@ -2086,4 +2178,45 @@ func TestLeastRecentlyActiveIndex(t *testing.T) {
 	if got := leastRecentlyActiveIndex(withUnknown); got != 1 {
 		t.Fatalf("leastRecentlyActiveIndex = %d, want the agent with no recorded activity (1)", got)
 	}
+}
+
+// Same-package test helpers on AgentScorer.
+
+func (s *AgentScorer) SetAgentMapping(mapping map[string]string) {
+	s.agentMapping = mapping
+}
+
+func (s *AgentScorer) GetBestAgent(scored []ScoredAgent) *ScoredAgent {
+	var best *ScoredAgent
+
+	for i := range scored {
+		if scored[i].Excluded {
+			continue
+		}
+		if best == nil || scored[i].Score > best.Score {
+			best = &scored[i]
+		}
+	}
+
+	return best
+}
+
+func (s *AgentScorer) GetAvailableAgents(scored []ScoredAgent) []ScoredAgent {
+	var available []ScoredAgent
+
+	for _, agent := range scored {
+		if !agent.Excluded {
+			available = append(available, agent)
+		}
+	}
+
+	for i := 0; i < len(available); i++ {
+		for j := i + 1; j < len(available); j++ {
+			if available[j].Score > available[i].Score {
+				available[i], available[j] = available[j], available[i]
+			}
+		}
+	}
+
+	return available
 }

@@ -92,6 +92,9 @@ Examples:
 	cmd.Flags().StringVarP(&output, "output", "o", "", "Output file path (use '-' for stdout)")
 	cmd.Flags().StringVar(&format, "format", "yaml", "Output format: yaml, json, or markdown")
 	cmd.Flags().BoolVar(&includeGit, "include-git", true, "Include git state in handoff")
+	cmd.Flags().Bool("no-integrations", false, "Disable external enrichment integrations (BV, Agent Mail, CASS)")
+	cmd.Flags().StringSlice("blocker", nil, "Blocker item to record (repeatable)")
+	cmd.Flags().StringArray("decision", nil, "Key decision in key=value format (repeatable)")
 
 	return cmd
 }
@@ -273,6 +276,11 @@ func runHandoffCreate(cmd *cobra.Command, sessionName, goal, now, fromFile strin
 			TransferTTLSeconds:   transferTTLSeconds,
 			TransferGraceSeconds: 2,
 		}
+		if cmd != nil {
+			if noIntegrations, flagErr := cmd.Flags().GetBool("no-integrations"); flagErr == nil && noIntegrations {
+				opts.DisableIntegrations()
+			}
+		}
 		h, err = generator.GenerateHandoff(ctx, opts)
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return fmt.Errorf("auto-generation failed: %w", ctxErr)
@@ -310,13 +318,18 @@ func runHandoffCreate(cmd *cobra.Command, sessionName, goal, now, fromFile strin
 			}
 		}
 	}
+	if err := applyHandoffCLIMutations(cmd, h, fromFile == "" && !auto); err != nil {
+		return err
+	}
 	if err := requireLiveHandoffContext(parent, "create"); err != nil {
 		return err
 	}
 
-	// Validate
-	if errs := h.Validate(); len(errs) > 0 {
-		return fmt.Errorf("validation failed: %v", errs[0])
+	// Set defaults, compute deterministic quality report, and validate
+	h.SetDefaults()
+	h.UpdateQuality(time.Now())
+	if errs := h.ValidateAndSetDefaults(); errs.HasErrors() {
+		return formatHandoffValidationFailure(errs)
 	}
 
 	// Handle output to stdout
@@ -359,22 +372,34 @@ func runHandoffCreate(cmd *cobra.Command, sessionName, goal, now, fromFile strin
 	)
 
 	if format == "json" {
-		return outputHandoffJSON(cmd, map[string]interface{}{
+		payload := map[string]interface{}{
 			"success":       true,
 			"path":          path,
 			"session":       h.Session,
 			"goal":          h.Goal,
 			"now":           h.Now,
 			"status":        h.Status,
+			"is_complete":   h.IsComplete(),
+			"is_blocked":    h.IsBlocked(),
 			"file_count":    h.TotalFileChanges(),
 			"blocker_count": len(h.Blockers),
-		})
+		}
+		if h.Quality != nil {
+			payload["quality"] = h.Quality
+		}
+		if len(h.Warnings) > 0 {
+			payload["warnings"] = h.Warnings
+		}
+		return outputHandoffJSON(cmd, payload)
 	}
 
 	fmt.Fprintf(cmd.OutOrStdout(), "Handoff created: %s\n", path)
 	fmt.Fprintf(cmd.OutOrStdout(), "  Session: %s\n", h.Session)
 	fmt.Fprintf(cmd.OutOrStdout(), "  Goal: %s\n", truncateForDisplay(h.Goal, 70))
 	fmt.Fprintf(cmd.OutOrStdout(), "  Now: %s\n", truncateForDisplay(h.Now, 70))
+	for _, warning := range h.Warnings {
+		fmt.Fprintf(cmd.OutOrStdout(), "  Incomplete %s enrichment: %s\n", warning.Source, warning.Message)
+	}
 	return nil
 }
 
@@ -520,6 +545,14 @@ func formatHandoffMarkdown(h *handoff.Handoff) string {
 		sb.WriteString("\n")
 	}
 
+	if len(h.Warnings) > 0 {
+		sb.WriteString("## Incomplete Enrichment\n")
+		for _, warning := range h.Warnings {
+			sb.WriteString(fmt.Sprintf("- **%s:** %s\n", warning.Source, warning.Message))
+		}
+		sb.WriteString("\n")
+	}
+
 	if h.TotalFileChanges() > 0 {
 		sb.WriteString("## File Changes\n")
 		if len(h.Files.Created) > 0 {
@@ -582,7 +615,9 @@ func runInteractiveHandoff(sessionName string) (*handoff.Handoff, error) {
 	}
 	blockersStr = strings.TrimSpace(blockersStr)
 	if blockersStr != "" {
-		h.Blockers = splitAndTrim(blockersStr, ",")
+		for _, b := range splitAndTrim(blockersStr, ",") {
+			h.AddBlocker(b)
+		}
 	}
 
 	// Decisions (optional)
@@ -593,11 +628,10 @@ func runInteractiveHandoff(sessionName string) (*handoff.Handoff, error) {
 	}
 	decisionsStr = strings.TrimSpace(decisionsStr)
 	if decisionsStr != "" {
-		h.Decisions = make(map[string]string)
 		for _, kv := range splitAndTrim(decisionsStr, ",") {
 			parts := strings.SplitN(kv, "=", 2)
 			if len(parts) == 2 {
-				h.Decisions[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+				h.AddDecision(strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]))
 			}
 		}
 	}
@@ -783,6 +817,14 @@ func runHandoffShow(cmd *cobra.Command, path string, jsonFormat bool) error {
 	if h.Outcome != "" {
 		fmt.Fprintf(cmd.OutOrStdout(), "Outcome: %s\n", h.Outcome)
 	}
+	if h.IsBlocked() {
+		fmt.Fprintf(cmd.OutOrStdout(), "State: blocked (%d blocker(s))\n", len(h.Blockers))
+	} else if h.IsComplete() {
+		fmt.Fprintf(cmd.OutOrStdout(), "State: complete\n")
+	}
+	if errs := h.Validate(); errs.HasErrors() {
+		fmt.Fprintf(cmd.OutOrStdout(), "Validation Warnings (%s): %d issue(s)\n", strings.Join(errs.FieldNames(), ", "), len(errs))
+	}
 	fmt.Fprintln(cmd.OutOrStdout())
 
 	fmt.Fprintf(cmd.OutOrStdout(), "Goal: %s\n", h.Goal)
@@ -820,6 +862,13 @@ func runHandoffShow(cmd *cobra.Command, path string, jsonFormat bool) error {
 		fmt.Fprintf(cmd.OutOrStdout(), "\nFindings:\n")
 		for k, v := range h.Findings {
 			fmt.Fprintf(cmd.OutOrStdout(), "  %s: %s\n", k, v)
+		}
+	}
+
+	if len(h.Warnings) > 0 {
+		fmt.Fprintf(cmd.OutOrStdout(), "\nIncomplete Enrichment:\n")
+		for _, warning := range h.Warnings {
+			fmt.Fprintf(cmd.OutOrStdout(), "  %s: %s\n", warning.Source, warning.Message)
 		}
 	}
 
@@ -894,6 +943,67 @@ func runHandoffShow(cmd *cobra.Command, path string, jsonFormat bool) error {
 }
 
 // Helper functions
+
+func applyHandoffCLIMutations(cmd *cobra.Command, h *handoff.Handoff, inferBlockedStatus bool) error {
+	if cmd == nil || h == nil {
+		return nil
+	}
+	flags := cmd.Flags()
+	var addedBlocker bool
+	if flags.Lookup("blocker") != nil {
+		blockers, err := flags.GetStringSlice("blocker")
+		if err != nil {
+			return fmt.Errorf("read --blocker flag: %w", err)
+		}
+		for _, raw := range blockers {
+			trimmed := strings.TrimSpace(raw)
+			if trimmed == "" {
+				continue
+			}
+			h.AddBlocker(trimmed)
+			addedBlocker = true
+		}
+	}
+	if addedBlocker && inferBlockedStatus && h.Status == handoff.StatusComplete {
+		h.Status = handoff.StatusBlocked
+		h.Outcome = handoff.OutcomePartialMinus
+	}
+
+	if flags.Lookup("decision") != nil {
+		decisions, err := flags.GetStringArray("decision")
+		if err != nil {
+			return fmt.Errorf("read --decision flag: %w", err)
+		}
+		for _, raw := range decisions {
+			trimmed := strings.TrimSpace(raw)
+			if trimmed == "" {
+				continue
+			}
+			parts := strings.SplitN(trimmed, "=", 2)
+			key := strings.TrimSpace(parts[0])
+			if len(parts) != 2 || key == "" {
+				return fmt.Errorf("invalid --decision %q: expected key=value", raw)
+			}
+			h.AddDecision(key, strings.TrimSpace(parts[1]))
+		}
+	}
+	return nil
+}
+
+func formatHandoffValidationFailure(errs handoff.ValidationErrors) error {
+	seen := make(map[string]bool)
+	var parts []string
+	for _, field := range errs.FieldNames() {
+		if seen[field] {
+			continue
+		}
+		seen[field] = true
+		for _, fe := range errs.ForField(field) {
+			parts = append(parts, fe.Error())
+		}
+	}
+	return fmt.Errorf("validation failed: %s", strings.Join(parts, "; "))
+}
 
 func outputHandoffJSON(cmd *cobra.Command, v interface{}) error {
 	encoder := json.NewEncoder(cmd.OutOrStdout())

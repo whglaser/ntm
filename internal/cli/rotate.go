@@ -273,6 +273,24 @@ func newRotateStatusCmd() *cobra.Command {
 				capErr = "caam not available"
 			}
 
+			type rotateProviderStatus struct {
+				Name                string   `json:"name"`
+				SupportsReauth      bool     `json:"supports_reauth"`
+				LoginCommand        string   `json:"login_command"`
+				AuthSuccessPatterns []string `json:"auth_success_patterns,omitempty"`
+			}
+			var providers []rotateProviderStatus
+			for _, id := range []string{"claude", "codex", "gemini"} {
+				if prov := rotation.GetProvider(id); prov != nil {
+					providers = append(providers, rotateProviderStatus{
+						Name:                prov.Name(),
+						SupportsReauth:      prov.SupportsReauth(),
+						LoginCommand:        prov.LoginCommand(),
+						AuthSuccessPatterns: prov.AuthSuccessPatterns(),
+					})
+				}
+			}
+
 			if IsJSONOutput() {
 				enc := json.NewEncoder(cmd.OutOrStdout())
 				enc.SetIndent("", "  ")
@@ -281,6 +299,7 @@ func newRotateStatusCmd() *cobra.Command {
 					"caam_safe_restore":     safeRestore,
 					"global_rotation_safe":  safeRestore,
 					"safe_restore_required": true,
+					"providers":             providers,
 				}
 				if capErr != "" {
 					out["caam_capability_error"] = capErr
@@ -524,8 +543,22 @@ func executeForcedRotation(ctx context.Context, session string, paneIdx int, pan
 	if outcome == nil {
 		return fmt.Errorf("pane %s produced no lifecycle result: %s", paneID, result.Error)
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if outcome.Refused || outcome.VerificationFailed || outcome.PaneState != "present" ||
+		outcome.ProcessState == "unknown" || !outcome.ShellPreserved {
+		return fmt.Errorf("refusing to escalate or relaunch pane %s: the original shell was not verified after graceful exit (%s)", paneID, outcome.Detail)
+	}
 	if !outcome.Exited {
+		if outcome.ProcessState != "running" || outcome.ProcessIdentity == nil {
+			return fmt.Errorf("refusing to escalate pane %s without a confirmed original live process", paneID)
+		}
 		fmt.Println("  CLI did not exit gracefully; escalating to process-tree kill...")
+		opts.ExpectedPane = &tmux.Pane{
+			ID: outcome.Target, PID: outcome.ShellPID, Type: tmux.AgentType(outcome.AgentType),
+		}
+		opts.ExpectedProcesses = outcome.ProcessIdentity
 		killResult, err := robot.GetKillAgent(ctx, opts)
 		if err != nil {
 			return err
@@ -534,8 +567,15 @@ func executeForcedRotation(ctx context.Context, session string, paneIdx int, pan
 		if outcome == nil {
 			return fmt.Errorf("pane %s produced no lifecycle result: %s", paneID, killResult.Error)
 		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if outcome.Refused || outcome.VerificationFailed || outcome.PaneState != "present" ||
+			outcome.ProcessState == "unknown" || !outcome.ShellPreserved {
+			return fmt.Errorf("could not verify the original shell after process-tree kill in pane %s (%s); further recovery requires fresh inspection", paneID, outcome.Detail)
+		}
 		if !outcome.Exited {
-			return fmt.Errorf("agent process survived SIGKILL (%s); the pane may need --robot-restart-pane", outcome.Detail)
+			return fmt.Errorf("original agent process remains active after process-tree kill (%s); inspect the pane before further recovery", outcome.Detail)
 		}
 		fmt.Printf("  ✓ Killed agent process tree %v (shell preserved: %v)\n", outcome.Killed, outcome.ShellPreserved)
 	} else {
@@ -599,6 +639,9 @@ func executeReauthRotation(session string, paneIdx int, paneID, provider string,
 	// Step 2: Wait for auth completion
 	fmt.Println("\nStep 2/3: Waiting for authentication...")
 	fmt.Println("  Complete the browser authentication...")
+	if patterns := prov.AuthSuccessPatterns(); len(patterns) > 0 {
+		fmt.Printf("  Watching for auth confirmation (%s)...\n", strings.Join(patterns, " / "))
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -615,7 +658,15 @@ func executeReauthRotation(session string, paneIdx int, paneID, provider string,
 	}); err != nil {
 		return fmt.Errorf("monitoring auth: %w", err)
 	}
-	fmt.Println("  ✓ Authentication successful!")
+	if captured, captureErr := tmux.CapturePaneOutputContext(ctx, paneID, 40); captureErr == nil {
+		if matched, ok := rotation.MatchesAuthSuccess(prov, captured); ok {
+			fmt.Printf("  ✓ Authentication successful! (matched %q)\n", matched)
+		} else {
+			fmt.Println("  ✓ Authentication successful!")
+		}
+	} else {
+		fmt.Println("  ✓ Authentication successful!")
+	}
 
 	// Step 3: Send continuation prompt
 	fmt.Println("\nStep 3/3: Sending continuation prompt...")

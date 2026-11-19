@@ -112,28 +112,24 @@ func (a *UBSAdapter) Info(ctx context.Context) (*ToolInfo, error) {
 	return a.BaseAdapter.Info(ctx, a)
 }
 
-// UBS-specific methods
+// Doctor runs UBS diagnostics
+func (a *UBSAdapter) Doctor(ctx context.Context) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, a.Timeout())
+	defer cancel()
 
-// UBSFinding represents a bug or issue found by UBS
-type UBSFinding struct {
-	ID         string `json:"id,omitempty"`
-	Severity   string `json:"severity,omitempty"` // critical, high, medium, low, info
-	Category   string `json:"category,omitempty"` // security, performance, maintainability, etc.
-	File       string `json:"file,omitempty"`
-	Line       int    `json:"line,omitempty"`
-	Message    string `json:"message,omitempty"`
-	Suggestion string `json:"suggestion,omitempty"`
-	RuleID     string `json:"rule_id,omitempty"`
-}
+	cmd := exec.CommandContext(ctx, a.BinaryName(), "doctor")
+	cmd.WaitDelay = time.Second
+	stdout := NewLimitedBuffer(10 * 1024 * 1024)
+	var stderr bytes.Buffer
+	cmd.Stdout = stdout
+	cmd.Stderr = &stderr
 
-// UBSScanResult represents the result of a UBS scan
-type UBSScanResult struct {
-	Findings   []UBSFinding `json:"findings,omitempty"`
-	TotalCount int          `json:"total_count"`
-	Critical   int          `json:"critical"`
-	High       int          `json:"high"`
-	Medium     int          `json:"medium"`
-	Low        int          `json:"low"`
-	Info       int          `json:"info"`
-	ScanTime   string       `json:"scan_time,omitempty"`
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return "", ErrTimeout
+		}
+		return "", fmt.Errorf("ubs doctor failed: %w: %s", err, stderr.String())
+	}
+
+	return stdout.String(), nil
 }

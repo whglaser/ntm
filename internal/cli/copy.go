@@ -21,24 +21,23 @@ import (
 
 func newCopyCmd() *cobra.Command {
 	var (
-		last     int
-		pattern  string
-		allFlag  bool
-		ccFlag   bool
-		codFlag  bool
-		gmiFlag  bool
-		agyFlag  bool
-		codeFlag bool
-		headers  bool
-		outFile  string
-		quiet    bool
+		last      int
+		pattern   string
+		allFlag   bool
+		filter    AgentFilter
+		codeFlag  bool
+		pasteFlag bool
+		headers   bool
+		outFile   string
+		quiet     bool
 	)
 
 	cmd := &cobra.Command{
 		Use:     "copy [session[:pane]]",
 		Aliases: []string{"cp", "yank"},
-		Short:   "Copy pane output to clipboard",
-		Long: `Copy the output from one or more panes to the system clipboard.
+		Short:   "Copy pane output to clipboard (or read clipboard with --paste)",
+		Long: `Copy the output from one or more panes to the system clipboard, or read
+from the system clipboard with --paste.
 
 By default, captures the last 1000 lines from the selected pane.
 Use filters to target specific agent types.
@@ -51,7 +50,9 @@ Examples:
   ntm copy myproject --code     # Copy only code blocks
   ntm copy myproject --pattern "ERROR" # Copy lines matching regex
   ntm copy myproject:1 --last 50       # Copy specific pane by index
-  ntm copy myproject --output out.txt  # Save to file instead of clipboard`,
+  ntm copy myproject --output out.txt  # Save to file instead of clipboard
+  ntm copy --paste                     # Print current clipboard contents
+  ntm copy --paste --code              # Extract code blocks from clipboard`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var session string
@@ -65,37 +66,38 @@ Examples:
 				}
 			}
 
-			filter := AgentFilter{
-				All:         allFlag,
-				Claude:      ccFlag,
-				Codex:       codFlag,
-				Gemini:      gmiFlag,
-				Antigravity: agyFlag,
-			}
+			runFilter := filter
+			runFilter.All = allFlag
 
 			options := CopyOptions{
 				Last:     last,
 				Pattern:  pattern,
 				Code:     codeFlag,
+				Paste:    pasteFlag,
 				Headers:  headers,
 				Output:   outFile,
 				Quiet:    quiet,
 				PaneSpec: paneSelector,
 			}
 
-			return runCopy(cmd.OutOrStdout(), session, filter, options)
+			if options.Paste {
+				if len(args) > 0 {
+					return fmt.Errorf("--paste reads from the clipboard and does not accept a session argument")
+				}
+				return runPaste(cmd.OutOrStdout(), options)
+			}
+
+			return runCopy(cmd.OutOrStdout(), session, runFilter, options)
 		},
 	}
 
 	cmd.Flags().IntVarP(&last, "last", "l", 1000, "Number of most recent lines to capture")
 	cmd.Flags().StringVarP(&pattern, "pattern", "p", "", "Regex pattern to filter lines")
 	cmd.Flags().BoolVar(&codeFlag, "code", false, "Copy only code blocks")
+	cmd.Flags().BoolVar(&pasteFlag, "paste", false, "Read from system clipboard instead of tmux panes")
 	cmd.Flags().BoolVar(&headers, "headers", false, "Include pane headers (defaults off when --code is set)")
 	cmd.Flags().BoolVar(&allFlag, "all", false, "Copy from all panes")
-	cmd.Flags().BoolVar(&ccFlag, "cc", false, "Copy from Claude panes")
-	cmd.Flags().BoolVar(&codFlag, "cod", false, "Copy from Codex panes")
-	cmd.Flags().BoolVar(&gmiFlag, "gmi", false, "Copy from Gemini panes")
-	cmd.Flags().BoolVar(&agyFlag, "agy", false, "Copy from Antigravity panes")
+	bindAgentFilterFlags(cmd, &filter, "Copy from %s panes")
 	cmd.Flags().StringVarP(&outFile, "output", "o", "", "Write output to file instead of clipboard")
 	cmd.Flags().BoolVar(&quiet, "quiet", false, "Suppress confirmation output")
 	cmd.ValidArgsFunction = completeSessionColonPane
@@ -103,17 +105,77 @@ Examples:
 	return cmd
 }
 
-// AgentFilter specifies which agent types to target
+// AgentFilter specifies which agent types to target across all 11 built-in harnesses.
 type AgentFilter struct {
 	All         bool
 	Claude      bool
 	Codex       bool
 	Gemini      bool
 	Antigravity bool
+	Grok        bool
+	Cursor      bool
+	Windsurf    bool
+	Aider       bool
+	Omp         bool
+	Opencode    bool
+	Ollama      bool
+}
+
+func bindAgentFilterFlags(cmd *cobra.Command, filter *AgentFilter, descFmt string) {
+	cmd.Flags().BoolVar(&filter.Claude, "cc", false, fmt.Sprintf(descFmt, "Claude"))
+	cmd.Flags().BoolVar(&filter.Codex, "cod", false, fmt.Sprintf(descFmt, "Codex"))
+	cmd.Flags().BoolVar(&filter.Gemini, "gmi", false, fmt.Sprintf(descFmt, "Gemini"))
+	cmd.Flags().BoolVar(&filter.Antigravity, "agy", false, fmt.Sprintf(descFmt, "Antigravity"))
+	cmd.Flags().BoolVar(&filter.Grok, "grok", false, fmt.Sprintf(descFmt, "Grok Build"))
+	cmd.Flags().BoolVar(&filter.Cursor, "cursor", false, fmt.Sprintf(descFmt, "Cursor"))
+	cmd.Flags().BoolVar(&filter.Windsurf, "windsurf", false, fmt.Sprintf(descFmt, "Windsurf"))
+	cmd.Flags().BoolVar(&filter.Aider, "aider", false, fmt.Sprintf(descFmt, "Aider"))
+	cmd.Flags().BoolVar(&filter.Opencode, "oc", false, fmt.Sprintf(descFmt, "OpenCode (oc)"))
+	cmd.Flags().BoolVar(&filter.Omp, "omp", false, fmt.Sprintf(descFmt, "Oh My Pi (omp)"))
+	cmd.Flags().BoolVar(&filter.Ollama, "ollama", false, fmt.Sprintf(descFmt, "Ollama"))
 }
 
 func (f AgentFilter) IsEmpty() bool {
-	return !f.All && !f.Claude && !f.Codex && !f.Gemini && !f.Antigravity
+	return !f.All && !f.Claude && !f.Codex && !f.Gemini && !f.Antigravity &&
+		!f.Grok && !f.Cursor && !f.Windsurf && !f.Aider && !f.Omp && !f.Opencode && !f.Ollama
+}
+
+func (f AgentFilter) SelectedTypes() []string {
+	var types []string
+	if f.Claude {
+		types = append(types, "cc")
+	}
+	if f.Codex {
+		types = append(types, "cod")
+	}
+	if f.Gemini {
+		types = append(types, "gmi")
+	}
+	if f.Antigravity {
+		types = append(types, "agy")
+	}
+	if f.Grok {
+		types = append(types, "grok")
+	}
+	if f.Cursor {
+		types = append(types, "cursor")
+	}
+	if f.Windsurf {
+		types = append(types, "windsurf")
+	}
+	if f.Aider {
+		types = append(types, "aider")
+	}
+	if f.Opencode {
+		types = append(types, "oc")
+	}
+	if f.Omp {
+		types = append(types, "omp")
+	}
+	if f.Ollama {
+		types = append(types, "ollama")
+	}
+	return types
 }
 
 func (f AgentFilter) Matches(agentType tmux.AgentType) bool {
@@ -129,6 +191,20 @@ func (f AgentFilter) Matches(agentType tmux.AgentType) bool {
 		return f.Gemini
 	case tmux.AgentAntigravity:
 		return f.Antigravity
+	case tmux.AgentGrok:
+		return f.Grok
+	case tmux.AgentCursor:
+		return f.Cursor
+	case tmux.AgentWindsurf:
+		return f.Windsurf
+	case tmux.AgentAider:
+		return f.Aider
+	case tmux.AgentOmp:
+		return f.Omp
+	case tmux.AgentOpencode:
+		return f.Opencode
+	case tmux.AgentOllama:
+		return f.Ollama
 	default:
 		return false
 	}
@@ -139,6 +215,7 @@ type CopyOptions struct {
 	Last     int
 	Pattern  string
 	Code     bool
+	Paste    bool
 	Headers  bool
 	Output   string
 	Quiet    bool
@@ -154,7 +231,98 @@ type copyResult struct {
 	Pattern     string            `json:"pattern,omitempty"`
 	Code        bool              `json:"code,omitempty"`
 	OutputPath  string            `json:"output_path,omitempty"`
+	Content     string            `json:"content,omitempty"`
 	Redaction   *RedactionSummary `json:"redaction,omitempty"`
+}
+
+func runPaste(w io.Writer, opts CopyOptions) error {
+	var regex *regexp.Regexp
+	if opts.Pattern != "" {
+		var err error
+		regex, err = regexp.Compile(opts.Pattern)
+		if err != nil {
+			return fmt.Errorf("invalid pattern regex: %w", err)
+		}
+	}
+
+	clip, err := clipboard.New()
+	if err != nil {
+		return fmt.Errorf("failed to init clipboard: %w", err)
+	}
+	if !clip.Available() {
+		return fmt.Errorf("clipboard backend unavailable")
+	}
+
+	pasted, err := clip.Paste()
+	if err != nil {
+		return fmt.Errorf("failed to paste from clipboard via %s: %w", clip.Backend(), err)
+	}
+
+	filtered := filterOutput(pasted, regex, opts.Code)
+
+	redactCfg := redaction.DefaultConfig()
+	if cfg != nil {
+		redactCfg = cfg.Redaction.ToRedactionLibConfig()
+	}
+	redacted, redactionSummary, err := applyOutputRedaction(filtered, redactCfg)
+	if err != nil {
+		return err
+	}
+	if redactionSummary != nil {
+		cats := formatRedactionCategoryCounts(redactionSummary.Categories)
+		switch redactionSummary.Action {
+		case "warn":
+			fmt.Fprintf(os.Stderr, "Warning: detected %d potential secret(s) (%s); output is NOT modified (mode=warn)\n", redactionSummary.Findings, cats)
+		case "redact":
+			fmt.Fprintf(os.Stderr, "Redacted %d potential secret(s) (%s)\n", redactionSummary.Findings, cats)
+		}
+	}
+
+	trimmed := strings.TrimRight(redacted, "\n")
+	lineCount := 0
+	if trimmed != "" {
+		lineCount = strings.Count(trimmed, "\n") + 1
+	}
+
+	destination := "stdout"
+	if opts.Output != "" {
+		if err := os.MkdirAll(filepath.Dir(opts.Output), 0o755); err != nil && !os.IsExist(err) {
+			return fmt.Errorf("failed to create output directory: %w", err)
+		}
+		if err := os.WriteFile(opts.Output, []byte(redacted), 0o644); err != nil {
+			return fmt.Errorf("failed to write output file: %w", err)
+		}
+		destination = "file"
+	}
+
+	result := copyResult{
+		Source:      "clipboard",
+		Panes:       []string{},
+		Lines:       lineCount,
+		Bytes:       len(redacted),
+		Destination: destination,
+		Pattern:     opts.Pattern,
+		Code:        opts.Code,
+		OutputPath:  opts.Output,
+		Redaction:   redactionSummary,
+	}
+	if destination == "stdout" {
+		result.Content = redacted
+	}
+
+	if IsJSONOutput() {
+		return output.DefaultFormatter(true).OutputData(result, nil)
+	}
+	if destination == "file" {
+		if !opts.Quiet {
+			t := theme.Current()
+			fmt.Fprintf(w, "%s✓%s Saved %d clipboard line(s) to file (%s)\n",
+				colorize(t.Success), colorize(t.Text), lineCount, opts.Output)
+		}
+		return nil
+	}
+	_, err = io.WriteString(w, redacted)
+	return err
 }
 
 func runCopy(w io.Writer, session string, filter AgentFilter, opts CopyOptions) error {

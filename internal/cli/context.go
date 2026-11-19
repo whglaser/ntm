@@ -7,7 +7,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/spf13/cobra"
@@ -17,6 +19,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/output"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
 	"github.com/Dicklesworthstone/ntm/internal/state"
+	statuspkg "github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
@@ -32,6 +35,8 @@ func newContextCmd() *cobra.Command {
 		newContextStatsCmd(),
 		newContextClearCmd(),
 		newContextInjectCmd(),
+		newContextStatusCmd(),
+		newContextRecoverCmd(),
 	)
 
 	return cmd
@@ -39,10 +44,13 @@ func newContextCmd() *cobra.Command {
 
 func newContextBuildCmd() *cobra.Command {
 	var (
-		beadID    string
-		agentType string
-		task      string
-		files     []string
+		beadID        string
+		agentType     string
+		model         string
+		contextWindow int
+		maxTokens     int
+		task          string
+		files         []string
 	)
 
 	cmd := &cobra.Command{
@@ -53,6 +61,10 @@ func newContextBuildCmd() *cobra.Command {
 - CM rules (learned guidelines)
 - CASS history (prior solutions)
 - Native, project-confined file context
+
+Use --model to size the pack for a specific model, --context-window to
+supply its actual window, and --max-tokens to impose a smaller pack limit.
+These are standalone preparation limits; delivery checks each target again.
 
 			The context is rendered in agent-appropriate format:
 			- Claude (cc), Cursor, Windsurf, Aider: XML format
@@ -89,6 +101,9 @@ func newContextBuildCmd() *cobra.Command {
 			opts := ntmctx.BuildOptions{
 				BeadID:          beadID,
 				AgentType:       agentType,
+				Model:           model,
+				ContextWindow:   contextWindow,
+				MaxTokens:       maxTokens,
 				RepoRev:         repoRev,
 				Task:            task,
 				Files:           files,
@@ -116,6 +131,13 @@ func newContextBuildCmd() *cobra.Command {
 			fmt.Printf("Context Pack: %s\n", pack.ID)
 			fmt.Printf("Agent Type:   %s\n", pack.AgentType)
 			fmt.Printf("Token Count:  %d\n", pack.TokenCount)
+			fmt.Printf("Token Budget: %d (estimated)\n", pack.TokenBudget)
+			if pack.Model != "" {
+				fmt.Printf("Model:        %s\n", pack.Model)
+			}
+			if pack.ContextWindow > 0 {
+				fmt.Printf("Window:       %d tokens\n", pack.ContextWindow)
+			}
 			fmt.Println()
 
 			for name, comp := range pack.Components {
@@ -140,6 +162,9 @@ func newContextBuildCmd() *cobra.Command {
 
 	cmd.Flags().StringVar(&beadID, "bead", "", "Bead ID for context")
 	cmd.Flags().StringVar(&agentType, "agent", "cc", "Agent type (cc, cod, gmi, cursor, windsurf, aider)")
+	cmd.Flags().StringVar(&model, "model", "", "Model identifier for the context pack budget")
+	cmd.Flags().IntVar(&contextWindow, "context-window", 0, "Actual model context window in tokens (0 uses the registry)")
+	cmd.Flags().IntVar(&maxTokens, "max-tokens", 0, "Maximum estimated tokens in the complete pack (0 uses the model budget)")
 	cmd.Flags().StringVar(&task, "task", "", "Task description for CM context")
 	cmd.Flags().StringSliceVar(&files, "files", nil, "Project-relative files or globs to include in native source context")
 	cmd.Flags().Bool("verbose", false, "Show full rendered prompt")
@@ -266,6 +291,8 @@ type ContextInjectResult struct {
 	Truncated     bool                  `json:"truncated"`
 	PanesInjected []int                 `json:"panes_injected"`
 	Error         string                `json:"error,omitempty"`
+	ErrorCode     string                `json:"error_code,omitempty"`
+	Hint          string                `json:"hint,omitempty"`
 	DryRun        bool                  `json:"dry_run"`
 	PanesPlanned  []int                 `json:"panes_planned,omitempty"`
 	Deliveries    []ContextPaneDelivery `json:"deliveries,omitempty"`
@@ -364,17 +391,14 @@ func selectContextInjectionPanes(panes []tmux.Pane, selector string, targetAll b
 }
 
 // injectContextIntoPanes adapts the uniform-content robot injection path to
-// the same batch dispatcher used by context inject. Its error includes the
-// delivered pane IDs so a partial delivery must not be blindly replayed.
-func injectContextIntoPanes(ctx context.Context, session string, panes []tmux.Pane, content string, dryRun bool, send contextPaneSender) ([]int, error) {
-	receipts, err := dispatchContextRequests(ctx, session, uniformContextRequests(panes, content), dryRun, send)
-	injected := make([]int, 0, len(receipts))
-	for _, receipt := range receipts {
-		if receipt.Status == "delivered" || (dryRun && receipt.Status == "planned") {
-			injected = append(injected, receipt.Pane)
-		}
+// the same batch dispatcher and safe receipts used by context inject.
+func injectContextIntoPanes(ctx context.Context, session string, panes []tmux.Pane, content string, maxBytes int, dryRun bool, send contextPaneSender) (ContextInjectResult, error) {
+	requests := uniformContextRequests(panes, content)
+	for i := range requests {
+		requests[i].MaxBytes = maxBytes
 	}
-	return injected, err
+	receipts, err := dispatchContextRequests(ctx, session, requests, dryRun, send)
+	return contextInjectionResult(session, nil, len(content), false, dryRun, receipts, err), err
 }
 
 // formatContextInjectContent reads project-confined regular text files. A positive
@@ -550,11 +574,18 @@ in a single-window session or window N in a multi-window session; the selected
 window must contain exactly one pane. Use --all to include shell panes in
 file mode; context packs require agent targets.
 Use --build to assemble native source, BV triage, CM rules, and CASS history
-once per target agent type, with that agent's format and token budget.
+for each distinct target model, context window, and remaining pack budget.
+Fresh process-bound accounting limits the pack to a fraction of remaining
+space. Every target is checked again before any send. Unknown or stale usage,
+including remote occupancy, is reported with an unverified agent-default
+limit; it is never presented as an empty session or a measured fit.
 These on-demand packs are transient; use context build to store an artifact.
 Use --pack ID to send a previously built artifact to matching agent types.
-Pack modes never truncate a rendered artifact; --max-bytes rejects an
-oversized pack instead. --dry-run prepares and validates but sends no keys.
+Pack modes never truncate a rendered artifact; --max-bytes and measured
+capacity reject oversized packs. --dry-run validates but sends no keys.
+All modes apply the configured --redact policy to each complete outbound
+message before any pane is written. Redaction that exceeds a byte or context
+budget is rejected; stored packs are never modified.
 Failed sends may have partially written input: inspect uncertain receipts
 before retrying, rather than replaying the entire batch.`,
 		Args: cobra.ExactArgs(1),
@@ -585,6 +616,9 @@ before retrying, rather than replaying the entire batch.`,
 				if receipt.PackID != "" {
 					fmt.Fprintf(w, ", pack=%s", receipt.PackID)
 				}
+				if receipt.Capacity != nil {
+					fmt.Fprintf(w, ", capacity=%s, pack-limit=%d estimated tokens", receipt.Capacity.Status, receipt.Capacity.BudgetTokens)
+				}
 				fmt.Fprintln(w)
 			}
 			for _, warning := range result.Warnings {
@@ -592,6 +626,9 @@ before retrying, rather than replaying the entire batch.`,
 			}
 			if result.Truncated {
 				fmt.Fprintln(w, "  Content was truncated to fit its budget.")
+			}
+			if result.Hint != "" {
+				fmt.Fprintf(w, "  Hint: %s\n", result.Hint)
 			}
 			return err
 		},
@@ -602,7 +639,7 @@ before retrying, rather than replaying the entire batch.`,
 	cmd.Flags().BoolVar(&opts.All, "all", false, "Select all panes (pack modes require every target to be an agent)")
 	cmd.Flags().StringVar(&opts.Pane, "pane", "", "Inject to one target: N (pane/window), W.P, or %N (pane ID)")
 	cmd.Flags().BoolVar(&opts.DryRun, "dry-run", false, "Prepare and validate without sending")
-	cmd.Flags().BoolVar(&opts.Build, "build", false, "Build a fresh context pack for each target agent type")
+	cmd.Flags().BoolVar(&opts.Build, "build", false, "Build context for each target model and remaining capacity")
 	cmd.Flags().StringVar(&opts.PackID, "pack", "", "Inject a stored context pack into matching agent types")
 	cmd.Flags().StringVar(&opts.Task, "task", "", "Task description for context retrieval (requires --build)")
 	cmd.Flags().StringVar(&opts.BeadID, "bead", "", "Bead ID to include in built packs (requires --build)")
@@ -626,6 +663,12 @@ func defaultContextInjectDeps(w io.Writer) contextInjectDeps {
 		project: resolveExplicitProjectDirForSessionContext,
 		panes:   tmux.GetPanes,
 		build:   builder.Build,
+		usage: func(ctx context.Context, pane tmux.Pane) (*ntmctx.TranscriptUsage, bool) {
+			if tmux.DefaultClient.Remote != "" || pane.PID <= 0 {
+				return nil, false
+			}
+			return ntmctx.ProcessTranscriptUsage(ctx, string(agent.AgentType(pane.Type).Canonical()), pane.PID)
+		},
 		load: func(id string) (*state.ContextPack, error) {
 			store, err := state.Open("")
 			if err != nil {
@@ -740,4 +783,491 @@ func readGitRevision(gitDir, ref string) (string, error) {
 	}
 
 	return "", fmt.Errorf("git ref %q not found", ref)
+}
+
+type contextStatusOptions struct {
+	Session         string
+	Pane            string
+	WarnThreshold   float64
+	RotateThreshold float64
+}
+
+type contextStatusDeps struct {
+	resolve  func(ctx context.Context, name string) (string, error)
+	panes    func(session string) ([]tmux.Pane, error)
+	capture  func(ctx context.Context, target string, lines int) (string, error)
+	usage    func(ctx context.Context, pane tmux.Pane) (*ntmctx.TranscriptUsage, bool)
+	detector statuspkg.Detector
+}
+
+// ContextAgentStatus reports live context estimation, forecast, handoff advice,
+// and runtime state for a single agent pane.
+type ContextAgentStatus struct {
+	AgentID      string                        `json:"agent_id"`
+	PaneID       string                        `json:"pane_id"`
+	PaneIndex    int                           `json:"pane_index"`
+	AgentType    string                        `json:"agent_type"`
+	Model        string                        `json:"model,omitempty"`
+	State        string                        `json:"state,omitempty"`
+	IdleSeconds  int64                         `json:"idle_seconds,omitempty"`
+	ErrorMessage string                        `json:"error_message,omitempty"`
+	Estimate     *ntmctx.ContextEstimate       `json:"estimate,omitempty"`
+	Handoff      *ntmctx.HandoffRecommendation `json:"handoff,omitempty"`
+}
+
+// ContextStatusResult is the structured output for `ntm context status`.
+type ContextStatusResult struct {
+	Success        bool                      `json:"success"`
+	Session        string                    `json:"session"`
+	MonitoredCount int                       `json:"monitored_count"`
+	WarnThreshold  float64                   `json:"warn_threshold"`
+	RotateAt       float64                   `json:"rotate_threshold"`
+	Agents         []ContextAgentStatus      `json:"agents"`
+	AboveThreshold []ntmctx.AgentContextInfo `json:"above_threshold"`
+}
+
+func newContextStatusCmd() *cobra.Command {
+	return newContextStatusCmdWithDeps(nil)
+}
+
+func newContextStatusCmdWithDeps(deps *contextStatusDeps) *cobra.Command {
+	opts := contextStatusOptions{
+		WarnThreshold:   70.0,
+		RotateThreshold: 75.0,
+	}
+
+	cmd := &cobra.Command{
+		Use:   "status [session]",
+		Short: "Inspect live agent context window estimates, velocity forecasts, and handoff readiness",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) > 0 {
+				opts.Session = strings.TrimSpace(args[0])
+			}
+			active := deps
+			if active == nil {
+				defaults := defaultContextStatusDeps(cmd.OutOrStdout())
+				active = &defaults
+			}
+			result, err := runContextStatus(cmd.Context(), opts, *active)
+			if err != nil {
+				return err
+			}
+			if IsJSONOutput() {
+				return json.NewEncoder(cmd.OutOrStdout()).Encode(result)
+			}
+			renderContextStatusText(cmd.OutOrStdout(), result)
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&opts.Pane, "pane", "", "Inspect a single pane selector (N, W.P, or %N)")
+	cmd.Flags().Float64Var(&opts.WarnThreshold, "warn-threshold", 70.0, "Context usage warning percentage")
+	cmd.Flags().Float64Var(&opts.RotateThreshold, "rotate-threshold", 75.0, "Context usage rotation percentage")
+
+	return cmd
+}
+
+func defaultContextStatusDeps(w io.Writer) contextStatusDeps {
+	return contextStatusDeps{
+		resolve: func(ctx context.Context, name string) (string, error) {
+			if err := ctx.Err(); err != nil {
+				return "", err
+			}
+			res, err := ResolveSessionWithOptions(name, w, SessionResolveOptions{TreatAsJSON: IsJSONOutput()})
+			if err != nil {
+				return "", err
+			}
+			return res.Session, nil
+		},
+		panes:   tmux.GetPanes,
+		capture: tmux.CapturePaneOutputContext,
+		usage: func(ctx context.Context, pane tmux.Pane) (*ntmctx.TranscriptUsage, bool) {
+			if tmux.DefaultClient.Remote != "" || pane.PID <= 0 {
+				return nil, false
+			}
+			return ntmctx.ProcessTranscriptUsage(ctx, string(agent.AgentType(pane.Type).Canonical()), pane.PID)
+		},
+		detector: statuspkg.NewDetector(),
+	}
+}
+
+func runContextStatus(ctx context.Context, opts contextStatusOptions, deps contextStatusDeps) (ContextStatusResult, error) {
+	if err := ctx.Err(); err != nil {
+		return ContextStatusResult{}, err
+	}
+	session, err := deps.resolve(ctx, opts.Session)
+	if err != nil {
+		return ContextStatusResult{}, err
+	}
+	panes, err := deps.panes(session)
+	if err != nil {
+		return ContextStatusResult{}, err
+	}
+	selected, err := selectContextInjectionPanes(panes, opts.Pane, false, session)
+	if err != nil {
+		return ContextStatusResult{}, err
+	}
+
+	statusByPaneID := make(map[string]statuspkg.AgentStatus)
+	statusByName := make(map[string]statuspkg.AgentStatus)
+	if deps.detector != nil {
+		if detected, detectErr := deps.detector.DetectAll(session); detectErr == nil {
+			for _, st := range detected {
+				if st.PaneID != "" {
+					statusByPaneID[st.PaneID] = st
+				}
+				if st.PaneName != "" {
+					statusByName[st.PaneName] = st
+				}
+			}
+		}
+	}
+
+	monitor := ntmctx.NewContextMonitor(ntmctx.MonitorConfig{
+		WarningThreshold: opts.WarnThreshold,
+		RotateThreshold:  opts.RotateThreshold,
+	})
+
+	sort.Slice(selected, func(i, j int) bool {
+		if selected[i].WindowIndex != selected[j].WindowIndex {
+			return selected[i].WindowIndex < selected[j].WindowIndex
+		}
+		return selected[i].Index < selected[j].Index
+	})
+
+	type paneRef struct {
+		agentID   string
+		agentType string
+		model     string
+		pane      tmux.Pane
+	}
+	refs := make([]paneRef, 0, len(selected))
+
+	for _, pane := range selected {
+		agentID := strings.TrimSpace(pane.Title)
+		if agentID == "" {
+			agentID = fmt.Sprintf("%s_pane_%d", session, pane.Index)
+		}
+		agentType := string(agent.AgentType(pane.Type).Canonical())
+		model := strings.TrimSpace(pane.Variant)
+
+		var transcriptPath string
+		var transcriptUsage *ntmctx.TranscriptUsage
+		if deps.usage != nil {
+			if u, ok := deps.usage(ctx, pane); ok && u != nil {
+				transcriptUsage = u
+				transcriptPath = u.Path
+				if model == "" && u.Model != "" {
+					model = u.Model
+				}
+			}
+		}
+
+		monitor.RegisterAgentWithTranscript(agentID, pane.ID, model, agentType, session, transcriptPath)
+
+		var captured string
+		if deps.capture != nil && pane.ID != "" {
+			captured, _ = deps.capture(ctx, pane.ID, 60)
+		}
+
+		if captured != "" && ntmctx.ParseRobotModeContext(captured) != nil {
+			monitor.UpdateFromRobotMode(agentID, captured)
+		} else if transcriptUsage != nil && (transcriptUsage.InputTokens > 0 || transcriptUsage.OutputTokens > 0 || transcriptUsage.Tokens > 0) {
+			inTokens := int64(transcriptUsage.InputTokens + transcriptUsage.CacheReadTokens + transcriptUsage.CacheCreationTokens)
+			outTokens := int64(transcriptUsage.OutputTokens)
+			if inTokens == 0 && outTokens == 0 && transcriptUsage.Tokens > 0 {
+				inTokens = int64(transcriptUsage.Tokens)
+			}
+			monitor.RecordMessage(agentID, inTokens, outTokens)
+		} else if transcriptPath != "" {
+			_, _ = monitor.UpdateFromTranscript(agentID)
+		}
+
+		refs = append(refs, paneRef{
+			agentID:   agentID,
+			agentType: agentType,
+			model:     model,
+			pane:      pane,
+		})
+	}
+
+	allEstimates := monitor.GetAllEstimates()
+	aboveThreshold := monitor.AgentsAboveThreshold(opts.WarnThreshold)
+	if aboveThreshold == nil {
+		aboveThreshold = []ntmctx.AgentContextInfo{}
+	}
+
+	agents := make([]ContextAgentStatus, 0, len(refs))
+	for _, ref := range refs {
+		entry := ContextAgentStatus{
+			AgentID:   ref.agentID,
+			PaneID:    ref.pane.ID,
+			PaneIndex: ref.pane.Index,
+			AgentType: ref.agentType,
+			Model:     ref.model,
+			Estimate:  allEstimates[ref.agentID],
+			Handoff:   monitor.ShouldTriggerHandoff(ref.agentID, nil),
+		}
+		if st, ok := statusByPaneID[ref.pane.ID]; ok {
+			entry.State = string(st.State)
+			entry.IdleSeconds = int64(st.IdleDuration().Seconds())
+			if st.ErrorType != statuspkg.ErrorNone {
+				entry.ErrorMessage = st.ErrorType.Message()
+			}
+		} else if st, ok := statusByName[ref.agentID]; ok {
+			entry.State = string(st.State)
+			entry.IdleSeconds = int64(st.IdleDuration().Seconds())
+			if st.ErrorType != statuspkg.ErrorNone {
+				entry.ErrorMessage = st.ErrorType.Message()
+			}
+		}
+		agents = append(agents, entry)
+	}
+
+	return ContextStatusResult{
+		Success:        true,
+		Session:        session,
+		MonitoredCount: monitor.Count(),
+		WarnThreshold:  opts.WarnThreshold,
+		RotateAt:       opts.RotateThreshold,
+		Agents:         agents,
+		AboveThreshold: aboveThreshold,
+	}, nil
+}
+
+func renderContextStatusText(w io.Writer, result ContextStatusResult) {
+	fmt.Fprintf(w, "Context Status: session=%s monitored=%d above-warn=%d\n",
+		result.Session, result.MonitoredCount, len(result.AboveThreshold))
+	for _, a := range result.Agents {
+		fmt.Fprintf(w, "  Pane %d (%s) [%s]: ", a.PaneIndex, a.PaneID, a.AgentID)
+		if a.Estimate != nil {
+			fmt.Fprintf(w, "%.1f%% (%d/%d tokens, %s)",
+				a.Estimate.UsagePercent, a.Estimate.TokensUsed, a.Estimate.ContextLimit, a.Estimate.Method)
+			if a.Estimate.TokenVelocity > 0 {
+				fmt.Fprintf(w, ", velocity=%.0f tpm", a.Estimate.TokenVelocity)
+				if a.Estimate.VelocityTrend != "" {
+					fmt.Fprintf(w, " (%s)", a.Estimate.VelocityTrend)
+				}
+				if a.Estimate.MinutesToExhaustion > 0 {
+					fmt.Fprintf(w, ", eta=%.1fm", a.Estimate.MinutesToExhaustion)
+				}
+			}
+		} else {
+			fmt.Fprint(w, "no context estimate yet")
+		}
+		if a.State != "" {
+			fmt.Fprintf(w, ", state=%s", a.State)
+			if a.IdleSeconds > 0 {
+				fmt.Fprintf(w, " (idle %ds)", a.IdleSeconds)
+			}
+		}
+		if a.ErrorMessage != "" {
+			fmt.Fprintf(w, ", error=%q", a.ErrorMessage)
+		}
+		if a.Handoff != nil && (a.Handoff.ShouldTrigger || a.Handoff.ShouldWarn) {
+			fmt.Fprintf(w, " — %s", a.Handoff.Reason)
+		}
+		fmt.Fprintln(w)
+	}
+}
+
+type contextRecoverOptions struct {
+	Session  string
+	Pane     int
+	PaneID   string
+	Prompt   string
+	Cooldown time.Duration
+	NoBeads  bool
+}
+
+type contextRecoverDeps struct {
+	resolve func(ctx context.Context, name string) (string, error)
+	panes   func(session string) ([]tmux.Pane, error)
+	manager *statuspkg.RecoveryManager
+}
+
+// ContextRecoverPaneOutcome reports the recovery prompt outcome for a single pane.
+type ContextRecoverPaneOutcome struct {
+	PaneID         string `json:"pane_id"`
+	PaneIndex      int    `json:"pane_index"`
+	Sent           bool   `json:"sent"`
+	SkippedReason  string `json:"skipped_reason,omitempty"`
+	Error          string `json:"error,omitempty"`
+	RecoveryCount  int    `json:"recovery_count"`
+	LastRecoveryAt string `json:"last_recovery_at,omitempty"`
+}
+
+// ContextRecoverResult is the structured output for `ntm context recover`.
+type ContextRecoverResult struct {
+	Success  bool                        `json:"success"`
+	Session  string                      `json:"session"`
+	Outcomes []ContextRecoverPaneOutcome `json:"outcomes"`
+	Events   []statuspkg.RecoveryEvent   `json:"events"`
+}
+
+func newContextRecoverCmd() *cobra.Command {
+	return newContextRecoverCmdWithDeps(nil)
+}
+
+func newContextRecoverCmdWithDeps(deps *contextRecoverDeps) *cobra.Command {
+	opts := contextRecoverOptions{Pane: -1}
+
+	cmd := &cobra.Command{
+		Use:   "recover <session>",
+		Short: "Send a context-aware post-compaction recovery prompt to agent panes",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			opts.Session = strings.TrimSpace(args[0])
+			active := deps
+			if active == nil {
+				defaults := defaultContextRecoverDeps(cmd.OutOrStdout())
+				active = &defaults
+			}
+			result, err := runContextRecover(cmd.Context(), opts, *active)
+			if IsJSONOutput() {
+				if encErr := json.NewEncoder(cmd.OutOrStdout()).Encode(result); encErr != nil {
+					return encErr
+				}
+				if err != nil {
+					return jsonFailureExit()
+				}
+				return nil
+			}
+			for _, outcome := range result.Outcomes {
+				switch {
+				case outcome.Sent:
+					fmt.Fprintf(cmd.OutOrStdout(), "✓ Sent recovery prompt to %s (count=%d)\n", outcome.PaneID, outcome.RecoveryCount)
+				case outcome.SkippedReason != "":
+					fmt.Fprintf(cmd.OutOrStdout(), "- Skipped %s: %s\n", outcome.PaneID, outcome.SkippedReason)
+				case outcome.Error != "":
+					fmt.Fprintf(cmd.OutOrStdout(), "✗ Failed %s: %s\n", outcome.PaneID, outcome.Error)
+				}
+			}
+			return err
+		},
+	}
+
+	cmd.Flags().IntVar(&opts.Pane, "pane", -1, "Target pane index (sends to all agent panes when omitted)")
+	cmd.Flags().StringVar(&opts.PaneID, "pane-id", "", "Durable tmux pane ID (e.g. %17)")
+	cmd.Flags().StringVar(&opts.Prompt, "prompt", "", "Custom recovery prompt override")
+	cmd.Flags().DurationVar(&opts.Cooldown, "cooldown", 0, "Per-pane recovery cooldown override")
+	cmd.Flags().BoolVar(&opts.NoBeads, "no-beads", false, "Omit bead triage context from recovery prompt")
+
+	return cmd
+}
+
+func defaultContextRecoverDeps(w io.Writer) contextRecoverDeps {
+	return contextRecoverDeps{
+		resolve: func(ctx context.Context, name string) (string, error) {
+			if err := ctx.Err(); err != nil {
+				return "", err
+			}
+			res, err := ResolveSessionWithOptions(name, w, SessionResolveOptions{TreatAsJSON: IsJSONOutput()})
+			if err != nil {
+				return "", err
+			}
+			return res.Session, nil
+		},
+		panes: tmux.GetPanes,
+	}
+}
+
+func runContextRecover(ctx context.Context, opts contextRecoverOptions, deps contextRecoverDeps) (ContextRecoverResult, error) {
+	if err := ctx.Err(); err != nil {
+		return ContextRecoverResult{}, err
+	}
+	session, err := deps.resolve(ctx, opts.Session)
+	if err != nil {
+		return ContextRecoverResult{}, err
+	}
+
+	rm := deps.manager
+	if rm == nil {
+		rcfg := statuspkg.DefaultRecoveryConfig()
+		rcfg.IncludeBeadContext = !opts.NoBeads
+		rm = statuspkg.NewRecoveryManager(rcfg)
+	}
+	if opts.Prompt != "" {
+		rm.SetPrompt(opts.Prompt)
+	}
+	if opts.Cooldown > 0 {
+		rm.SetCooldown(opts.Cooldown)
+	}
+
+	var outcomes []ContextRecoverPaneOutcome
+	var firstErr error
+
+	recordOutcome := func(paneKey string, paneIdx int, sent bool, skipReason string, sendErr error) {
+		out := ContextRecoverPaneOutcome{
+			PaneID:        paneKey,
+			PaneIndex:     paneIdx,
+			Sent:          sent,
+			SkippedReason: skipReason,
+			RecoveryCount: rm.GetRecoveryCount(paneKey),
+		}
+		if sendErr != nil {
+			out.Error = sendErr.Error()
+			if firstErr == nil {
+				firstErr = sendErr
+			}
+		}
+		if last, ok := rm.GetLastRecoveryTime(paneKey); ok {
+			out.LastRecoveryAt = last.UTC().Format(time.RFC3339)
+		}
+		outcomes = append(outcomes, out)
+	}
+
+	if opts.Pane >= 0 && strings.TrimSpace(opts.PaneID) == "" {
+		paneKey := fmt.Sprintf("%s:.%d", session, opts.Pane)
+		if can, reason := rm.CanSendRecovery(paneKey); !can {
+			recordOutcome(paneKey, opts.Pane, false, reason, nil)
+		} else {
+			sent, sendErr := rm.SendRecoveryPrompt(session, opts.Pane)
+			recordOutcome(paneKey, opts.Pane, sent, "", sendErr)
+		}
+	} else {
+		panes, panesErr := deps.panes(session)
+		if panesErr != nil {
+			return ContextRecoverResult{Session: session}, panesErr
+		}
+		var targets []tmux.Pane
+		if paneID := strings.TrimSpace(opts.PaneID); paneID != "" {
+			for _, p := range panes {
+				if p.ID == paneID {
+					targets = append(targets, p)
+					break
+				}
+			}
+			if len(targets) == 0 {
+				return ContextRecoverResult{Session: session}, fmt.Errorf("pane %s not found in session %s", paneID, session)
+			}
+		} else {
+			selected, selErr := selectContextInjectionPanes(panes, "", false, session)
+			if selErr != nil {
+				return ContextRecoverResult{Session: session}, selErr
+			}
+			targets = selected
+		}
+		for _, p := range targets {
+			if can, reason := rm.CanSendRecovery(p.ID); !can {
+				recordOutcome(p.ID, p.Index, false, reason, nil)
+				continue
+			}
+			sent, sendErr := rm.SendRecoveryPromptByID(session, p.Index, p.ID, "manual")
+			recordOutcome(p.ID, p.Index, sent, "", sendErr)
+		}
+	}
+
+	events := rm.GetRecoveryEvents()
+	if events == nil {
+		events = []statuspkg.RecoveryEvent{}
+	}
+
+	return ContextRecoverResult{
+		Success:  firstErr == nil,
+		Session:  session,
+		Outcomes: outcomes,
+		Events:   events,
+	}, firstErr
 }

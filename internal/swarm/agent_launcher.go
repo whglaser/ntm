@@ -312,6 +312,12 @@ func (b *LaunchCommandBuilder) WithAgentArgs(agentType string, args []string) *L
 	return b
 }
 
+// WithLogger sets a custom logger.
+func (b *LaunchCommandBuilder) WithLogger(logger *slog.Logger) *LaunchCommandBuilder {
+	b.Logger = logger
+	return b
+}
+
 // logger returns the configured logger or the default logger.
 func (b *LaunchCommandBuilder) loggerB() *slog.Logger {
 	if b.Logger != nil {

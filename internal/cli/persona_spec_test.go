@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Dicklesworthstone/ntm/internal/robot"
 	"github.com/Dicklesworthstone/ntm/internal/tui/icons"
 	"github.com/Dicklesworthstone/ntm/internal/tui/theme"
 )
@@ -213,8 +214,8 @@ func TestMatchesPersonaAgentFilter(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := matchesPersonaAgentFilter(tt.agentType, tt.filter); got != tt.want {
-				t.Errorf("matchesPersonaAgentFilter(%q, %q) = %v, want %v", tt.agentType, tt.filter, got, tt.want)
+			if got := robot.MatchesPersonaAgentFilter(tt.agentType, tt.filter); got != tt.want {
+				t.Errorf("MatchesPersonaAgentFilter(%q, %q) = %v, want %v", tt.agentType, tt.filter, got, tt.want)
 			}
 		})
 	}
@@ -385,5 +386,22 @@ focus_patterns = ["internal/cli/**"]
 			}
 		}
 		t.Fatal("profiles command did not register switch")
+	})
+
+	t.Run("resolve expands persona counts and display names", func(t *testing.T) {
+		cmd := newProfilesCmd()
+		cmd.SilenceErrors = true
+		cmd.SilenceUsage = true
+		cmd.SetArgs([]string{"resolve", "profile-contract:2"})
+
+		output, err := captureStdout(t, cmd.Execute)
+		if err != nil {
+			t.Fatalf("profiles resolve failed: %v", err)
+		}
+		for _, want := range []string{"profile-contract", "Codex", "2 total agent(s) from profile-contract:2"} {
+			if !strings.Contains(output, want) {
+				t.Errorf("profiles resolve output = %q, want %q", output, want)
+			}
+		}
 	})
 }

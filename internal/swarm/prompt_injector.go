@@ -178,14 +178,22 @@ func (p *PromptInjector) recordSuccess(agentType string) {
 	}
 }
 
-// InjectPrompt sends a prompt to a single pane.
-// agentType is used to handle agent-specific quirks (e.g., Codex needs double-Enter).
-// This method satisfies the ensemble.BasicInjector interface.
-func (p *PromptInjector) InjectPrompt(sessionPane, agentType, prompt string) error {
-	return p.InjectPromptContext(context.Background(), sessionPane, agentType, prompt)
+// GetTemplate returns the prompt template by name.
+// Returns the default template if the name is not found.
+func (p *PromptInjector) GetTemplate(name string) string {
+	if tmpl, ok := p.Templates[name]; ok {
+		return tmpl
+	}
+	return p.Templates["default"]
 }
 
-// InjectPromptContext honors cancellation during readiness and every send.
+// SetTemplate sets a named template.
+func (p *PromptInjector) SetTemplate(name, template string) {
+	p.Templates[name] = template
+}
+
+// InjectPromptContext sends a prompt to a single pane and honors cancellation
+// during readiness and every send. This method satisfies ensemble.BasicInjector.
 func (p *PromptInjector) InjectPromptContext(ctx context.Context, sessionPane, agentType, prompt string) error {
 	if err := validatePromptInjectionTarget(InjectionTarget{SessionPane: sessionPane, AgentType: agentType}); err != nil {
 		return err
@@ -471,4 +479,104 @@ func validatePromptInjectionTarget(target InjectionTarget) error {
 		return fmt.Errorf("pane %s (%s) does not support automated prompt delivery: %w", target.SessionPane, agentType.Canonical(), err)
 	}
 	return nil
+}
+
+func (p *PromptInjector) sessionOrchestrator() *SessionOrchestrator {
+	if p.SessionOrchestrator != nil {
+		return p.SessionOrchestrator
+	}
+	return NewSessionOrchestrator()
+}
+
+// InjectSwarmWithContext sends marching orders to all panes in a SwarmPlan with context support.
+// Each pane receives the same prompt. The operation can be cancelled via context.
+func (p *PromptInjector) InjectSwarmWithContext(ctx context.Context, plan *SwarmPlan, prompt string) (*BatchInjectionResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if plan == nil {
+		return nil, fmt.Errorf("plan cannot be nil")
+	}
+
+	// Build targets from plan
+	orch := p.sessionOrchestrator()
+	var targets []InjectionTarget
+	for _, sessionSpec := range plan.Sessions {
+		targeting, err := orch.resolveTargeting(ctx, sessionSpec.Name)
+		targetingOK := err == nil
+		if err != nil {
+			p.logger().Warn("[PromptInjector] session_targeting_resolve_failed",
+				"session", sessionSpec.Name,
+				"error", err)
+		}
+
+		for _, paneSpec := range sessionSpec.Panes {
+			sessionPane := formatPaneTarget(sessionSpec.Name, paneSpec.Index)
+			if targetingOK {
+				if resolved, err := swarmPaneTargetFromPlanIndex(sessionSpec.Name, targeting, paneSpec.Index); err == nil {
+					sessionPane = resolved
+				} else {
+					p.logger().Warn("[PromptInjector] pane_target_resolve_failed",
+						"session", sessionSpec.Name,
+						"pane_index", paneSpec.Index,
+						"error", err)
+				}
+			}
+
+			target := InjectionTarget{
+				SessionPane: sessionPane,
+				AgentType:   paneSpec.AgentType,
+			}
+			targets = append(targets, target)
+		}
+	}
+
+	p.logger().Info("[PromptInjector] swarm_inject_start",
+		"total_sessions", len(plan.Sessions),
+		"total_panes", len(targets))
+
+	result, err := p.InjectBatchWithContext(ctx, targets, prompt)
+
+	p.logger().Info("[PromptInjector] swarm_inject_complete",
+		"successful", result.Successful,
+		"failed", result.Failed,
+		"duration", result.Duration)
+
+	return result, err
+}
+
+// InjectSwarmWithTemplate sends marching orders using a named template.
+func (p *PromptInjector) InjectSwarmWithTemplate(plan *SwarmPlan, templateName string) (*BatchInjectionResult, error) {
+	prompt := p.GetTemplate(templateName)
+	return p.InjectSwarmWithContext(context.Background(), plan, prompt)
+}
+
+// InjectToSessionWithContext sends a prompt to all agent panes in a session with context support.
+// It fetches pane information from tmux and sends to all non-user panes.
+func (p *PromptInjector) InjectToSessionWithContext(ctx context.Context, session, prompt string) (*BatchInjectionResult, error) {
+	client := p.tmuxClient()
+
+	panes, err := client.GetPanesContext(ctx, session)
+	if err != nil {
+		return nil, fmt.Errorf("get panes for session %q: %w", session, err)
+	}
+
+	var targets []InjectionTarget
+	for _, pane := range panes {
+		// Skip user panes
+		if pane.Type == tmux.AgentUser {
+			continue
+		}
+
+		targets = append(targets, InjectionTarget{
+			SessionPane: pane.ID,
+			AgentType:   string(pane.Type),
+		})
+	}
+
+	p.logger().Info("[PromptInjector] session_inject_start",
+		"session", session,
+		"agent_panes", len(targets))
+
+	return p.InjectBatchWithContext(ctx, targets, prompt)
 }

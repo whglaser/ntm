@@ -11,6 +11,7 @@ import (
 
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
 	"github.com/Dicklesworthstone/ntm/internal/hooks"
+	"github.com/Dicklesworthstone/ntm/internal/robot"
 	"github.com/Dicklesworthstone/ntm/internal/tui/theme"
 )
 
@@ -61,8 +62,11 @@ func newHooksInstallCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "install [hook-type]",
 		Short: "Install a git hook",
-		Long: `Install a git hook. Currently supports:
-  - pre-commit: Syncs beads (if available) and runs UBS on staged files
+		Long: `Install a git hook. Supported hook types:
+  - pre-commit: Syncs beads (if available), checks Agent Mail reservations, and runs UBS on staged files
+  - pre-push: Checks Agent Mail reservations, beads dependency cycles, uncommitted .beads, and optional NTM_MAIN_ONLY=1
+  - commit-msg: Validates non-empty message, merge-conflict markers, subject length, and optional NTM_CONVENTIONAL_COMMITS=1
+  - post-commit: Warns when uncommitted .beads changes remain after commit
   - post-checkout: Warns when .beads has uncommitted changes
 
 If no hook type is specified, installs pre-commit.`,
@@ -212,43 +216,36 @@ func newHooksStatusCmd() *cobra.Command {
 func runHooksStatus() error {
 	t := theme.Current()
 
-	mgr, err := hooks.NewManager("")
+	robotOut, err := robot.GetHooks(context.Background(), robot.HooksOptions{Action: "status"})
 	if err != nil {
-		if jsonOutput {
-			return emitJSONFailureEnvelopeWithCause(map[string]interface{}{
-				"success": false,
-				"error":   err.Error(),
-			}, err)
-		}
 		return err
 	}
-
-	infos, err := mgr.ListAll()
-	if err != nil {
+	if !robotOut.Success {
+		cause := fmt.Errorf("%s", robotOut.Error)
 		if jsonOutput {
-			return emitJSONFailureEnvelopeWithCause(map[string]interface{}{
+			return emitJSONFailureEnvelopeWithCause(map[string]any{
 				"success": false,
-				"error":   err.Error(),
-			}, err)
+				"error":   robotOut.Error,
+			}, cause)
 		}
-		return err
+		return cause
 	}
 
 	if jsonOutput {
-		return json.NewEncoder(os.Stdout).Encode(map[string]interface{}{
-			"repo_root": mgr.RepoRoot(),
-			"hooks_dir": mgr.HooksDir(),
-			"hooks":     infos,
+		return json.NewEncoder(os.Stdout).Encode(map[string]any{
+			"repo_root": robotOut.RepoRoot,
+			"hooks_dir": robotOut.HooksDir,
+			"hooks":     robotOut.Hooks,
 		})
 	}
 
 	fmt.Println()
 	fmt.Printf("\033[1mGit Hooks Status\033[0m\n")
 	fmt.Printf("\033[2m════════════════════════════════════════\033[0m\n\n")
-	fmt.Printf("  Repository: %s\n", mgr.RepoRoot())
-	fmt.Printf("  Hooks dir:  %s\n\n", mgr.HooksDir())
+	fmt.Printf("  Repository: %s\n", robotOut.RepoRoot)
+	fmt.Printf("  Hooks dir:  %s\n\n", robotOut.HooksDir)
 
-	for _, info := range infos {
+	for _, info := range robotOut.Hooks {
 		var status, statusColor string
 		if info.Installed {
 			if info.IsNTM {
@@ -283,14 +280,16 @@ func newHooksRunCmd() *cobra.Command {
 	)
 
 	cmd := &cobra.Command{
-		Use:   "run <hook-type>",
+		Use:   "run <hook-type> [args...]",
 		Short: "Run a hook manually",
 		Long: `Run a hook manually without committing. Useful for testing.
 
+Supported hook types: pre-commit, pre-push, commit-msg, post-commit, post-checkout.
+
 This is also called by the installed hook script.`,
-		Args: cobra.ExactArgs(1),
+		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runHooksRun(args[0], verbose, failOnWarning, timeout)
+			return runHooksRun(args[0], args[1:], verbose, failOnWarning, timeout)
 		},
 	}
 
@@ -301,58 +300,126 @@ This is also called by the installed hook script.`,
 	return cmd
 }
 
-func runHooksRun(hookType string, verbose, failOnWarning bool, timeout int) error {
-	switch hookType {
-	case "pre-commit":
+func runHooksRun(hookType string, hookArgs []string, verbose, failOnWarning bool, timeout int) error {
+	switch hooks.HookType(hookType) {
+	case hooks.HookPreCommit:
 		return runPreCommitHook(verbose, failOnWarning, timeout)
+	case hooks.HookPrePush, hooks.HookCommitMsg, hooks.HookPostCommit, hooks.HookPostCheckout:
+		return runManagedHook(hooks.HookType(hookType), hookArgs, verbose, timeout)
 	default:
-		return fmt.Errorf("unknown hook type: %s", hookType)
+		err := fmt.Errorf("unknown hook type: %s (supported: pre-commit, pre-push, commit-msg, post-commit, post-checkout)", hookType)
+		if jsonOutput {
+			return emitJSONFailureEnvelopeWithCause(map[string]interface{}{
+				"success":   false,
+				"hook_type": hookType,
+				"passed":    false,
+				"error":     err.Error(),
+			}, err)
+		}
+		return err
 	}
 }
 
+func runManagedHook(hookType hooks.HookType, hookArgs []string, verbose bool, timeout int) error {
+	robotOut, err := robot.GetHooks(context.Background(), robot.HooksOptions{
+		Action:     "run",
+		HookType:   string(hookType),
+		HookArgs:   hookArgs,
+		Verbose:    verbose,
+		TimeoutSec: timeout,
+	})
+	if err != nil {
+		return err
+	}
+	if robotOut.CheckResult == nil {
+		cause := fmt.Errorf("%s", robotOut.Error)
+		if jsonOutput {
+			return emitJSONFailureEnvelopeWithCause(map[string]any{
+				"success":   false,
+				"hook_type": string(hookType),
+				"passed":    false,
+				"error":     robotOut.Error,
+			}, cause)
+		}
+		return cause
+	}
+
+	result := robotOut.CheckResult
+	if jsonOutput {
+		return outputHookCheckJSON(result)
+	}
+
+	hooks.PrintHookResult(result)
+	if !result.Passed {
+		return newSilentExitError(result.ExitCode())
+	}
+	return nil
+}
+
+func outputHookCheckJSON(result *hooks.HookCheckResult) error {
+	if result == nil {
+		cause := fmt.Errorf("hook returned no result")
+		return emitJSONFailureEnvelopeWithCause(map[string]any{
+			"success": false,
+			"passed":  false,
+			"error":   cause.Error(),
+		}, cause)
+	}
+
+	payload := struct {
+		Success bool `json:"success"`
+		*hooks.HookCheckResult
+	}{
+		Success:         result.Passed,
+		HookCheckResult: result,
+	}
+	if !result.Passed {
+		cause := fmt.Errorf("%s hook failed", result.HookType)
+		if result.BlockReason != "" {
+			cause = fmt.Errorf("%s hook failed: %s", result.HookType, result.BlockReason)
+		}
+		return emitJSONFailureEnvelopeWithCause(payload, cause)
+	}
+	return json.NewEncoder(os.Stdout).Encode(payload)
+}
+
 func runPreCommitHook(verbose, failOnWarning bool, timeout int) error {
-	ctx := context.Background()
-
-	config := hooks.DefaultPreCommitConfig()
-	config.Verbose = verbose
-	config.FailOnWarning = failOnWarning
+	timeoutSec := timeout
 	if timeout <= 0 {
-		config.Timeout = 0
-	} else {
-		config.Timeout = time.Duration(timeout) * time.Second
+		timeoutSec = -1
 	}
-
-	// Get repo root
-	mgr, err := hooks.NewManager("")
+	fow := failOnWarning
+	robotOut, err := robot.GetHooks(context.Background(), robot.HooksOptions{
+		Action:        "run",
+		HookType:      string(hooks.HookPreCommit),
+		Verbose:       verbose,
+		FailOnWarning: &fow,
+		TimeoutSec:    timeoutSec,
+	})
 	if err != nil {
-		if jsonOutput {
-			return emitJSONFailureEnvelopeWithCause(map[string]interface{}{
-				"success": false,
-				"passed":  false,
-				"error":   err.Error(),
-			}, err)
-		}
 		return err
 	}
-
-	result, err := hooks.RunPreCommit(ctx, mgr.RepoRoot(), config)
-	if err != nil {
+	if robotOut.PreCommitResult == nil {
+		cause := fmt.Errorf("%s", robotOut.Error)
 		if jsonOutput {
-			return emitJSONFailureEnvelopeWithCause(map[string]interface{}{
+			return emitJSONFailureEnvelopeWithCause(map[string]any{
 				"success": false,
 				"passed":  false,
-				"error":   err.Error(),
-			}, err)
+				"error":   robotOut.Error,
+			}, cause)
 		}
-		return err
+		return cause
 	}
 
+	result := robotOut.PreCommitResult
 	if jsonOutput {
 		return outputPreCommitHookJSON(result)
 	}
 
 	hooks.PrintPreCommitResult(result)
-	result.Exit()
+	if !result.Passed {
+		return newSilentExitError(result.ExitCode())
+	}
 	return nil
 }
 

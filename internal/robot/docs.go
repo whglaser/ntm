@@ -195,7 +195,12 @@ func getCommandsContent() *DocsContent {
 --robot-diagnose=SESSION: Comprehensive health check
 --robot-health-restart-stuck=SESSION: Detect and restart stuck agents
 --robot-probe=SESSION: Active pane responsiveness probe (--panes follows the shared selector convention: on a multi-window session a bare index selects a WINDOW and every pane in it is probed; each result carries pane_ref, the exact "window.pane" address probed)
---robot-pane-address=SESSION: Per-pane addressing cards (canonical selector, stable %pane_id, tmux target)`,
+--robot-pane-address=SESSION: Per-pane addressing cards (canonical selector, stable %pane_id, tmux target)
+--robot-handoff=SESSION: Inspect or create Goal/Now session continuity handoffs with quality scores (use SESSION or 'all')
+--robot-analytics: Aggregated multi-harness session, prompt, token, crash/restart, and error analytics (--analytics-days, --analytics-since, --analytics-sessions)
+--robot-audit[=SESSION]: Query, search, list, or verify tamper-evident audit logs and projection source health (--audit-search, --audit-verify, --audit-sources, --audit-limit, --audit-offset)
+--robot-timeline[=SESSION]: List saved session timelines, inspect session state transitions (--timeline-events), or view aggregate storage stats (--timeline-stats)
+--robot-doctor: Validate ecosystem health, tools, dependencies, daemons, configuration, invariants, and optional contention (--doctor-contention, --doctor-verbose)`,
 			},
 			{
 				Heading: "Agent Control",
@@ -210,13 +215,29 @@ func getCommandsContent() *DocsContent {
 --robot-smart-restart=SESSION: Safety-checked restart with optional --hard-kill / --hard-kill-only fallback
 --robot-wait=SESSION: Wait for pane state, attention-feed, or evidence-backed convergence condition
 --robot-overlay: Open dashboard overlay for human handoff (--overlay-session optional inside tmux)
---robot-route=SESSION: Get routing recommendation`,
+--robot-route=SESSION: Get routing recommendation
+--robot-rebalance=SESSION: Analyze bead workload imbalance, check tile geometry, and optionally apply transfers (--rebalance-apply, --rebalance-threshold, --rebalance-geometry)
+--robot-review-queue=SESSION: Detect idle agents and generate or dispatch peer-review prompts (--review-dispatch, --review-idle-threshold, --review-commits)
+--robot-coordinator=SESSION: Inspect coordinator agent status, generate/send digests, or list reservation conflicts (--coordinator-action, --coordinator-send-digest)`,
 			},
 			{
 				Heading: "Session Management",
 				Body: `--robot-spawn=SESSION: Create session with agents
+--robot-adopt=SESSION: Adopt an external tmux session across all 11 harnesses plus user panes (--adopt-cc..--adopt-user, --adopt-by-window, --adopt-auto-name)
+--robot-scale=SESSION: Scale agent counts per harness across all 11 built-in harnesses (--scale-cc, --scale-cod, --scale-gmi, --scale-agy, --scale-ollama, --scale-cursor, --scale-windsurf, --scale-aider, --scale-grok, --scale-omp, --scale-oc)
 --robot-ensemble-spawn=SESSION: Spawn reasoning ensemble
---robot-recipes: List available spawn presets`,
+--robot-ensemble-synthesize=SESSION: Synthesize ensemble reasoning outputs
+--robot-recipes: List available spawn presets
+--robot-personas: List built-in, user, and project personas and profile sets (--personas-agent, --personas-tag)
+--robot-session-templates: List or inspect multi-agent session templates (--template-name)
+--robot-saved-sessions: List, inspect, capture, archive, or unarchive saved session snapshots (--saved-action, --saved-name, --saved-session, --saved-archived, --saved-overwrite)
+--robot-mapping=SESSION: Resolve Agent Mail names to live tmux panes and reconcile border badges
+--robot-workflows: List or inspect workflow coordination templates with trigger validation (--workflows-name, --workflows-role)
+--robot-grep=PATTERN: Search pane scrollback with regex across 11 harnesses (--grep-session, --all, --type, --grep-ignore-case, --grep-context)
+--robot-extract=SESSION: Extract fenced code blocks and file hints from pane scrollback (--extract-pane, --extract-lang, --extract-last, --lines)
+--robot-validate: Validate user/project config, recipes, personas, policy, and 11-harness executables (--validate-all, --validate-fix, --project)
+--robot-plugins: List installed agent and command plugins
+--robot-models: Recommend local models from GPU VRAM or list installed Ollama models (--models-action, --models-host)`,
 			},
 			{
 				Heading: "Beads Management",
@@ -252,7 +273,11 @@ func getCommandsContent() *DocsContent {
 --robot-proxy-status: rust_proxy daemon/route status
 --robot-slb-pending: List SLB pending approvals
 --robot-slb-approve=ID: Approve SLB request
---robot-slb-deny=ID: Deny SLB request`,
+--robot-slb-deny=ID: Deny SLB request
+--robot-preflight[=PROMPT]: Lint and validate a prompt before sending (--preflight-strict, --preflight-file)
+--robot-redact[=TEXT]: Preview secret/PII redaction findings and safe-redacted output (--redact-file)
+--robot-hooks: Inspect installed repository git hooks or execute hook checks (--hooks-action, --hooks-type, --hooks-fail-on-warning)
+--robot-webhook-outbox: Inspect, retry, or archive durable project webhook outbox receipts (--outbox-action, --outbox-record, --outbox-revision)`,
 			},
 		},
 	}
@@ -280,7 +305,7 @@ func getExamplesContent() *DocsContent {
 				Name:        "ensemble_session",
 				Description: "Spawn reasoning ensemble for analysis",
 				Command:     "ntm --robot-ensemble-spawn=analysis --preset=project-diagnosis --question='Review architecture'",
-				Notes:       "Requires ensemble build tag",
+				Notes:       "Inspect progress with --robot-ensemble=analysis and synthesize with --robot-ensemble-synthesize=analysis",
 			},
 			// Prompt Sending
 			{
@@ -357,6 +382,42 @@ func getExamplesContent() *DocsContent {
 				Notes:       "Use this when an operator should jump directly to the relevant attention item instead of parsing free-form instructions",
 			},
 			{
+				Name:        "session_handoff",
+				Description: "Create or inspect a structured Goal/Now continuity handoff with quality scoring",
+				Command:     "ntm --robot-handoff=proj --handoff-create --handoff-goal='Implemented auth' --handoff-now='Run E2E suite'",
+				Notes:       "Omit --handoff-create to inspect the latest handoff and quality dimensions, or pass --handoff-auto to synthesize from session/git state",
+			},
+			{
+				Name:        "event_analytics",
+				Description: "Get multi-harness event analytics with per-session breakdown",
+				Command:     "ntm --robot-analytics --analytics-days=7 --analytics-sessions",
+				Notes:       "Aggregates spawns, prompts, characters, estimated tokens, crashes, restarts, and error types across all harnesses",
+			},
+			{
+				Name:        "audit_verify",
+				Description: "Verify tamper-evident audit log hash chains for a session",
+				Command:     "ntm --robot-audit=proj --audit-verify",
+				Notes:       "Omit --audit-verify to inspect entries, or pass --audit-search='pattern' across all sessions",
+			},
+			{
+				Name:        "session_timeline",
+				Description: "Inspect persisted agent state transitions and breakdown stats for a session",
+				Command:     "ntm --robot-timeline=proj --timeline-events",
+				Notes:       "Omit =SESSION to list saved timelines, or pass --timeline-stats for aggregate storage statistics",
+			},
+			{
+				Name:        "ecosystem_doctor",
+				Description: "Validate NTM ecosystem health and scan for shared-resource contention",
+				Command:     "ntm --robot-doctor --doctor-contention",
+				Notes:       "Returns structured tools, dependencies, daemons, configuration, invariants, guard_hook, and contention holders",
+			},
+			{
+				Name:        "prompt_preflight",
+				Description: "Lint and validate a prompt before sending to agents",
+				Command:     "ntm --robot-preflight='fix the bug in auth.go' --preflight-strict",
+				Notes:       "Checks for secrets, destructive commands, PII, and oversize thresholds; pass --preflight-file=path to read from file",
+			},
+			{
 				Name:        "restart_with_bead",
 				Description: "Hard reset a pane and re-seed it with a bead-backed prompt",
 				Command:     "ntm --robot-restart-pane=proj --panes=2 --restart-bead=bd-abc12",
@@ -386,6 +447,24 @@ func getExamplesContent() *DocsContent {
 				Description: "Diagnose and auto-fix issues",
 				Command:     "ntm --robot-diagnose=proj --diagnose-fix",
 				Notes:       "Attempts automatic fixes for common issues",
+			},
+			{
+				Name:        "scale_session",
+				Description: "Scale harness counts up or down non-interactively",
+				Command:     "ntm --robot-scale=proj --scale-cc=4 --scale-cod=2 --dry-run",
+				Notes:       "Supports all 11 harnesses (--scale-cc, --scale-cod, --scale-gmi, --scale-agy, --scale-ollama, --scale-cursor, --scale-windsurf, --scale-aider, --scale-grok, --scale-omp, --scale-oc)",
+			},
+			{
+				Name:        "rebalance_session",
+				Description: "Inspect or apply bead workload rebalancing across panes",
+				Command:     "ntm --robot-rebalance=proj --rebalance-apply --rebalance-threshold=0.5",
+				Notes:       "Add --rebalance-geometry to verify tile uniformity",
+			},
+			{
+				Name:        "review_queue_dispatch",
+				Description: "Generate and dispatch peer-review prompts to idle agents",
+				Command:     "ntm --robot-review-queue=proj --review-dispatch --review-commits=5",
+				Notes:       "Combines completed bead work and recent git commits",
 			},
 		},
 	}

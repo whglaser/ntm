@@ -497,13 +497,65 @@ func (s *Substitutor) substituteOnce(template string) (string, int, error) {
 		// placeholder so the outer Substitute loop sees them as opaque
 		// data; restoreEscapedSubstitutions converts them back to literal
 		// `${` in the final output.
-		if isTerminalSubstitutionNamespace(varPath) {
+		if s.isTerminalSubstitutionPath(varPath) {
 			formatted = sealTerminalValue(formatted)
 		}
 		return formatted
 	})
 
 	return result, resolved, firstErr
+}
+
+// isTerminalSubstitutionPath extends the fixed terminal namespaces with
+// named output_var aliases. Those aliases intentionally live under vars for
+// workflow ergonomics, but their values come from commands, agents, bead
+// queries, mail and other runtime sources. Persisting the marker on state keeps
+// that provenance across checkpoints/resume without modifying the raw value.
+func (s *Substitutor) isTerminalSubstitutionPath(varPath string) bool {
+	if isTerminalSubstitutionNamespace(varPath) {
+		return true
+	}
+	path := strings.TrimSpace(varPath)
+	parts := strings.Split(path, ".")
+	if len(parts) < 2 || parts[0] != "vars" || s.state == nil || s.state.TerminalVariables == nil {
+		return false
+	}
+	return s.state.TerminalVariables[parts[1]]
+}
+
+func markTerminalVariable(state *ExecutionState, name string) {
+	if state == nil || name == "" {
+		return
+	}
+	if state.TerminalVariables == nil {
+		state.TerminalVariables = make(map[string]bool)
+	}
+	state.TerminalVariables[name] = true
+}
+
+func clearTerminalVariable(state *ExecutionState, name string) {
+	if state == nil || state.TerminalVariables == nil || name == "" {
+		return
+	}
+	delete(state.TerminalVariables, name)
+}
+
+func storeOutputVar(state *ExecutionState, name string, output string, parsedData interface{}) {
+	if state == nil || name == "" {
+		return
+	}
+	if state.Variables == nil {
+		state.Variables = make(map[string]interface{})
+	}
+	state.Variables[name] = output
+	markTerminalVariable(state, name)
+	if parsedData != nil {
+		state.Variables[name+"_parsed"] = parsedData
+		markTerminalVariable(state, name+"_parsed")
+	} else {
+		delete(state.Variables, name+"_parsed")
+		clearTerminalVariable(state, name+"_parsed")
+	}
 }
 
 // isTerminalSubstitutionNamespace reports whether values resolved from this
@@ -524,7 +576,13 @@ func isTerminalSubstitutionNamespace(varPath string) bool {
 		root = path[:idx]
 	}
 	switch root {
-	case "steps", "env", "bead_query", "agent":
+	case "steps", "env", "bead_query", "agent", "loop", "item":
+		// Loop/item values are materialized runtime data. Their source
+		// expression is resolved before iteration starts, so any ${...}
+		// that remains inside an item is data from the source and must not
+		// gain a second evaluation pass when referenced as ${item.*} or
+		// ${loop.item.*}. This preserves the terminal-data fence when
+		// bead/step output flows through foreach aliases.
 		return true
 	}
 	return false
@@ -957,6 +1015,35 @@ func navigateNested(value interface{}, parts []string) (interface{}, error) {
 				return nil, fmt.Errorf("array index %d out of bounds (length: %d)", idx, len(v))
 			}
 			current = v[idx]
+
+		case []BeadRecord:
+			idx, err := strconv.Atoi(part)
+			if err != nil {
+				return nil, fmt.Errorf("invalid array index '%s': must be numeric", part)
+			}
+			if idx < 0 || idx >= len(v) {
+				return nil, fmt.Errorf("array index %d out of bounds (length: %d)", idx, len(v))
+			}
+			current = v[idx]
+
+		case BeadRecord:
+			// Native bead_query results stay typed in memory. Navigate their
+			// public JSON fields so fresh execution and a decoded checkpoint
+			// use identical names and values, without exposing arbitrary Go
+			// structs or accepting unknown fields.
+			data, err := json.Marshal(v)
+			if err != nil {
+				return nil, fmt.Errorf("encode bead record fields: %w", err)
+			}
+			var fields map[string]interface{}
+			if err := json.Unmarshal(data, &fields); err != nil {
+				return nil, fmt.Errorf("decode bead record fields: %w", err)
+			}
+			var ok bool
+			current, ok = fields[part]
+			if !ok {
+				return nil, fmt.Errorf("field '%s' not found", part)
+			}
 
 		default:
 			return nil, fmt.Errorf("cannot access field '%s' on type %T", part, current)

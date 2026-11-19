@@ -2,10 +2,12 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/ensemble"
+	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
 type testError struct {
@@ -341,6 +344,8 @@ func TestNewEnsembleCheckpointStoreForSessionUsesSessionProjectDir(t *testing.T)
 }
 
 func TestRunEnsembleResumeUsesConfiguredRunProjectWhenCWDDiffers(t *testing.T) {
+	env := setupIsolatedEnsembleTmuxEnv(t, nil)
+
 	projectsBase := t.TempDir()
 	sessionProject := filepath.Join(projectsBase, "mysession")
 	if err := os.MkdirAll(sessionProject, 0o755); err != nil {
@@ -360,7 +365,10 @@ func TestRunEnsembleResumeUsesConfiguredRunProjectWhenCWDDiffers(t *testing.T) {
 	}
 
 	oldCfg := cfg
-	cfg = &config.Config{ProjectsBase: projectsBase}
+	testCfg := config.Default()
+	testCfg.ProjectsBase = projectsBase
+	testCfg.Agents.Claude = env.AgentScript
+	cfg = testCfg
 	t.Cleanup(func() { cfg = oldCfg })
 
 	store, err := newEnsembleCheckpointStoreForSession(t.Context(), "mysession")
@@ -373,13 +381,14 @@ func TestRunEnsembleResumeUsesConfiguredRunProjectWhenCWDDiffers(t *testing.T) {
 		SessionName:  "mysession",
 		Question:     "Resume me",
 		Status:       ensemble.EnsembleActive,
-		CompletedIDs: []string{"mode-a"},
-		PendingIDs:   []string{"mode-b"},
+		CompletedIDs: []string{"deductive"},
+		PendingIDs:   []string{"inductive"},
 		TotalModes:   2,
 	}
 	if err := store.SaveMetadata(meta); err != nil {
 		t.Fatalf("SaveMetadata() error = %v", err)
 	}
+	seedCompletedModeCheckpoint(t, store, meta.RunID, "deductive", "Deductive thesis", "Deductive finding", 0.85, time.Now().UTC())
 
 	oldWd, _ := os.Getwd()
 	if err := os.Chdir(nestedDir); err != nil {
@@ -388,7 +397,13 @@ func TestRunEnsembleResumeUsesConfiguredRunProjectWhenCWDDiffers(t *testing.T) {
 	defer os.Chdir(oldWd)
 
 	var buf bytes.Buffer
-	if err := runEnsembleResume(&buf, meta.RunID, "json", false, true); err != nil {
+	if err := runEnsembleResume(t.Context(), nil, &buf, ensembleResumeCommandOptions{
+		RunID:    meta.RunID,
+		Format:   "json",
+		Quiet:    false,
+		SkipDone: true,
+		Timeout:  20 * time.Second,
+	}); err != nil {
 		t.Fatalf("runEnsembleResume() error = %v", err)
 	}
 
@@ -402,9 +417,14 @@ func TestRunEnsembleResumeUsesConfiguredRunProjectWhenCWDDiffers(t *testing.T) {
 	if payload.RunID != meta.RunID || payload.Session != meta.SessionName {
 		t.Fatalf("payload = %+v, want run %q session %q", payload, meta.RunID, meta.SessionName)
 	}
+	if payload.Status != string(ensemble.EnsembleComplete) {
+		t.Fatalf("Status = %q, want %q", payload.Status, ensemble.EnsembleComplete)
+	}
 }
 
 func TestRunEnsembleResumeSkipDoneFalseIncludesCompletedModes(t *testing.T) {
+	env := setupIsolatedEnsembleTmuxEnv(t, nil)
+
 	projectDir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(projectDir, ".ntm"), 0o755); err != nil {
 		t.Fatalf("mkdir .ntm: %v", err)
@@ -412,6 +432,12 @@ func TestRunEnsembleResumeSkipDoneFalseIncludesCompletedModes(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(projectDir, ".ntm", "config.toml"), []byte(""), 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
+
+	oldCfg := cfg
+	testCfg := config.Default()
+	testCfg.Agents.Claude = env.AgentScript
+	cfg = testCfg
+	t.Cleanup(func() { cfg = oldCfg })
 
 	oldWd, _ := os.Getwd()
 	if err := os.Chdir(projectDir); err != nil {
@@ -429,17 +455,24 @@ func TestRunEnsembleResumeSkipDoneFalseIncludesCompletedModes(t *testing.T) {
 		SessionName:  "mysession",
 		Question:     "Resume me",
 		Status:       ensemble.EnsembleActive,
-		CompletedIDs: []string{"mode-a"},
-		PendingIDs:   []string{"mode-b"},
-		ErrorIDs:     []string{"mode-c"},
+		CompletedIDs: []string{"deductive"},
+		PendingIDs:   []string{"inductive"},
+		ErrorIDs:     []string{"systems-thinking"},
 		TotalModes:   3,
 	}
 	if err := store.SaveMetadata(meta); err != nil {
 		t.Fatalf("SaveMetadata() error = %v", err)
 	}
+	seedCompletedModeCheckpoint(t, store, meta.RunID, "deductive", "Deductive thesis", "Deductive finding", 0.85, time.Now().UTC())
 
 	var buf bytes.Buffer
-	if err := runEnsembleResume(&buf, meta.RunID, "json", false, false); err != nil {
+	if err := runEnsembleResume(t.Context(), nil, &buf, ensembleResumeCommandOptions{
+		RunID:    meta.RunID,
+		Format:   "json",
+		Quiet:    false,
+		SkipDone: false,
+		Timeout:  25 * time.Second,
+	}); err != nil {
 		t.Fatalf("runEnsembleResume() error = %v", err)
 	}
 
@@ -477,7 +510,12 @@ func TestRunEnsembleResume_InvalidMetadataReturnsStructuredFailure(t *testing.T)
 	defer os.Chdir(oldWd)
 
 	var buf bytes.Buffer
-	if err := runEnsembleResume(&buf, "resume-invalid-meta-run", "json", false, true); err != nil && !errors.Is(err, errJSONFailure) {
+	if err := runEnsembleResume(t.Context(), nil, &buf, ensembleResumeCommandOptions{
+		RunID:    "resume-invalid-meta-run",
+		Format:   "json",
+		Quiet:    false,
+		SkipDone: true,
+	}); err != nil && !errors.Is(err, errJSONFailure) {
 		t.Fatalf("runEnsembleResume() error = %v", err)
 	}
 
@@ -509,7 +547,12 @@ func TestRunEnsembleResume_InvalidRunIDReturnsStructuredFailure(t *testing.T) {
 	defer os.Chdir(oldWd)
 
 	var buf bytes.Buffer
-	if err := runEnsembleResume(&buf, "../escape", "json", false, true); err != nil && !errors.Is(err, errJSONFailure) {
+	if err := runEnsembleResume(t.Context(), nil, &buf, ensembleResumeCommandOptions{
+		RunID:    "../escape",
+		Format:   "json",
+		Quiet:    false,
+		SkipDone: true,
+	}); err != nil && !errors.Is(err, errJSONFailure) {
 		t.Fatalf("runEnsembleResume() error = %v", err)
 	}
 
@@ -526,6 +569,8 @@ func TestRunEnsembleResume_InvalidRunIDReturnsStructuredFailure(t *testing.T) {
 }
 
 func TestRunEnsembleRerunModeUsesConfiguredRunProjectWhenCWDDiffers(t *testing.T) {
+	env := setupIsolatedEnsembleTmuxEnv(t, nil)
+
 	projectsBase := t.TempDir()
 	sessionProject := filepath.Join(projectsBase, "mysession")
 	if err := os.MkdirAll(sessionProject, 0o755); err != nil {
@@ -545,7 +590,10 @@ func TestRunEnsembleRerunModeUsesConfiguredRunProjectWhenCWDDiffers(t *testing.T
 	}
 
 	oldCfg := cfg
-	cfg = &config.Config{ProjectsBase: projectsBase}
+	testCfg := config.Default()
+	testCfg.ProjectsBase = projectsBase
+	testCfg.Agents.Claude = env.AgentScript
+	cfg = testCfg
 	t.Cleanup(func() { cfg = oldCfg })
 
 	store, err := newEnsembleCheckpointStoreForSession(t.Context(), "mysession")
@@ -558,12 +606,13 @@ func TestRunEnsembleRerunModeUsesConfiguredRunProjectWhenCWDDiffers(t *testing.T
 		SessionName:  "mysession",
 		Question:     "Rerun me",
 		Status:       ensemble.EnsembleActive,
-		CompletedIDs: []string{"mode-a"},
+		CompletedIDs: []string{"deductive"},
 		TotalModes:   1,
 	}
 	if err := store.SaveMetadata(meta); err != nil {
 		t.Fatalf("SaveMetadata() error = %v", err)
 	}
+	seedCompletedModeCheckpoint(t, store, meta.RunID, "deductive", "Deductive thesis", "Deductive finding", 0.85, time.Now().UTC())
 
 	oldWd, _ := os.Getwd()
 	if err := os.Chdir(nestedDir); err != nil {
@@ -572,7 +621,13 @@ func TestRunEnsembleRerunModeUsesConfiguredRunProjectWhenCWDDiffers(t *testing.T
 	defer os.Chdir(oldWd)
 
 	var buf bytes.Buffer
-	if err := runEnsembleRerunMode(&buf, meta.RunID, "mode-a", "json", false); err != nil {
+	if err := runEnsembleRerunMode(t.Context(), nil, &buf, ensembleRerunCommandOptions{
+		RunID:   meta.RunID,
+		ModeRef: "deductive",
+		Format:  "json",
+		Quiet:   false,
+		Timeout: 20 * time.Second,
+	}); err != nil {
 		t.Fatalf("runEnsembleRerunMode() error = %v", err)
 	}
 
@@ -621,7 +676,12 @@ func TestRunEnsembleRerunModeRejectsUnknownModeInCheckpointRun(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if err := runEnsembleRerunMode(&buf, meta.RunID, "bayesian", "json", false); err != nil && !errors.Is(err, errJSONFailure) {
+	if err := runEnsembleRerunMode(t.Context(), nil, &buf, ensembleRerunCommandOptions{
+		RunID:   meta.RunID,
+		ModeRef: "bayesian",
+		Format:  "json",
+		Quiet:   false,
+	}); err != nil && !errors.Is(err, errJSONFailure) {
 		t.Fatalf("runEnsembleRerunMode() error = %v", err)
 	}
 
@@ -656,7 +716,12 @@ func TestRunEnsembleRerunMode_InvalidMetadataReturnsStructuredFailure(t *testing
 	defer os.Chdir(oldWd)
 
 	var buf bytes.Buffer
-	if err := runEnsembleRerunMode(&buf, "rerun-invalid-meta-run", "deductive", "json", false); err != nil && !errors.Is(err, errJSONFailure) {
+	if err := runEnsembleRerunMode(t.Context(), nil, &buf, ensembleRerunCommandOptions{
+		RunID:   "rerun-invalid-meta-run",
+		ModeRef: "deductive",
+		Format:  "json",
+		Quiet:   false,
+	}); err != nil && !errors.Is(err, errJSONFailure) {
 		t.Fatalf("runEnsembleRerunMode() error = %v", err)
 	}
 
@@ -1040,4 +1105,338 @@ func TestCompareOutput_Struct(t *testing.T) {
 	}
 
 	t.Log("TEST: TestCompareOutput_Struct - assertion: compareOutput marshals correctly")
+}
+
+func TestWriteCompareResult_ChangedSectionsAndUnchanged(t *testing.T) {
+	empty := &ensemble.ComparisonResult{
+		RunA:    "same-a",
+		RunB:    "same-b",
+		Summary: "No differences",
+	}
+	var emptyJSON bytes.Buffer
+	if err := writeCompareResult(&emptyJSON, empty, compareOptions{}, "json"); err != nil {
+		t.Fatalf("writeCompareResult(empty json): %v", err)
+	}
+	var parsedEmpty compareOutput
+	if err := json.Unmarshal(emptyJSON.Bytes(), &parsedEmpty); err != nil {
+		t.Fatalf("unmarshal empty compare json: %v", err)
+	}
+	if !parsedEmpty.Unchanged || len(parsedEmpty.ChangedSections) != 0 {
+		t.Fatalf("expected unchanged=true and no changed_sections, got %+v", parsedEmpty)
+	}
+
+	var emptyText bytes.Buffer
+	if err := writeCompareResult(&emptyText, empty, compareOptions{}, "text"); err != nil {
+		t.Fatalf("writeCompareResult(empty text): %v", err)
+	}
+	if !strings.Contains(emptyText.String(), "Runs are identical") {
+		t.Fatalf("expected identical status in text output, got:\n%s", emptyText.String())
+	}
+
+	changed := &ensemble.ComparisonResult{
+		RunA:         "run-1",
+		RunB:         "run-2",
+		ModeDiff:     ensemble.ModeDiff{AddedCount: 1, Added: []string{"bayesian"}},
+		FindingsDiff: ensemble.FindingsDiff{NewCount: 1},
+		ConclusionDiff: ensemble.ConclusionDiff{
+			SynthesisChanged: true,
+		},
+		ContributionDiff: ensemble.ContributionDiff{
+			ScoreDeltas: []ensemble.ScoreDelta{{ModeID: "deductive", Delta: 2.5}},
+		},
+		Summary: "all sections changed",
+	}
+	var changedJSON bytes.Buffer
+	if err := writeCompareResult(&changedJSON, changed, compareOptions{}, "json"); err != nil {
+		t.Fatalf("writeCompareResult(changed json): %v", err)
+	}
+	var parsedChanged compareOutput
+	if err := json.Unmarshal(changedJSON.Bytes(), &parsedChanged); err != nil {
+		t.Fatalf("unmarshal changed compare json: %v", err)
+	}
+	if parsedChanged.Unchanged {
+		t.Fatal("expected unchanged=false for changed comparison")
+	}
+	wantSections := "modes,findings,conclusions,contributions"
+	if got := strings.Join(parsedChanged.ChangedSections, ","); got != wantSections {
+		t.Fatalf("ChangedSections = %q, want %q", got, wantSections)
+	}
+}
+
+func TestRenderProvenanceValidation(t *testing.T) {
+	validChain := &ensemble.ProvenanceChain{
+		FindingID:    "f-valid-001",
+		SourceMode:   "deductive",
+		OriginalText: "Valid finding",
+		CurrentText:  "Valid finding",
+		Impact:       ensemble.ImpactHigh,
+		Confidence:   0.85,
+		Steps: []ensemble.ProvenanceStep{
+			{Stage: "discovery", Action: "discovered", Timestamp: time.Now().UTC()},
+		},
+	}
+	invalidChain := &ensemble.ProvenanceChain{
+		FindingID:  "f-invalid-002",
+		SourceMode: "",
+	}
+
+	invalidCount, valErrs := validateProvenanceChains([]*ensemble.ProvenanceChain{validChain, invalidChain})
+	if invalidCount != 1 || len(valErrs) != 1 {
+		t.Fatalf("validateProvenanceChains = (%d, %v), want 1 invalid chain", invalidCount, valErrs)
+	}
+
+	validFlag := false
+	var textBuf bytes.Buffer
+	err := renderProvenanceOutput(&textBuf, provenanceOutput{
+		GeneratedAt:      time.Now().UTC(),
+		FindingID:        invalidChain.FindingID,
+		Valid:            &validFlag,
+		ValidationErrors: valErrs,
+		Chain:            invalidChain,
+	}, "text")
+	if err != nil {
+		t.Fatalf("renderProvenanceOutput(text): %v", err)
+	}
+	if !strings.Contains(textBuf.String(), "Validation: INVALID") {
+		t.Fatalf("expected INVALID provenance banner in text output, got:\n%s", textBuf.String())
+	}
+}
+
+const standaloneCLIModeOutput = "Analysis complete.\n" +
+	"```yaml\nmode_id: deductive\nthesis: Preserve member reasoning before lead synthesis.\n" +
+	"top_findings:\n  - finding: Durable capture must precede lead dispatch.\n" +
+	"    impact: high\n    confidence: 0.9\n    evidence_pointer: internal/ensemble/capture.go\n" +
+	"    reasoning: Sending the next task replaces the only live result.\nconfidence: 0.9\n```\nclaude>\n"
+
+func setupStandaloneCLISynthesis(t *testing.T, output string) (string, string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake tmux requires a POSIX shell")
+	}
+	isolateSessionAgentStorage(t)
+	ensemble.CloseDefaultStateStore()
+	t.Cleanup(ensemble.CloseDefaultStateStore)
+	oldCfg, oldJSON := cfg, jsonOutput
+	cfg, jsonOutput = config.Default(), false
+	t.Cleanup(func() { cfg, jsonOutput = oldCfg, oldJSON })
+
+	const session = "standalone-cli-synthesis"
+	dir := t.TempDir()
+	t.Setenv("NTM_SYNTH_ROOT", dir)
+	t.Setenv("NTM_SYNTH_SESSION", session)
+	t.Setenv("NTM_SYNTH_HOLD", "")
+	t.Setenv("NTM_SYNTH_PANES", "%1_NTM_SEP_0_NTM_SEP_"+session+"__cc_1_NTM_SEP_claude_NTM_SEP_120_NTM_SEP_40_NTM_SEP_1_NTM_SEP_0_NTM_SEP_0_NTM_SEP_cc_NTM_SEP__NTM_SEP__NTM_SEP_0_NTM_SEP_[]")
+	for name, content := range map[string]string{
+		"member.txt": output,
+		"lead.txt": "\n```json\n" +
+			`{"summary":"Fresh synthesis from the live lead agent.","findings":[{"finding":"Save completed reasoning before dispatch.","impact":"high","confidence":0.94}],"confidence":0.94}` +
+			"\n```\nclaude>\n",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	script := `#!/bin/sh
+printf '%s\n' "$1" >> "$NTM_SYNTH_ROOT/tmux.log"
+case "$1" in
+  -V) printf 'tmux 3.5a\n' ;;
+  has-session) ;;
+  list-sessions) printf '%s_NTM_SEP_1_NTM_SEP_0_NTM_SEP_now\n' "$NTM_SYNTH_SESSION" ;;
+  list-panes) printf '%s\n' "$NTM_SYNTH_PANES" ;;
+  display-message)
+    case "$*" in
+      *session_name*) printf '%s\n' "$NTM_SYNTH_SESSION" ;;
+      *rotation_token*) printf '[]\n' ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  capture-pane)
+    cat "$NTM_SYNTH_ROOT/member.txt"
+    if [ -e "$NTM_SYNTH_ROOT/submitted" ]; then cat "$NTM_SYNTH_ROOT/lead.txt"; fi
+    ;;
+  load-buffer)
+    cat > "$NTM_SYNTH_ROOT/prompt.txt"
+    : > "$NTM_SYNTH_ROOT/before-prompt"
+    if [ "$NTM_SYNTH_HOLD" = "1" ]; then
+      while [ ! -e "$NTM_SYNTH_ROOT/release" ]; do sleep 0.01; done
+    fi
+    ;;
+  paste-buffer|delete-buffer) ;;
+  send-keys)
+    case "$*" in
+      *Enter*) : > "$NTM_SYNTH_ROOT/submitted" ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  *) printf 'unexpected tmux command: %s\n' "$1" >&2; exit 1 ;;
+esac
+`
+	binPath := filepath.Join(dir, "tmux")
+	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("NTM_TMUX_BINARY", binPath)
+	oldClient := tmux.DefaultClient
+	tmux.DefaultClient = tmux.NewClient("")
+	t.Cleanup(func() { tmux.DefaultClient = oldClient })
+	now := time.Now().UTC()
+	state := &ensemble.EnsembleSession{
+		SessionName:       session,
+		Question:          "How should completed ensemble reasoning be preserved?",
+		Status:            ensemble.EnsembleActive,
+		SynthesisStrategy: ensemble.StrategyConsensus,
+		CreatedAt:         now,
+		Assignments: []ensemble.ModeAssignment{
+			{ModeID: "deductive", PaneName: session + "__cc_1", AgentType: "cc", Status: ensemble.AssignmentActive, AssignedAt: now},
+		},
+	}
+	if err := ensemble.SaveSession(session, state); err != nil {
+		t.Fatal(err)
+	}
+	return session, dir
+}
+
+func TestEnsembleSynthesizeCommandCapturesActiveAgentsBeforeLeadDispatch(t *testing.T) {
+	session, dir := setupStandaloneCLISynthesis(t, standaloneCLIModeOutput)
+	t.Setenv("NTM_SYNTH_HOLD", "1")
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	var output bytes.Buffer
+	cmd := newEnsembleSynthesizeCmd()
+	cmd.SetOut(&output)
+	cmd.SetErr(&output)
+	cmd.SetArgs([]string{session, "--format=json", "--no-cache"})
+	cmd.SilenceErrors, cmd.SilenceUsage = true, true
+	done := make(chan struct{})
+	var runErr error
+	go func() {
+		defer close(done)
+		runErr = cmd.ExecuteContext(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		_ = os.WriteFile(filepath.Join(dir, "release"), nil, 0o600)
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Error("synthesis command did not stop after cancellation")
+		}
+	})
+
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "before-prompt")); err == nil {
+			break
+		} else if !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+		select {
+		case <-done:
+			t.Fatalf("command ended before lead dispatch: %v; output=%s", runErr, output.String())
+		case <-ctx.Done():
+			t.Fatal("command never reached lead dispatch")
+		case <-ticker.C:
+		}
+	}
+
+	saved, err := ensemble.LoadSession(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assignment := saved.Assignments[0]
+	if assignment.Status != ensemble.AssignmentDone || assignment.OutputPath == "" || assignment.CompletedAt == nil {
+		t.Fatalf("member result was not durable before lead dispatch: %+v", assignment)
+	}
+	recovered, err := ensemble.CollectModeOutputs(saved, nil)
+	if err != nil || len(recovered.Outputs) != 1 || recovered.Outputs[0].Thesis != "Preserve member reasoning before lead synthesis." {
+		t.Fatalf("saved member result cannot be recovered before dispatch: %+v, err=%v", recovered, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "submitted")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("lead prompt submitted before release: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "release"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal("command did not finish after lead reply")
+	}
+	if runErr != nil {
+		t.Fatalf("synthesize without --force: %v; output=%s", runErr, output.String())
+	}
+	var decoded struct {
+		Synthesis *ensemble.SynthesisResult `json:"synthesis"`
+	}
+	if err := json.Unmarshal(output.Bytes(), &decoded); err != nil {
+		t.Fatalf("decode synthesis: %v; output=%s", err, output.String())
+	}
+	if decoded.Synthesis == nil || decoded.Synthesis.SynthesizedBy != "agent" ||
+		decoded.Synthesis.FallbackReason != "" || decoded.Synthesis.Summary != "Fresh synthesis from the live lead agent." {
+		t.Fatalf("expected a fresh lead synthesis, got %+v", decoded.Synthesis)
+	}
+	prompt, err := os.ReadFile(filepath.Join(dir, "prompt.txt"))
+	if err != nil || !strings.Contains(string(prompt), saved.Question) ||
+		!strings.Contains(string(prompt), "Durable capture must precede lead dispatch.") {
+		t.Fatalf("lead did not receive the question and captured reasoning: %q, err=%v", prompt, err)
+	}
+}
+
+func TestEnsembleSynthesizeCommandRefusesUnfinishedLiveOutput(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		output string
+	}{
+		{name: "complete schema while still busy", output: strings.TrimSuffix(standaloneCLIModeOutput, "claude>\n") + "Continuing analysis...\n"},
+		{name: "idle with incomplete output", output: "Partial analysis with no structured result.\nclaude>\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			session, dir := setupStandaloneCLISynthesis(t, tc.output)
+			var output bytes.Buffer
+			cmd := newEnsembleSynthesizeCmd()
+			cmd.SetOut(&output)
+			cmd.SetErr(&output)
+			cmd.SetArgs([]string{session, "--format=json", "--no-cache"})
+			cmd.SilenceErrors, cmd.SilenceUsage = true, true
+			err := cmd.ExecuteContext(t.Context())
+			if err == nil || !strings.Contains(err.Error(), "synthesis not ready") {
+				t.Fatalf("unfinished output must remain not ready: err=%v output=%s", err, output.String())
+			}
+			saved, err := ensemble.LoadSession(session)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if saved.Assignments[0].Status != ensemble.AssignmentActive || saved.Assignments[0].OutputPath != "" {
+				t.Fatalf("unfinished output was promoted to completed: %+v", saved.Assignments[0])
+			}
+			if _, err := os.Stat(filepath.Join(dir, "prompt.txt")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("unfinished member received a synthesis prompt: %v", err)
+			}
+		})
+	}
+}
+
+func TestEnsembleSynthesizeCommandCancellationDoesNotDispatch(t *testing.T) {
+	session, dir := setupStandaloneCLISynthesis(t, standaloneCLIModeOutput)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	var output bytes.Buffer
+	cmd := newEnsembleSynthesizeCmd()
+	cmd.SetOut(&output)
+	cmd.SetErr(&output)
+	cmd.SetArgs([]string{session, "--format=json", "--no-cache"})
+	cmd.SilenceErrors, cmd.SilenceUsage = true, true
+	if err := cmd.ExecuteContext(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled command returned %v, want context.Canceled", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "prompt.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("canceled command dispatched a prompt: %v", err)
+	}
+	saved, err := ensemble.LoadSession(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.Assignments[0].Status != ensemble.AssignmentActive {
+		t.Fatalf("canceled command changed assignment state: %+v", saved.Assignments[0])
+	}
 }

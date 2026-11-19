@@ -10,6 +10,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Dicklesworthstone/ntm/internal/kernel"
+	"github.com/Dicklesworthstone/ntm/internal/serve"
 )
 
 func init() {
@@ -23,7 +24,7 @@ func init() {
 		},
 		REST: &kernel.RESTBinding{
 			Method: "GET",
-			Path:   "/api/kernel/commands",
+			Path:   "/api/v1/kernel/commands",
 		},
 		Examples: []kernel.Example{
 			{
@@ -36,12 +37,42 @@ func init() {
 		Idempotent:  true,
 	})
 	kernel.MustRegisterHandler("kernel.list", func(ctx context.Context, _ any) (any, error) {
+		serve.EnsureKernelCatalogRegistered()
 		commands := kernel.List()
 		return kernel.ListResponse{
 			Commands: commands,
 			Count:    len(commands),
 		}, nil
 	})
+}
+
+// decodeKernelInput decodes a typed struct, pointer, or map[string]any payload
+// passed to kernel.Run into T using JSON field tags.
+func decodeKernelInput[T any](name string, input any) (T, error) {
+	var opts T
+	if input == nil {
+		return opts, nil
+	}
+	switch value := input.(type) {
+	case T:
+		return value, nil
+	case *T:
+		if value != nil {
+			return *value, nil
+		}
+		return opts, nil
+	case map[string]any:
+		raw, err := json.Marshal(value)
+		if err != nil {
+			return opts, fmt.Errorf("marshal %s input: %w", name, err)
+		}
+		if err := json.Unmarshal(raw, &opts); err != nil {
+			return opts, fmt.Errorf("decode %s input: %w", name, err)
+		}
+		return opts, nil
+	default:
+		return opts, fmt.Errorf("unsupported %s input type %T", name, input)
+	}
 }
 
 func newKernelCmd() *cobra.Command {

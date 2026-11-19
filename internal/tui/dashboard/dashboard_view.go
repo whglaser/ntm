@@ -10,7 +10,9 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/Dicklesworthstone/ntm/internal/backpressure"
 	"github.com/Dicklesworthstone/ntm/internal/config"
+	"github.com/Dicklesworthstone/ntm/internal/pressure"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 	"github.com/Dicklesworthstone/ntm/internal/tui/components"
 	"github.com/Dicklesworthstone/ntm/internal/tui/dashboard/panels"
@@ -93,7 +95,9 @@ func (m Model) View() string {
 
 	// [tui-upgrade: bd-uz09d] Render spawn wizard overlay
 	if m.showSpawnWizard && m.spawnWizard != nil {
-		m.spawnWizard.SetSize(m.width, m.height)
+		if w, h := m.spawnWizard.Size(); w != m.width || h != m.height {
+			m.spawnWizard.SetSize(m.width, m.height)
+		}
 		modal := m.spawnWizard.View()
 		backdrop := m.renderHeaderSection() + m.renderMainContentSection() + m.renderFooterSection()
 		return renderModalOverlay(backdrop, modal, m.width, m.height, m.theme)
@@ -348,16 +352,24 @@ func (m Model) renderPanelTabBar(width int) string {
 		switch pid {
 		case PanelAlerts:
 			badge = len(m.activeAlerts)
-			hasErr = m.alertsPanel.HasError()
+			hasErr = m.alertsPanel != nil && m.alertsPanel.HasError()
 		case PanelAttention:
 			if m.attentionPanel != nil {
 				badge = m.attentionPanel.ActionRequiredCount()
 			}
 		case PanelBeads:
 			badge = m.beadsSummary.InProgress
-			hasErr = m.beadsPanel.HasError()
+			hasErr = m.beadsPanel != nil && m.beadsPanel.HasError()
 		case PanelConflicts:
-			badge = m.conflictsPanel.ConflictCount()
+			if m.conflictsPanel != nil {
+				badge = m.conflictsPanel.ConflictCount()
+			}
+		case PanelMetrics:
+			hasErr = m.metricsPanel != nil && m.metricsPanel.HasError()
+		case PanelHistory:
+			hasErr = m.historyPanel != nil && m.historyPanel.HasError()
+		case PanelSidebar:
+			hasErr = m.sidebarHasError()
 		}
 
 		tabs = append(tabs, components.PanelIDToTab(idStr, badge, hasErr))
@@ -385,7 +397,7 @@ func (m Model) renderFooterSection() string {
 	// TICKER BAR (scrolling status summary)
 	// ═══════════════════════════════════════════════════════════════
 	b.WriteString("\n")
-	m.tickerPanel.SetSize(m.width-4, 1)
+	m.tickerPanel.SetSize(m.width-4, maxInt(m.tickerPanel.GetHeight(), 1))
 	b.WriteString("  " + m.tickerPanel.View() + "\n")
 
 	// ═══════════════════════════════════════════════════════════════
@@ -406,6 +418,7 @@ func (m Model) renderFooterSection() string {
 		GeminiCount:      m.geminiCount,
 		GrokCount:        m.grokCount,
 		OmpCount:         m.ompCount,
+		OpencodeCount:    m.opencodeCount,
 		AntigravityCount: m.antigravityCount,
 		UserCount:        m.userCount,
 		FocusedPanel:     panelIDString(m.focusedPanel),
@@ -470,6 +483,9 @@ func (m Model) renderStatsBar() string {
 	if healthBadge := m.renderHealthBadge(); healthBadge != "" {
 		parts = append(parts, healthBadge)
 	}
+	if bpBadge := m.renderBackpressureBadge(); bpBadge != "" {
+		parts = append(parts, bpBadge)
+	}
 
 	totalBadge := lipgloss.NewStyle().
 		Background(t.Surface0).
@@ -517,6 +533,18 @@ func (m Model) renderStatsBar() string {
 			Bold(true).
 			Padding(0, 1).
 			Render(fmt.Sprintf("OMP %d", m.ompCount)))
+	}
+	if m.opencodeCount > 0 {
+		ocColor := t.Semantic().AgentOpencode
+		if ocColor == "" {
+			ocColor = t.Teal
+		}
+		parts = append(parts, lipgloss.NewStyle().
+			Background(ocColor).
+			Foreground(t.Base).
+			Bold(true).
+			Padding(0, 1).
+			Render(fmt.Sprintf("OC %d", m.opencodeCount)))
 	}
 	if m.antigravityCount > 0 {
 		parts = append(parts, lipgloss.NewStyle().
@@ -614,6 +642,46 @@ func (m Model) renderHealthBadge() string {
 	return lipgloss.NewStyle().
 		Background(bgColor).
 		Foreground(fgColor).
+		Bold(true).
+		Padding(0, 1).
+		Render(fmt.Sprintf("%s %s", icon, label))
+}
+
+func classifyBackpressureSnapshot(bp backpressure.BackpressureSnapshot) (pressure.Level, bool) {
+	switch bp.Decision {
+	case backpressure.DecisionCoalesce:
+		return pressure.LevelElevated, false
+	case backpressure.DecisionDefer:
+		return pressure.LevelCritical, false
+	case backpressure.DecisionDegrade:
+		return pressure.LevelCritical, true
+	default:
+		return pressure.LevelNormal, false
+	}
+}
+
+func (m Model) renderBackpressureBadge() string {
+	bp := m.effectiveBackpressure()
+	level, overload := classifyBackpressureSnapshot(bp)
+	if level <= pressure.LevelNormal && !overload {
+		return ""
+	}
+
+	t := m.theme
+	var bgColor lipgloss.Color
+	var icon, label string
+	switch {
+	case overload:
+		bgColor, icon, label = t.Red, "✗", "BP: overload"
+	case level >= pressure.LevelCritical:
+		bgColor, icon, label = t.Peach, "⚠", "BP: critical"
+	default:
+		bgColor, icon, label = t.Yellow, "⚡", "BP: elevated"
+	}
+
+	return lipgloss.NewStyle().
+		Background(bgColor).
+		Foreground(t.Base).
 		Bold(true).
 		Padding(0, 1).
 		Render(fmt.Sprintf("%s %s", icon, label))
@@ -946,13 +1014,57 @@ func (m Model) renderDiagnosticsBar(width int) string {
 		parts = append(parts, labelStyle.Render("age")+":"+agePart)
 	}
 
+	content := strings.Join(parts, "  ")
+	if bpLine := m.renderBackpressureDiagnosticsLine(m.effectiveBackpressure()); bpLine != "" {
+		content += "\n" + bpLine
+	}
+
 	box := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(t.Surface1).
 		Padding(0, 1).
 		Width(width)
 
-	return box.Render(strings.Join(parts, "  "))
+	return box.Render(content)
+}
+
+func (m Model) renderBackpressureDiagnosticsLine(bp backpressure.BackpressureSnapshot) string {
+	level, overload := classifyBackpressureSnapshot(bp)
+	if level <= pressure.LevelNormal && !overload {
+		return ""
+	}
+
+	t := m.theme
+	labelStyle := lipgloss.NewStyle().Foreground(t.Subtext).Bold(true)
+	valueStyle := lipgloss.NewStyle().Foreground(t.Text)
+
+	var levelLabel string
+	var levelColor lipgloss.Color
+	switch {
+	case overload:
+		levelLabel, levelColor = "overload", t.Red
+	case level >= pressure.LevelCritical:
+		levelLabel, levelColor = "critical", t.Peach
+	default:
+		levelLabel, levelColor = "elevated", t.Yellow
+	}
+
+	reasons := make([]string, 0, len(bp.ReasonCodes))
+	for _, rc := range bp.ReasonCodes {
+		reasons = append(reasons, string(rc))
+	}
+	reasonText := "none"
+	if len(reasons) > 0 {
+		reasonText = strings.Join(reasons, ",")
+	}
+
+	detail := fmt.Sprintf("decision=%s reasons=%s", bp.Decision, reasonText)
+	if bp.RetryAfterMS > 0 {
+		detail += fmt.Sprintf(" retry=%dms", bp.RetryAfterMS)
+	}
+
+	levelStyled := lipgloss.NewStyle().Foreground(levelColor).Bold(true).Render(levelLabel)
+	return labelStyle.Render("backpressure") + ":" + levelStyled + "  " + valueStyle.Render(detail)
 }
 
 func hintForSessionFetchError(err error) string {
@@ -1102,7 +1214,7 @@ func (m Model) renderToastHistoryContent() string {
 	}
 
 	var lines []string
-	lines = append(lines, subtle.Render("Most recent first. Press n or Esc to close."))
+	lines = append(lines, subtle.Render("Most recent first. Press c to clear, n or Esc to close."))
 	lines = append(lines, "")
 
 	for _, toast := range m.toasts.RecentHistory(8) {
@@ -1161,30 +1273,34 @@ func (m Model) renderHelpOverlayBox(title, content string, maxWidth int) string 
 func (m Model) getFocusedPanelHints() []components.KeyHint {
 	var keybindings []panels.Keybinding
 
-	switch m.focusedPanel {
-	case PanelBeads:
-		if m.beadsPanel != nil {
-			keybindings = m.beadsPanel.Keybindings()
-		}
-	case PanelAlerts:
-		if m.alertsPanel != nil {
-			keybindings = m.alertsPanel.Keybindings()
-		}
-	case PanelAttention:
-		if m.attentionPanel != nil {
-			keybindings = m.attentionPanel.Keybindings()
-		}
-	case PanelMetrics:
-		if m.metricsPanel != nil {
-			keybindings = m.metricsPanel.Keybindings()
-		}
-	case PanelHistory:
-		if m.historyPanel != nil {
-			keybindings = m.historyPanel.Keybindings()
-		}
-	case PanelSidebar:
-		if ref, ok := m.sidebarActivePanelRef(); ok {
-			keybindings = ref.panel.Keybindings()
+	if m.showSpawnWizard && m.spawnWizard != nil {
+		keybindings = m.spawnWizard.Keybindings()
+	} else {
+		switch m.focusedPanel {
+		case PanelBeads:
+			if m.beadsPanel != nil {
+				keybindings = m.beadsPanel.Keybindings()
+			}
+		case PanelAlerts:
+			if m.alertsPanel != nil {
+				keybindings = m.alertsPanel.Keybindings()
+			}
+		case PanelAttention:
+			if m.attentionPanel != nil {
+				keybindings = m.attentionPanel.Keybindings()
+			}
+		case PanelMetrics:
+			if m.metricsPanel != nil {
+				keybindings = m.metricsPanel.Keybindings()
+			}
+		case PanelHistory:
+			if m.historyPanel != nil {
+				keybindings = m.historyPanel.Keybindings()
+			}
+		case PanelSidebar:
+			if ref, ok := m.sidebarActivePanelRef(); ok {
+				keybindings = ref.panel.Keybindings()
+			}
 		}
 	}
 

@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -230,6 +231,83 @@ func TestSubstituteErrorMessageReflectsConfiguredLimit(t *testing.T) {
 	want := "substitution recursion depth exceeded after 4 passes"
 	if !strings.Contains(err.Error(), want) {
 		t.Fatalf("Substitute() error = %v, want substring %q", err, want)
+	}
+}
+
+// Runtime loop aliases are a data boundary too. A bead/step value can flow
+// through foreach as ${item.*} / ${loop.item.*}; preserving the terminal
+// fence here prevents that indirection from re-enabling recursive expansion.
+func TestSubstituteLoopItemDoesNotInjectEnvVariable(t *testing.T) {
+	t.Setenv("BD_447SE_LOOP_SECRET", "must-not-leak")
+	item := map[string]interface{}{"title": "${env.BD_447SE_LOOP_SECRET}"}
+	state := &ExecutionState{Variables: map[string]interface{}{
+		"loop.item": item,
+		"loop.task": item,
+	}}
+	sub := NewSubstitutor(state, "sess", "wf")
+
+	for _, template := range []string{"${item.title}", "${loop.item.title}", "${loop.task.title}"} {
+		got, err := sub.Substitute(template)
+		if err != nil {
+			t.Fatalf("Substitute(%q) error = %v", template, err)
+		}
+		if got != "${env.BD_447SE_LOOP_SECRET}" {
+			t.Fatalf("Substitute(%q) = %q, want literal env reference", template, got)
+		}
+		if strings.Contains(got, "must-not-leak") {
+			t.Fatalf("Substitute(%q) leaked env value: %q", template, got)
+		}
+	}
+}
+
+func TestSubstituteLoopItemKeepsAlreadyResolvedScalarValues(t *testing.T) {
+	state := &ExecutionState{Variables: map[string]interface{}{
+		"loop.item":  "ready",
+		"loop.index": 2,
+	}}
+	sub := NewSubstitutor(state, "sess", "wf")
+	got, err := sub.Substitute("item=${loop.item} index=${loop.index}")
+	if err != nil {
+		t.Fatalf("Substitute() error = %v", err)
+	}
+	if got != "item=ready index=2" {
+		t.Fatalf("Substitute() = %q, want ordinary loop values preserved", got)
+	}
+}
+
+func TestSubstituteOutputVarAliasPreservesTerminalProvenance(t *testing.T) {
+	t.Setenv("BD_447SE_ALIAS_SECRET", "must-not-leak")
+	state := &ExecutionState{Variables: map[string]interface{}{}}
+	storeOutputVar(state, "answer", "literal ${env.BD_447SE_ALIAS_SECRET}", map[string]interface{}{"text": "${env.BD_447SE_ALIAS_SECRET}"})
+
+	if got := state.Variables["answer"]; got != "literal ${env.BD_447SE_ALIAS_SECRET}" {
+		t.Fatalf("raw output_var value mutated: %q", got)
+	}
+	for _, template := range []string{"${vars.answer}", "${vars.answer_parsed.text}"} {
+		sub := NewSubstitutor(state, "sess", "wf")
+		got, err := sub.Substitute(template)
+		if err != nil {
+			t.Fatalf("Substitute(%q): %v", template, err)
+		}
+		if strings.Contains(got, "must-not-leak") {
+			t.Fatalf("output_var alias leaked env value: %q", got)
+		}
+	}
+
+	raw, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restored ExecutionState
+	if err := json.Unmarshal(raw, &restored); err != nil {
+		t.Fatal(err)
+	}
+	got, err := NewSubstitutor(&restored, "sess", "wf").Substitute("${vars.answer}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "literal ${env.BD_447SE_ALIAS_SECRET}" {
+		t.Fatalf("restored output_var provenance lost: %q", got)
 	}
 }
 

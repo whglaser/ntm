@@ -10,11 +10,13 @@ ntm quick myproject --template=go
 ntm quick myproject --label frontend
 
 ntm spawn myproject --cc=3 --cod=2 --agy=1
+ntm spawn myproject --grok=1 --omp=1 --oc=1
 ntm spawn myproject --label frontend --cc=3
 ntm spawn myproject --label backend --cc=2 --worktrees
 ntm spawn myproject --no-user --cc=5 --cod=5
 ntm add myproject --cc=2
 ntm add myproject --label frontend --cc=1
+ntm scale myproject --cc=2 --grok=1 --omp=1 --oc=1 --dry-run
 
 ntm list
 ntm status myproject
@@ -76,6 +78,8 @@ ntm send myproject --all --randomize
 ntm copy myproject:1
 ntm copy myproject --all
 ntm copy myproject --cc
+ntm copy myproject --grok
+ntm copy myproject --omp --oc
 ntm copy myproject --code
 ntm save myproject
 
@@ -89,6 +93,15 @@ ntm logs myproject --panes=1,2
 ntm extract myproject --lines=200
 ntm diff myproject cc_1 cod_1
 ntm grep "timeout" myproject -C 3
+
+# Backpressure, swarm lab, and support bundles
+ntm health --backpressure --heatmap
+ntm health myproject --backpressure --heatmap --json
+ntm swarm lab list
+ntm swarm lab run --scenario short_smoke --gate short
+ntm swarm lab corpus --gate short
+ntm support-bundle --output bundle.zip --include-sessions
+ntm support-bundle --verify bundle.zip
 ```
 
 ### Human-Only Surfaces
@@ -98,8 +111,22 @@ These are excellent for operators, but not for agents driving automation:
 ```bash
 ntm dashboard myproject
 ntm palette myproject
+ntm web
 ntm bind
 ntm tutorial
+```
+
+## Reasoning Ensembles
+
+```bash
+ntm modes list --tier core
+ntm ensemble presets --format=json
+ntm ensemble suggest "What security issues exist in the auth layer?" --json
+ntm ensemble spawn myensemble --preset project-diagnosis --question "What are the main architectural risks?"
+ntm ensemble status myensemble --format=json
+ntm ensemble synthesize myensemble --format=json
+ntm ensemble compare myensemble-v1 myensemble-v2 --format=json
+ntm ensemble provenance --all --format=json
 ```
 
 ## Work Intelligence
@@ -133,12 +160,25 @@ ntm assign myproject --beads=br-123,br-124 --agent=codex
 ```bash
 ntm mail send myproject --all "Report blockers and current file focus."
 ntm mail inbox myproject
+ntm mail session-start myproject --program codex --model my-model --json
+ntm mail prepare-thread myproject --agent BlueLake --thread FEAT-123 --json
+ntm mail handshake myproject --agent BlueLake --to GreenCastle --reason "Coordinate API work" --json
 ntm locks list myproject --all-agents
 ntm locks renew myproject
 ntm locks force-release myproject 42 --note "agent inactive"  # approval-gated by default: files an approval, needs `ntm approve <id>` by a second operator
 ntm coordinator status myproject
 ntm coordinator digest myproject
 ntm coordinator conflicts myproject
+ntm attention list --session myproject --json
+ntm attention ack 42 --reason "investigating pane_2"
+ntm attention snooze 42 --until 30m --reason "waiting on build"
+ntm attention pin 42 --reason "release blocker"
+ntm attention dismiss 42 --reason "false alarm"
+
+ntm context recover myproject
+ntm context recover myproject --pane-id %17
+ntm rotate context pending
+ntm rotate context pending myproject
 
 ntm checkpoint save myproject -m "before risky refactor"
 ntm checkpoint list myproject
@@ -149,7 +189,29 @@ ntm history search "authentication error"
 ntm audit show myproject
 ntm conflicts myproject
 ntm resume myproject
+ntm resume myproject --spawn --grok=1 --omp=1 --oc=1
 ```
+
+`mail session-start` runs the Agent Mail bootstrap macro and saves the returned
+identity credential locally without printing it. Existing session coordinators
+and pane bindings stay intact; use the returned agent name with `--agent`.
+`mail prepare-thread` returns the thread summary, examples, and inbox in one
+macro call. Its default summary is deterministic; `--llm` enables the server's
+LLM summarizer, and `--include-bodies` includes full inbox messages. Thread
+preparation reuses an existing identity unless `--register-if-missing` is
+explicitly supplied. Handshakes require an existing identity because the server
+does not return a registration credential from that macro.
+
+`mail handshake` requests contact under the server's authorization rules. Use
+`--to-project /absolute/path` for a different project, `--auto-accept` to request
+mutual approval, and the `--welcome-subject`/`--welcome-body` pair for an optional
+welcome message. Tasks, contact reasons, and welcome messages respect the
+configured redaction mode before any macro is invoked; JSON results include a
+safe redaction summary when content matches. A blocked contact, unsupported
+macro, unconfirmed requested approval, or skipped requested welcome returns a
+nonzero exit with a `success:false` JSON envelope. Macro
+errors can follow partial server-side work; inspect the returned receipt before
+retrying instead of assuming nothing happened.
 
 Worktree-specific commands when repo policy allows them:
 

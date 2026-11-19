@@ -8,7 +8,9 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { apiRequestSignal, getAuthHeaders, getBaseUrl } from "@/lib/api/client";
+import { apiFetch, type ApiEnvelope } from "@/lib/api/client";
+import { BeadsActionsAndPlan } from "@/components/beads/BeadsActionsAndPlan";
+import { BeadsGraphAndDepsPanel } from "@/components/beads/BeadsGraphAndDepsPanel";
 
 type BeadStatus = "open" | "in_progress" | "closed";
 
@@ -26,14 +28,6 @@ interface Bead {
   updated_at?: string;
   dependency_count?: number;
   dependent_count?: number;
-}
-
-interface ApiEnvelope {
-  success: boolean;
-  timestamp: string;
-  request_id?: string;
-  error?: string;
-  error_code?: string;
 }
 
 interface BeadsListResponse extends ApiEnvelope {
@@ -131,40 +125,6 @@ const FILTER_DEFS: { key: BeadFilter; label: string; helper: string }[] = [
 ];
 
 const ASSIGNEE_STORAGE_KEY = "ntm-beads-assignee";
-
-async function apiFetch<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const baseUrl = getBaseUrl();
-  const headers: HeadersInit = {
-    "Content-Type": "application/json",
-    ...getAuthHeaders(),
-    ...(options.headers || {}),
-  };
-
-  const response = await fetch(`${baseUrl}${path}`, {
-    ...options,
-    signal: options.signal ?? apiRequestSignal(),
-    headers,
-  });
-
-  const raw = await response.text();
-  let data: unknown = null;
-  if (raw) {
-    try {
-      data = JSON.parse(raw);
-    } catch {
-      throw new Error("Invalid response from server.");
-    }
-  }
-
-  const envelope = data as ApiEnvelope | null;
-  if (!response.ok || !envelope?.success) {
-    const message =
-      envelope?.error || `Request failed (${response.status})`;
-    throw new Error(message);
-  }
-
-  return data as T;
-}
 
 function getErrorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
@@ -336,14 +296,14 @@ export default function BeadsPage() {
             return;
           }
 
-          await apiFetch(`/api/v1/beads/${bead.id}/claim`, {
+          await apiFetch(`/api/v1/beads/${encodeURIComponent(bead.id)}/claim`, {
             method: "POST",
             body: JSON.stringify({ assignee: resolvedAssignee }),
           });
         }
 
         if (targetStatus === "closed") {
-          await apiFetch(`/api/v1/beads/${bead.id}/close`, {
+          await apiFetch(`/api/v1/beads/${encodeURIComponent(bead.id)}/close`, {
             method: "POST",
           });
         }
@@ -429,6 +389,16 @@ export default function BeadsPage() {
           />
         ))}
       </div>
+
+      <BeadsActionsAndPlan
+        onNotice={setStatusNotice}
+        onSelectBead={setSelectedBeadId}
+      />
+
+      <BeadsGraphAndDepsPanel
+        onNotice={setStatusNotice}
+        onSelectBead={setSelectedBeadId}
+      />
 
       <div className="grid gap-6 lg:grid-cols-3">
         <section className="lg:col-span-2 space-y-4">

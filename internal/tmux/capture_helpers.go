@@ -58,6 +58,7 @@ func CaptureForStatusDetectionContext(ctx context.Context, target string) (strin
 }
 
 // CaptureForHealthCheckContext captures with context support for health checks.
+// Uses LinesHealthCheck (50 lines) to balance between detail and performance.
 func (c *Client) CaptureForHealthCheckContext(ctx context.Context, target string) (string, error) {
 	return c.CapturePaneOutputContext(ctx, target, LinesHealthCheck)
 }
@@ -68,6 +69,7 @@ func CaptureForHealthCheckContext(ctx context.Context, target string) (string, e
 }
 
 // CaptureForFullContextContext captures with context support for full analysis.
+// Uses LinesFullContext (500 lines) for grep, diff, save, and context estimation.
 func (c *Client) CaptureForFullContextContext(ctx context.Context, target string) (string, error) {
 	return c.CapturePaneOutputContext(ctx, target, LinesFullContext)
 }

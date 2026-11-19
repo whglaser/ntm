@@ -753,6 +753,135 @@ func TestRenewReservations(t *testing.T) {
 	}
 }
 
+func TestStartSession(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(mockMCPHandler(t, map[string]func(args map[string]interface{}) (interface{}, *JSONRPCError){
+		"macro_start_session": func(args map[string]interface{}) (interface{}, *JSONRPCError) {
+			return SessionStartResult{
+				Project: &Project{ID: 1, Slug: "ntm"},
+				Agent:   &Agent{ID: 5, Name: "BlueLake"},
+				Inbox:   []InboxMessage{},
+			}, nil
+		},
+	}))
+	defer server.Close()
+
+	c := NewClient(WithBaseURL(server.URL + "/"))
+	result, err := c.StartSession(context.Background(), "/test", "claude-code", "opus-4.5", "testing")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Project.Slug != "ntm" {
+		t.Errorf("project slug = %q, want ntm", result.Project.Slug)
+	}
+	if result.Agent.Name != "BlueLake" {
+		t.Errorf("agent name = %q, want BlueLake", result.Agent.Name)
+	}
+}
+
+func TestPrepareThread(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(mockMCPHandler(t, map[string]func(args map[string]interface{}) (interface{}, *JSONRPCError){
+		"macro_prepare_thread": func(args map[string]interface{}) (interface{}, *JSONRPCError) {
+			// Match the server's actual macro envelope, independently of our
+			// client structs: summary and examples are nested under thread.
+			return map[string]interface{}{
+				"project": map[string]interface{}{"id": 1, "slug": "test", "human_key": "/test"},
+				"agent":   map[string]interface{}{"id": 5, "name": "BlueLake"},
+				"thread": map[string]interface{}{
+					"thread_id": args["thread_id"],
+					"summary": map[string]interface{}{
+						"participants": []string{"BlueLake"},
+						"key_points":   []string{"point1"},
+						"action_items": []string{"item1"},
+					},
+					"examples":       []map[string]interface{}{{"id": 42, "subject": "Plan"}},
+					"total_messages": 7,
+				},
+				"inbox": []interface{}{},
+			}, nil
+		},
+	}))
+	defer server.Close()
+
+	c := NewClient(WithBaseURL(server.URL + "/"))
+	trueVal := true
+	falseVal := false
+	result, err := c.PrepareThread(context.Background(), PrepareThreadOptions{
+		ProjectKey:         "/test",
+		ThreadID:           "TKT-99",
+		Program:            "claude-code",
+		Model:              "opus-4.5",
+		AgentName:          "BlueLake",
+		TaskDescription:    "testing",
+		LLMModel:           "opus-4.5",
+		InboxLimit:         5,
+		IncludeExamples:    &trueVal,
+		IncludeInboxBodies: &falseVal,
+		LLMMode:            &trueVal,
+		RegisterIfMissing:  &trueVal,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Thread == nil || result.Thread.ThreadID != "TKT-99" {
+		t.Fatalf("thread = %+v, want TKT-99", result.Thread)
+	}
+	if result.Thread.TotalMessages != 7 || len(result.Thread.Summary.KeyPoints) != 1 || len(result.Thread.Examples) != 1 || result.Thread.Examples[0].ID != 42 {
+		t.Fatalf("macro discarded thread evidence: %+v", result.Thread)
+	}
+}
+
+func TestContactHandshake(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(mockMCPHandler(t, map[string]func(args map[string]interface{}) (interface{}, *JSONRPCError){
+		"macro_contact_handshake": func(args map[string]interface{}) (interface{}, *JSONRPCError) {
+			return map[string]interface{}{
+				"request": map[string]interface{}{
+					"from_agent": "TestAgent", "to_agent": "BlueLake", "status": "pending",
+					"from_project": "test", "to_project": "other",
+				},
+				"response": map[string]interface{}{"from": "TestAgent", "to": "BlueLake", "approved": true, "updated": 1},
+				"welcome_message": map[string]interface{}{
+					"count": 1,
+					"deliveries": []map[string]interface{}{{
+						"project": "other", "payload": map[string]interface{}{"id": 12, "subject": "Hello!"},
+					}},
+				},
+			}, nil
+		},
+	}))
+	defer server.Close()
+
+	c := NewClient(WithBaseURL(server.URL + "/"))
+	result, err := c.ContactHandshake(context.Background(), ContactHandshakeOptions{
+		ProjectKey:      "/test",
+		AgentName:       "TestAgent",
+		ToAgent:         "BlueLake",
+		ToProject:       "/other",
+		Reason:          "coordination",
+		Program:         "claude-code",
+		Model:           "opus-4.5",
+		TaskDescription: "testing",
+		AutoAccept:      true,
+		WelcomeSubject:  "Hello!",
+		WelcomeBody:     "Hi there",
+		TTLSeconds:      7200,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Request == nil || result.Request.Status != "pending" || result.Response == nil || !result.Response.Approved {
+		t.Fatalf("contact request/approval was discarded: %+v", result)
+	}
+	if result.WelcomeMsg == nil || result.WelcomeMsg.Count != 1 || len(result.WelcomeMsg.Deliveries) != 1 || result.WelcomeMsg.Deliveries[0].Payload.ID != 12 {
+		t.Fatalf("welcome delivery receipt was discarded: %+v", result.WelcomeMsg)
+	}
+}
+
 func TestSendOverseerMessage(t *testing.T) {
 	t.Parallel()
 

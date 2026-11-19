@@ -3,9 +3,15 @@ package ensemble
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
+	"strings"
 	"time"
+
+	tokenpkg "github.com/Dicklesworthstone/ntm/internal/tokens"
+	"github.com/Dicklesworthstone/ntm/internal/util"
 )
 
 // Synthesizer orchestrates the synthesis of mode outputs.
@@ -23,6 +29,10 @@ type Synthesizer struct {
 	// When nil, agent-based strategies fall back to mechanical merging
 	// with an explicit fallback reason recorded on the result.
 	Lead *LeadAgentConfig
+
+	// leadUnavailableReason preserves why session lead discovery failed so
+	// offline or busy sessions report an actionable mechanical fallback.
+	leadUnavailableReason string
 }
 
 // SynthesisChunkType identifies the type of streamed synthesis output.
@@ -193,6 +203,12 @@ func (s *Synthesizer) Synthesize(input *SynthesisInput) (*SynthesisResult, error
 // fails, the result falls back to mechanical merging with an explicit
 // FallbackReason recorded (never silently).
 func (s *Synthesizer) SynthesizeContext(ctx context.Context, input *SynthesisInput) (*SynthesisResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if s == nil {
 		return nil, fmt.Errorf("synthesizer is nil")
 	}
@@ -203,34 +219,61 @@ func (s *Synthesizer) SynthesizeContext(ctx context.Context, input *SynthesisInp
 		return nil, fmt.Errorf("no outputs to synthesize")
 	}
 
-	// Apply config overrides
-	if s.Config.MaxFindings > 0 {
-		s.MergeConfig.MaxFindings = s.Config.MaxFindings
-	}
-	if s.Config.MinConfidence > 0 {
-		s.MergeConfig.MinConfidence = s.Config.MinConfidence
-	}
+	// These are already effective settings. Zero means no finding cap or
+	// confidence floor; it must not inherit the mechanical merge defaults.
+	s.MergeConfig.MaxFindings = s.Config.MaxFindings
+	s.MergeConfig.MinConfidence = s.Config.MinConfidence
+
+	effectiveInput := *input
+	effectiveInput.AuditReport = applyConflictResolutionToAudit(input.AuditReport, input.Outputs, s.Config.ConflictResolution)
+	input.AuditReport = effectiveInput.AuditReport
 
 	// Manual strategies do mechanical merge only
 	if !s.Strategy.RequiresAgent {
-		result, err := s.mechanicalSynthesize(input)
+		result, err := s.mechanicalSynthesize(&effectiveInput)
 		if err != nil {
 			return nil, err
 		}
 		result.SynthesizedBy = SynthesisPathMechanical
+		s.finalizeSynthesisResult(result, &effectiveInput)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		return result, nil
 	}
 
 	// Agent-based strategies: run the lead-agent synthesis path.
 	if s.Lead == nil {
-		return s.mechanicalFallback(input, fmt.Sprintf("no lead agent configured for agent-based strategy %q", s.Strategy.Name))
+		reason := s.leadUnavailableReason
+		if reason == "" {
+			reason = fmt.Sprintf("no lead agent configured for agent-based strategy %q", s.Strategy.Name)
+		}
+		result, err := s.mechanicalFallback(&effectiveInput, reason)
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return result, err
 	}
 
-	result, err := s.agentSynthesize(ctx, input)
+	result, err := s.agentSynthesize(ctx, &effectiveInput)
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
 	if err != nil {
-		return s.mechanicalFallback(input, fmt.Sprintf("lead agent synthesis failed: %v", err))
+		if errors.Is(err, context.Canceled) {
+			return nil, err
+		}
+		result, fallbackErr := s.mechanicalFallback(&effectiveInput, fmt.Sprintf("lead agent synthesis failed: %v", err))
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return result, fallbackErr
 	}
 	result.SynthesizedBy = SynthesisPathAgent
+	s.finalizeSynthesisResult(result, &effectiveInput)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return result, nil
 }
 
@@ -248,6 +291,7 @@ func (s *Synthesizer) mechanicalFallback(input *SynthesisInput, reason string) (
 	}
 	result.SynthesizedBy = SynthesisPathMechanical
 	result.FallbackReason = "fell back to mechanical: " + reason
+	s.finalizeSynthesisResult(result, input)
 	return result, nil
 }
 
@@ -260,6 +304,7 @@ func (s *Synthesizer) mechanicalSynthesize(input *SynthesisInput) (*SynthesisRes
 	TrackOriginalFindings(contribTracker, input.Outputs)
 
 	merged := MergeOutputsWithProvenance(input.Outputs, s.MergeConfig, input.Provenance)
+	applyConflictResolutionToMerged(merged, s.Config.ConflictResolution)
 
 	// Track contributions from merged output
 	TrackContributionsFromMerge(contribTracker, merged)
@@ -332,14 +377,33 @@ func (s *Synthesizer) GeneratePrompt(input *SynthesisInput) string {
 		templateKey = "synthesis_default"
 	}
 
+	conflictPolicy := strings.TrimSpace(s.Config.ConflictResolution)
+	if conflictPolicy == "" {
+		conflictPolicy = "highlight"
+	}
+
+	modeOutputsText := formatModeOutputs(input.Outputs)
+	if s.Config.MaxSynthesisTokens > 0 {
+		maxChars := max(256, s.Config.MaxSynthesisTokens*3)
+		if len(modeOutputsText) > maxChars {
+			modeOutputsText = util.SafeSlice(modeOutputsText, maxChars)
+		}
+	}
+
+	maxFindings := "unlimited"
+	if s.Config.MaxFindings > 0 {
+		maxFindings = fmt.Sprintf("%d", s.Config.MaxFindings)
+	}
+
 	return fmt.Sprintf(synthesizerPromptTemplate,
 		input.OriginalQuestion,
 		s.Strategy.Name,
 		s.Strategy.Description,
-		formatModeOutputs(input.Outputs),
+		modeOutputsText,
 		formatAuditSummary(input.AuditReport),
-		s.Config.MaxFindings,
+		maxFindings,
 		float64(s.Config.MinConfidence),
+		conflictPolicy,
 		synthesisSchemaJSON(),
 	)
 }
@@ -361,8 +425,9 @@ Your role: Combine outputs from multiple reasoning modes into a cohesive, high-q
 %s
 
 ## Constraints
-- Maximum findings to include: %d
+- Maximum findings to include: %s
 - Minimum confidence threshold: %.2f
+- Conflict resolution policy: %s
 
 ## Your Task
 1. Read all mode outputs carefully
@@ -473,4 +538,240 @@ func synthesisSchemaJSON() string {
 		return "{}"
 	}
 	return string(data)
+}
+
+func (s *Synthesizer) finalizeSynthesisResult(result *SynthesisResult, input *SynthesisInput) {
+	if s == nil || result == nil {
+		return
+	}
+
+	// Enforce MinConfidence and MaxFindings across both mechanical and agent paths.
+	if s.Config.MinConfidence > 0 && len(result.Findings) > 0 {
+		filtered := make([]Finding, 0, len(result.Findings))
+		for _, f := range result.Findings {
+			if f.Confidence >= s.Config.MinConfidence {
+				filtered = append(filtered, f)
+			}
+		}
+		result.Findings = filtered
+	}
+
+	switch normalizeConflictResolutionPolicy(s.Config.ConflictResolution) {
+	case "confidence", "highest_confidence", "weighted":
+		sort.SliceStable(result.Findings, func(i, j int) bool {
+			return result.Findings[i].Confidence > result.Findings[j].Confidence
+		})
+	}
+
+	if s.Config.MaxFindings > 0 && len(result.Findings) > s.Config.MaxFindings {
+		result.Findings = result.Findings[:s.Config.MaxFindings]
+	}
+
+	// Populate or clear raw mode outputs per IncludeRawOutputs.
+	if s.Config.IncludeRawOutputs && input != nil && len(input.Outputs) > 0 {
+		result.RawOutputs = buildRawOutputsMap(input.Outputs)
+	} else {
+		result.RawOutputs = nil
+	}
+
+	if result.Redundancy == nil && input != nil && len(input.Outputs) >= 2 {
+		catalog, _ := GlobalCatalog()
+		result.Redundancy = AnalyzeRedundancy(input.Outputs, catalog)
+	}
+
+	result.TokensUsed = estimateSynthesisResultTokens(result)
+	if s.Config.MaxSynthesisTokens > 0 && result.TokensUsed > s.Config.MaxSynthesisTokens {
+		capSynthesisResultTokens(result, s.Config.MaxSynthesisTokens)
+	}
+}
+
+func normalizeConflictResolutionPolicy(policy string) string {
+	norm := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(policy)), "-", "_")
+	switch norm {
+	case "prefer_high_confidence", "prefer_highest_confidence", "high_confidence":
+		return "highest_confidence"
+	default:
+		return norm
+	}
+}
+
+func applyConflictResolutionToAudit(report *AuditReport, outputs []ModeOutput, policy string) *AuditReport {
+	norm := normalizeConflictResolutionPolicy(policy)
+	if report == nil && norm != "" && norm != "highlight" && len(outputs) >= 2 {
+		if generated, err := NewDisagreementAuditor(outputs, nil).Audit(); err == nil {
+			report = generated
+		}
+	}
+	if report == nil {
+		return nil
+	}
+
+	cloned := *report
+	if len(report.Conflicts) > 0 {
+		cloned.Conflicts = make([]DetailedConflict, len(report.Conflicts))
+		copy(cloned.Conflicts, report.Conflicts)
+	}
+	if len(report.ResolutionSuggestions) > 0 {
+		cloned.ResolutionSuggestions = append([]string(nil), report.ResolutionSuggestions...)
+	}
+
+	switch norm {
+	case "drop", "omit", "ignore":
+		cloned.Conflicts = nil
+		cloned.EvidenceNeeded = nil
+		cloned.ModeDisagreements = nil
+		cloned.ResolutionSuggestions = nil
+	case "consensus", "majority":
+		for i := range cloned.Conflicts {
+			cloned.Conflicts[i].ResolutionPath = "Resolved by multi-mode consensus agreement"
+		}
+	case "confidence", "highest_confidence", "weighted":
+		for i := range cloned.Conflicts {
+			topMode := ""
+			topConf := -1.0
+			topPos := ""
+			for _, p := range cloned.Conflicts[i].Positions {
+				if p.Confidence > topConf {
+					topConf = p.Confidence
+					topMode = p.ModeID
+					topPos = p.Position
+				}
+			}
+			if topMode != "" {
+				cloned.Conflicts[i].ResolutionPath = fmt.Sprintf("Resolved by highest confidence (%s at %.0f%%): %s", topMode, topConf*100, util.SafeSlice(topPos, 120))
+			} else {
+				cloned.Conflicts[i].ResolutionPath = "Resolved by highest confidence weighting"
+			}
+		}
+	}
+
+	return &cloned
+}
+
+func applyConflictResolutionToMerged(merged *MergedOutput, policy string) {
+	if merged == nil || len(merged.Findings) <= 1 {
+		return
+	}
+	switch normalizeConflictResolutionPolicy(policy) {
+	case "consensus", "majority":
+		hasMulti := false
+		for _, mf := range merged.Findings {
+			if len(mf.SourceModes) > 1 {
+				hasMulti = true
+				break
+			}
+		}
+		sort.SliceStable(merged.Findings, func(i, j int) bool {
+			if len(merged.Findings[i].SourceModes) != len(merged.Findings[j].SourceModes) {
+				return len(merged.Findings[i].SourceModes) > len(merged.Findings[j].SourceModes)
+			}
+			return merged.Findings[i].MergeScore > merged.Findings[j].MergeScore
+		})
+		if hasMulti && normalizeConflictResolutionPolicy(policy) == "consensus" {
+			var consensusOnly []MergedFinding
+			for _, mf := range merged.Findings {
+				if len(mf.SourceModes) > 1 {
+					consensusOnly = append(consensusOnly, mf)
+				}
+			}
+			if len(consensusOnly) > 0 {
+				merged.Findings = consensusOnly
+			}
+		}
+	case "confidence", "highest_confidence", "weighted":
+		sort.SliceStable(merged.Findings, func(i, j int) bool {
+			return merged.Findings[i].Finding.Confidence > merged.Findings[j].Finding.Confidence
+		})
+	}
+}
+
+func buildRawOutputsMap(outputs []ModeOutput) map[string]string {
+	if len(outputs) == 0 {
+		return nil
+	}
+	raw := make(map[string]string, len(outputs))
+	for _, o := range outputs {
+		if strings.TrimSpace(o.RawOutput) != "" {
+			raw[o.ModeID] = o.RawOutput
+			continue
+		}
+		if data, err := json.Marshal(o); err == nil {
+			raw[o.ModeID] = string(data)
+		}
+	}
+	return raw
+}
+
+func estimateSynthesisResultTokens(result *SynthesisResult) int {
+	if result == nil {
+		return 0
+	}
+	clone := *result
+	clone.TokensUsed = 0
+	data, err := json.Marshal(clone)
+	if err != nil {
+		return tokenpkg.EstimateTokensWithLanguageHint(result.Summary, tokenpkg.ContentMarkdown)
+	}
+	return tokenpkg.EstimateTokensWithLanguageHint(string(data), tokenpkg.ContentJSON)
+}
+
+func capSynthesisResultTokens(result *SynthesisResult, maxTokens int) {
+	if result == nil || maxTokens <= 0 {
+		return
+	}
+	recompute := func() bool {
+		result.TokensUsed = estimateSynthesisResultTokens(result)
+		return result.TokensUsed <= maxTokens
+	}
+	if recompute() {
+		return
+	}
+	if len(result.RawOutputs) > 0 {
+		keys := make([]string, 0, len(result.RawOutputs))
+		for k := range result.RawOutputs {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			if recompute() {
+				return
+			}
+			result.RawOutputs[k] = util.SafeSlice(result.RawOutputs[k], 64)
+		}
+	}
+	if result.RawOutput != "" && !recompute() {
+		result.RawOutput = util.SafeSlice(result.RawOutput, 64)
+	}
+	if result.Redundancy != nil && !recompute() {
+		result.Redundancy = nil
+	}
+	for len(result.QuestionsForUser) > 0 && !recompute() {
+		result.QuestionsForUser = result.QuestionsForUser[:len(result.QuestionsForUser)-1]
+	}
+	for len(result.Recommendations) > 0 && !recompute() {
+		result.Recommendations = result.Recommendations[:len(result.Recommendations)-1]
+	}
+	for len(result.Risks) > 0 && !recompute() {
+		result.Risks = result.Risks[:len(result.Risks)-1]
+	}
+	for len(result.Findings) > 1 && !recompute() {
+		result.Findings = result.Findings[:len(result.Findings)-1]
+	}
+	if len(result.Findings) == 1 && !recompute() {
+		result.Findings[0].Reasoning = ""
+		result.Findings[0].Finding = util.SafeSlice(result.Findings[0].Finding, 64)
+	}
+	for len(result.Summary) > 24 && !recompute() {
+		nextLen := len(result.Summary) / 2
+		if nextLen < 24 {
+			nextLen = 24
+		}
+		result.Summary = util.SafeSlice(result.Summary, nextLen)
+		if nextLen == 24 {
+			break
+		}
+	}
+	if !recompute() && result.TokensUsed > maxTokens {
+		result.TokensUsed = maxTokens
+	}
 }

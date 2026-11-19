@@ -204,14 +204,17 @@ func readNativeTranscriptTail(src io.ReaderAt, size int64) (*TranscriptUsage, er
 // record, with its preceding model. The second result permits looking farther
 // back only when no corruption or history-rewrite barrier was encountered.
 // Native compaction/branch records invalidate old accounting; their pre-counts
-// and projected after-counts are not a new provider measurement.
+// and projected after-counts are not a new provider measurement. A model switch
+// also invalidates the preceding model's window and occupancy until fresh usage.
 func parseLastUsage(buf []byte) (*TranscriptUsage, bool) {
 	var last *TranscriptUsage
 	lastModel := ""
+	unresolvedModel := false
 	mayLookBack := true
 	invalidate := func() {
 		last = nil
 		lastModel = ""
+		unresolvedModel = false
 		mayLookBack = false
 	}
 
@@ -262,12 +265,25 @@ func parseLastUsage(buf []byte) (*TranscriptUsage, bool) {
 			continue
 		}
 
+		declaredModel := ""
 		if (e.Type == "assistant" || (e.Type == "message" && e.Message.Role == "assistant")) && e.Message.Model != "" {
-			lastModel = ompQualifiedModel(e.Message.Provider, e.Message.Model)
+			declaredModel = ompQualifiedModel(e.Message.Provider, e.Message.Model)
 		} else if e.Type == "turn_context" && e.Payload.Model != "" {
-			lastModel = e.Payload.Model
+			declaredModel = e.Payload.Model
 		} else if e.Type == "model_change" && e.Model != "" {
-			lastModel = e.Model // omp: already provider-qualified
+			declaredModel = e.Model // omp: already provider-qualified
+		}
+		if declaredModel != "" {
+			if last != nil {
+				if last.Model == "" {
+					// Its preceding declaration may be outside the fast tail.
+					// Expand the scan before trusting its window or occupancy.
+					unresolvedModel = true
+				} else if !strings.EqualFold(last.Model, declaredModel) {
+					invalidate()
+				}
+			}
+			lastModel = declaredModel
 		}
 
 		switch {
@@ -337,12 +353,16 @@ func parseLastUsage(buf []byte) (*TranscriptUsage, bool) {
 		default:
 			continue
 		}
+		unresolvedModel = false
 		if last.Model == "" {
 			last.Model = lastModel
 		}
 		last.UpdatedAt, _ = time.Parse(time.RFC3339Nano, e.Timestamp)
 	}
 
+	if unresolvedModel {
+		return nil, mayLookBack
+	}
 	return last, mayLookBack
 }
 
@@ -606,6 +626,33 @@ func OmpStatusBarUsage(captured string, capturedAt time.Time) (*TranscriptUsage,
 	}, true
 }
 
+// OpencodeStatusBarUsage converts OpenCode's live right-sidebar context block
+// ("Context" / "<N> tokens" / "<P>% used") into a usage reading. When the
+// sidebar shows 0% used on a fresh session, fallbackWindow supplies the
+// context window; when usedPct > 0 and tokensUsed > 0, the effective context
+// window is derived directly from OpenCode's own accounting.
+func OpencodeStatusBarUsage(captured string, fallbackWindow int, capturedAt time.Time) (*TranscriptUsage, bool) {
+	usedPct, tokensUsed, ok := agent.OpencodeContextUsage(captured)
+	if !ok {
+		return nil, false
+	}
+	window := fallbackWindow
+	if usedPct > 0 && tokensUsed > 0 {
+		derived := int(float64(tokensUsed)*100/usedPct + 0.5)
+		if derived > 0 {
+			window = derived
+		}
+	}
+	if window <= 0 {
+		return nil, false
+	}
+	return &TranscriptUsage{
+		Tokens:        int(tokensUsed),
+		ContextWindow: window,
+		UpdatedAt:     capturedAt,
+	}, true
+}
+
 // LatestAgentTranscriptUsage finds the transcript for an agent pane by agent
 // type and working directory and returns its last usage record. agentType is
 // NTM's normalized agent type string ("claude", "codex", ...). newerThan
@@ -718,22 +765,24 @@ func maxPaneContextUsage(ctx stdcontext.Context, panes []tmux.Pane, stopAt int, 
 		seen[pane.ID] = true
 		agentType := agent.AgentType(pane.Type).Canonical()
 		switch agentType {
-		case agent.AgentTypeClaudeCode, agent.AgentTypeCodex, agent.AgentTypeGemini, agent.AgentTypeOmp:
+		case agent.AgentTypeClaudeCode, agent.AgentTypeCodex, agent.AgentTypeGemini, agent.AgentTypeOmp, agent.AgentTypeOpencode:
 		default:
 			continue
 		}
 		var used float64
 		var measured bool
 		// Only these existing parsers establish a native context gauge from
-		// its live composer/footer structure. Codex's generic percentage regex
-		// can match quoted history, so Codex uses exact transcript binding.
-		if agentType == agent.AgentTypeGemini || agentType == agent.AgentTypeOmp {
+		// its live composer/footer/sidebar structure. Codex's generic percentage
+		// regex can match quoted history, so Codex uses exact transcript binding.
+		if agentType == agent.AgentTypeGemini || agentType == agent.AgentTypeOmp || agentType == agent.AgentTypeOpencode {
 			if visible, err := capture(ctx, pane.ID); err == nil && ctx.Err() == nil {
 				if agentType == agent.AgentTypeOmp {
 					composer := agent.ParseOmpComposer(visible)
 					if composer.Found && composer.RowsBelow == 0 {
 						used, _, measured = agent.OmpContextUsage(visible)
 					}
+				} else if agentType == agent.AgentTypeOpencode {
+					used, _, measured = agent.OpencodeContextUsage(visible)
 				} else if parsed, err := agent.NewParser().ParseWithHint(visible, agentType); err == nil && parsed.ContextRemaining != nil {
 					used, measured = 100-*parsed.ContextRemaining, true
 				}
@@ -758,18 +807,16 @@ func maxPaneContextUsage(ctx stdcontext.Context, panes []tmux.Pane, stopAt int, 
 }
 
 func freshTranscriptUsagePercent(usage *TranscriptUsage, now time.Time) (float64, bool) {
-	if usage == nil || usage.Tokens < 0 || TranscriptConfidence(usage.UpdatedAt, now) != "high" {
+	if usage == nil || usage.Tokens < 0 || usage.ContextWindow < 0 || TranscriptConfidence(usage.UpdatedAt, now) != "high" {
 		return 0, false
 	}
 	limit := usage.ContextWindow
-	if limit <= 0 {
-		if !models.KnownModel(usage.Model) {
+	if limit == 0 {
+		var known bool
+		limit, known = models.LookupContextLimit(usage.Model)
+		if !known {
 			return 0, false
 		}
-		limit = models.GetContextLimit(usage.Model)
-	}
-	if limit <= 0 {
-		return 0, false
 	}
 	return min(float64(usage.Tokens)*100/float64(limit), 100), true
 }

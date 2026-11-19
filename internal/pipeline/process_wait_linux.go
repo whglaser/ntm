@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"strconv"
@@ -33,7 +34,22 @@ func waitCommandWithProcessGroupCleanup(ctx context.Context, cmd *exec.Cmd) (res
 	if cmd == nil || cmd.Process == nil || cmd.ProcessState != nil {
 		return commandCleanupResult{Err: errors.New("command cleanup requires a started, unwaited command")}
 	}
-	defer func() { verifyCommandOutputSettlement(cmd, &result) }()
+	if handle, ok := takeCommandContainmentHandle(cmd); ok {
+		return waitCommandWithContainmentHandle(ctx, cmd, handle)
+	}
+	return waitCommandWithProcPGID(ctx, cmd)
+}
+
+func waitCommandWithProcPGID(ctx context.Context, cmd *exec.Cmd) (result commandCleanupResult) {
+	waitStart := time.Now()
+	defer func() {
+		verifyCommandOutputSettlement(cmd, &result)
+		slog.Debug("command containment settled",
+			"containment_tier", ContainmentTierProcPGID,
+			"settlement_latency_us", time.Since(waitStart).Microseconds(),
+			"reaped_descendants", 0,
+		)
+	}()
 	if cmd.WaitDelay == 0 {
 		cmd.WaitDelay = commandPipeDrainTimeout
 	}
@@ -156,7 +172,7 @@ func cleanupCancelledCommandGroup(ctx context.Context, cmd *exec.Cmd, observatio
 	if errors.Is(killErr, os.ErrProcessDone) {
 		killErr = nil
 	}
-	settle, stop := context.WithTimeout(context.WithoutCancel(ctx), commandPipeDrainTimeout)
+	settle, stop := withCommandSettlementBudget(ctx, commandPipeDrainTimeout)
 	quietErr := waitCommandGroupQuiescent(settle, cmd.Process.Pid)
 	stop()
 	if killErr == nil {
@@ -411,11 +427,23 @@ func groupSignalFoundOnlyZombies(int) bool {
 // A quiet result requires a complete, valid census containing the unreaped
 // leader in its expected group. Missing evidence must not authorize replay.
 func commandGroupHasLiveMembers(pgid int) (bool, error) {
-	return inspectCommandGroup(pgid, commandGroupInspector{
-		readDir:  os.ReadDir,
-		readFile: os.ReadFile,
-		getpgid:  syscall.Getpgid,
-	})
+	const maxBirthRaceImmediateRetries = 4
+	inspector := commandGroupInspector{
+		readDir: os.ReadDir,
+		readFile: func(path string) ([]byte, error) {
+			if strings.HasPrefix(path, "/proc/") && strings.HasSuffix(path, "/stat") && path != "/proc/stat" {
+				commandGroupProcStatOpens.Add(1)
+			}
+			return os.ReadFile(path)
+		},
+		getpgid: syscall.Getpgid,
+	}
+	for attempt := 0; ; attempt++ {
+		alive, err := inspectCommandGroup(pgid, inspector)
+		if !errors.Is(err, errCommandGroupBirthRace) || attempt >= maxBirthRaceImmediateRetries {
+			return alive, err
+		}
+	}
 }
 
 // Keep the observation operations local to each census. Besides making the

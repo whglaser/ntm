@@ -20,9 +20,8 @@ import (
 
 // attachTokenFromField adds a cached token to an MCP tool arg map.
 // Different Agent Mail tools use different token parameter names:
-// send_message/reply_message use sender_token, most agent-scoped read
-// and reservation tools use registration_token, and handshake macros
-// use requester_registration_token / target_registration_token.
+// send_message/reply_message and handshake welcome messages use sender_token;
+// most agent-scoped reads and reservation tools use registration_token.
 func (c *Client) attachTokenFromField(args map[string]interface{}, tokenField, agentField string) {
 	if c == nil || args == nil {
 		return
@@ -702,6 +701,142 @@ func (c *Client) ListReservations(ctx context.Context, projectKey, agentName str
 	}
 
 	return c.readReservationPages(ctx, projectKey, agentName, allAgents, uri, result)
+}
+
+// StartSession is a macro that starts a project session (ensure project, register agent, fetch inbox).
+func (c *Client) StartSession(ctx context.Context, projectKey, program, model, taskDescription string) (*SessionStartResult, error) {
+	args := map[string]interface{}{
+		"human_key": projectKey,
+		"program":   program,
+		"model":     model,
+	}
+	if taskDescription != "" {
+		args["task_description"] = taskDescription
+	}
+
+	c.attachRegistrationToken(args)
+	result, err := c.callTool(ctx, "macro_start_session", args)
+	if err != nil {
+		return nil, err
+	}
+
+	var sessionResult SessionStartResult
+	if err := json.Unmarshal(result, &sessionResult); err != nil {
+		return nil, NewAPIError("macro_start_session", 0, err)
+	}
+	c.rememberRegistrationToken(projectKey, sessionResult.Agent)
+
+	return &sessionResult, nil
+}
+
+// PrepareThread aligns an agent with an existing thread, optionally summarizing the thread.
+// This is a macro that ensures registration, summarizes the thread, and fetches recent inbox context.
+func (c *Client) PrepareThread(ctx context.Context, opts PrepareThreadOptions) (*PrepareThreadResult, error) {
+	args := map[string]interface{}{
+		"project_key": opts.ProjectKey,
+		"thread_id":   opts.ThreadID,
+		"program":     opts.Program,
+		"model":       opts.Model,
+	}
+
+	if opts.AgentName != "" {
+		args["agent_name"] = opts.AgentName
+	}
+	if opts.TaskDescription != "" {
+		args["task_description"] = opts.TaskDescription
+	}
+	if opts.LLMModel != "" {
+		args["llm_model"] = opts.LLMModel
+	}
+	if opts.InboxLimit > 0 {
+		args["inbox_limit"] = opts.InboxLimit
+	}
+
+	// Only send boolean options when explicitly set (non-nil).
+	// Server defaults: include_examples=true, include_inbox_bodies=false, llm_mode=true, register_if_missing=true
+	if opts.IncludeExamples != nil {
+		args["include_examples"] = *opts.IncludeExamples
+	}
+	if opts.IncludeInboxBodies != nil {
+		args["include_inbox_bodies"] = *opts.IncludeInboxBodies
+	}
+	if opts.LLMMode != nil {
+		args["llm_mode"] = *opts.LLMMode
+	}
+	if opts.RegisterIfMissing != nil {
+		args["register_if_missing"] = *opts.RegisterIfMissing
+	}
+
+	c.attachTokenFromField(args, "registration_proof", "agent_name")
+	result, err := c.callTool(ctx, "macro_prepare_thread", args)
+	if err != nil {
+		return nil, err
+	}
+
+	var threadResult PrepareThreadResult
+	if err := json.Unmarshal(result, &threadResult); err != nil {
+		return nil, NewAPIError("macro_prepare_thread", 0, err)
+	}
+	c.rememberRegistrationToken(opts.ProjectKey, threadResult.Agent)
+
+	return &threadResult, nil
+}
+
+// ContactHandshake requests contact permissions and optionally auto-approves and sends a welcome message.
+func (c *Client) ContactHandshake(ctx context.Context, opts ContactHandshakeOptions) (*ContactHandshakeResult, error) {
+	args := map[string]interface{}{
+		"project_key": opts.ProjectKey,
+	}
+
+	if opts.AgentName != "" {
+		args["agent_name"] = opts.AgentName
+	}
+	if opts.ToAgent != "" {
+		args["to_agent"] = opts.ToAgent
+	}
+	if opts.ToProject != "" {
+		args["to_project"] = opts.ToProject
+	}
+	if opts.Reason != "" {
+		args["reason"] = opts.Reason
+	}
+	if opts.Program != "" {
+		args["program"] = opts.Program
+	}
+	if opts.Model != "" {
+		args["model"] = opts.Model
+	}
+	if opts.TaskDescription != "" {
+		args["task_description"] = opts.TaskDescription
+	}
+	if opts.WelcomeSubject != "" {
+		args["welcome_subject"] = opts.WelcomeSubject
+	}
+	if opts.WelcomeBody != "" {
+		args["welcome_body"] = opts.WelcomeBody
+	}
+	if opts.TTLSeconds > 0 {
+		args["ttl_seconds"] = opts.TTLSeconds
+	}
+
+	args["auto_accept"] = opts.AutoAccept
+	args["register_if_missing"] = opts.RegisterIfMissing
+
+	// The macro forwards sender_token to the welcome send. The server's MCP
+	// actor authorization controls both request and acceptance; a same-named
+	// target token from the requester's project is never contact authority.
+	c.attachTokenFromField(args, "sender_token", "agent_name")
+	result, err := c.callTool(ctx, "macro_contact_handshake", args)
+	if err != nil {
+		return nil, err
+	}
+
+	var handshakeResult ContactHandshakeResult
+	if err := json.Unmarshal(result, &handshakeResult); err != nil {
+		return nil, NewAPIError("macro_contact_handshake", 0, err)
+	}
+
+	return &handshakeResult, nil
 }
 
 // SendOverseerMessage uses the server's audited human intervention route.

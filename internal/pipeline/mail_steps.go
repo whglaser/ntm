@@ -1262,13 +1262,31 @@ func (e *Executor) executeMailInboxCheckStep(ctx context.Context, step *Step, re
 		return failMailStep(result, "substitution", fmt.Sprintf("mail_inbox_check agent_name: %v", err))
 	}
 
+	if e.stopBeforeDispatch(ctx, &result) {
+		return result
+	}
+
 	client := e.mailClient(projectKey)
 	messages, err := client.FetchInbox(ctx, agentmail.FetchInboxOptions{
 		ProjectKey: projectKey,
 		AgentName:  agentName,
 	})
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			result.Status = StatusCancelled
+			result.SkipKind = SkipKindCancelled
+			result.SkipReason = ctxErr.Error()
+			result.FinishedAt = time.Now()
+			return result
+		}
 		return failMailStep(result, "agent_mail", fmt.Sprintf("mail_inbox_check failed: %v", err))
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		result.Status = StatusCancelled
+		result.SkipKind = SkipKindCancelled
+		result.SkipReason = ctxErr.Error()
+		result.FinishedAt = time.Now()
+		return result
 	}
 
 	ackRequired := 0

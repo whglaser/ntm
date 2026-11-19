@@ -606,9 +606,11 @@ func (s *DefaultPaneSpawner) agentLaunchSpec(session, agentType string, index in
 			}
 		}
 	}
-	if agent.AgentType(agentType).Canonical() == agent.AgentTypeAntigravity &&
-		vars.ModelAlias != "" && vars.ModelAlias != config.AntigravityRequiredModel {
-		return tmux.AgentLaunchSpec{}, fmt.Errorf("antigravity model is pinned to %q, cannot restore model %q", config.AntigravityRequiredModel, vars.ModelAlias)
+	if agent.AgentType(agentType).Canonical() == agent.AgentTypeAntigravity {
+		allowed := models.GetModelName("antigravity", "")
+		if vars.ModelAlias != "" && vars.ModelAlias != config.AntigravityRequiredModel && vars.ModelAlias != allowed {
+			return tmux.AgentLaunchSpec{}, fmt.Errorf("antigravity model is pinned to %q, cannot restore model %q", allowed, vars.ModelAlias)
+		}
 	}
 	vars.Model = models.GetModelName(agentType, vars.ModelAlias)
 	if agent.AgentType(agentType).Canonical() == agent.AgentTypeClaudeCode {
@@ -758,7 +760,7 @@ func rotationPromptReady(captured string, pane tmux.Pane) (bool, string) {
 	}
 	composer := tmux.InspectComposer(captured, pane.Type)
 	switch pane.Type.Canonical() {
-	case agent.AgentTypeClaudeCode, agent.AgentTypeCodex, agent.AgentTypeGrok, agent.AgentTypeOmp:
+	case agent.AgentTypeClaudeCode, agent.AgentTypeCodex, agent.AgentTypeGrok, agent.AgentTypeOmp, agent.AgentTypeOpencode, agent.AgentTypeAntigravity:
 		if !composer.MarkerVisible {
 			return false, "agent composer is not visible"
 		}
@@ -983,6 +985,8 @@ func (s *DefaultPaneSpawner) DeliverHandoffContext(ctx stdcontext.Context, sessi
 		confirmed, _, err = tmux.VerifyGrokSubmissionContext(deliveryCtx, ready.ID, prompt, ready.Width)
 	case agent.AgentTypeOmp:
 		confirmed, _, err = tmux.VerifyOmpSubmissionContext(deliveryCtx, ready.ID, prompt, ready.Width)
+	case agent.AgentTypeOpencode:
+		confirmed, _, err = tmux.VerifyOpencodeSubmissionContext(deliveryCtx, ready.ID, prompt, ready.Width)
 	}
 	if err != nil {
 		return fmt.Errorf("checking handoff submission: %w", err)
@@ -1188,6 +1192,10 @@ func agentTypeShort(agentType string) string {
 		return "gmi"
 	case agent.AgentTypeAntigravity:
 		return "agy"
+	case agent.AgentTypeGrok:
+		return "grok"
+	case agent.AgentTypeOpencode:
+		return "oc"
 	case agent.AgentTypeOmp:
 		return "omp"
 	case agent.AgentTypeCursor:
@@ -1216,6 +1224,10 @@ func agentTypeLong(shortType string) string {
 		return "gemini"
 	case agent.AgentTypeAntigravity:
 		return "antigravity"
+	case agent.AgentTypeGrok:
+		return "grok"
+	case agent.AgentTypeOpencode:
+		return "opencode"
 	case agent.AgentTypeOmp:
 		return "omp"
 	case agent.AgentTypeCursor:
@@ -2127,7 +2139,9 @@ func (r *Rotator) rotateAgentContext(ctx stdcontext.Context, session, agentID, w
 		recordRotationToHistory(result, session, deriveAgentTypeFromID(agentID), 0)
 		return result
 	}
-	if state.Estimate != nil {
+	if est := r.monitor.GetEstimate(agentID); est != nil {
+		contextUsage = est.UsagePercent
+	} else if state.Estimate != nil {
 		contextUsage = state.Estimate.UsagePercent
 	}
 
@@ -2439,11 +2453,8 @@ func (r *Rotator) rotateAgentContext(ctx stdcontext.Context, session, agentID, w
 		result.Error += fmt.Sprintf("warning: failed to kill old pane: %v", err)
 	}
 
-	// Record the rotation event
-	contextBefore := float64(0)
-	if state.Estimate != nil {
-		contextBefore = state.Estimate.UsagePercent
-	}
+	// Record the rotation event using pre-reset usage captured before ResetAgent.
+	contextBefore := contextUsage
 	event := RotationEvent{
 		SessionName:   session,
 		OldAgentID:    agentID,
@@ -2791,13 +2802,6 @@ func (r *Rotator) GetHistory() []RotationEvent {
 	return out
 }
 
-// ClearHistory clears the rotation history.
-func (r *Rotator) ClearHistory() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.history = make([]RotationEvent, 0)
-}
-
 // ManualRotate triggers a rotation for a specific agent regardless of threshold.
 func (r *Rotator) ManualRotate(session, agentID, workDir string) RotationResult {
 	// Check prerequisites that rotateAgent assumes
@@ -2898,12 +2902,6 @@ func (r *Rotator) EnqueuePendingRotation(session, agentID, paneID string, contex
 	// (createPendingRotation overwrites both the in-memory entry and the
 	// persisted store entry).
 	return r.createPendingRotation(session, agentID, paneID, contextPercent, workDir)
-}
-
-// ConfirmRotation handles user confirmation of a pending rotation.
-// Returns the result of the action taken.
-func (r *Rotator) ConfirmRotation(agentID string, action ConfirmAction, postponeMinutes int) RotationResult {
-	return r.ConfirmRotationContext(stdcontext.Background(), agentID, action, postponeMinutes)
 }
 
 // ConfirmPendingRotationContext executes a persisted choice through the same
@@ -3260,6 +3258,26 @@ func (r *Rotator) ConfirmRotationContext(ctx stdcontext.Context, agentID string,
 	}
 }
 
+// LoadPendingFromStore hydrates the rotator's in-memory pending map from the
+// persistent pending rotation store without mutating stored timestamps or claims.
+func (r *Rotator) LoadPendingFromStore() error {
+	entries, err := GetAllPendingRotations()
+	if err != nil {
+		return err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.pending == nil {
+		r.pending = make(map[string]*PendingRotation, len(entries))
+	}
+	for _, entry := range entries {
+		if entry != nil && entry.AgentID != "" {
+			r.pending[entry.AgentID] = entry
+		}
+	}
+	return nil
+}
+
 // CancelPendingRotation removes a pending rotation without taking any action.
 func (r *Rotator) CancelPendingRotation(agentID string) bool {
 	r.mu.Lock()
@@ -3272,14 +3290,4 @@ func (r *Rotator) CancelPendingRotation(agentID string) bool {
 		return true
 	}
 	return false
-}
-
-// ClearPending removes all pending rotations.
-func (r *Rotator) ClearPending() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.pending = make(map[string]*PendingRotation)
-	if err := DefaultPendingRotationStore.Clear(); err != nil {
-		slog.Warn("failed to clear pending rotation store", "error", err)
-	}
 }

@@ -8,15 +8,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { apiRequestSignal, getAuthHeaders, getBaseUrl } from "@/lib/api/client";
-
-interface ApiEnvelope {
-  success: boolean;
-  timestamp: string;
-  request_id?: string;
-  error?: string;
-  error_code?: string;
-}
+import { apiFetch, type ApiEnvelope } from "@/lib/api/client";
+import { MailContactsPanel } from "@/components/mail/MailContactsPanel";
 
 interface Agent {
   id: number;
@@ -87,44 +80,27 @@ interface ReservationConflictsResponse extends ApiEnvelope {
   has_conflicts: boolean;
 }
 
+interface MailSearchResultItem {
+  id: number;
+  subject: string;
+  from: string;
+  created_ts: string;
+  thread_id?: string | null;
+  importance: string;
+  ack_required: boolean;
+}
+
+interface MailSearchResponse extends ApiEnvelope {
+  results: MailSearchResultItem[];
+  count: number;
+  query: string;
+}
+
 type Notice = { type: "success" | "error"; message: string };
 
 type ImportanceFilter = "all" | "normal" | "high" | "urgent";
 
 const AGENT_STORAGE_KEY = "ntm-mail-agent";
-
-async function apiFetch<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const baseUrl = getBaseUrl();
-  const headers: HeadersInit = {
-    "Content-Type": "application/json",
-    ...getAuthHeaders(),
-    ...(options.headers || {}),
-  };
-
-  const response = await fetch(`${baseUrl}${path}`, {
-    ...options,
-    signal: options.signal ?? apiRequestSignal(),
-    headers,
-  });
-
-  const raw = await response.text();
-  let data: unknown = null;
-  if (raw) {
-    try {
-      data = JSON.parse(raw);
-    } catch {
-      throw new Error("Invalid response from server.");
-    }
-  }
-
-  const envelope = data as ApiEnvelope | null;
-  if (!response.ok || !envelope?.success) {
-    const message = envelope?.error || `Request failed (${response.status})`;
-    throw new Error(message);
-  }
-
-  return data as T;
-}
 
 function getErrorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
@@ -164,6 +140,10 @@ export default function MailPage() {
   const [ackOnly, setAckOnly] = useState(false);
   const [selectedMessageId, setSelectedMessageId] = useState<number | null>(null);
   const [replyBody, setReplyBody] = useState("");
+  const [searchInput, setSearchInput] = useState("");
+  const [submittedSearch, setSubmittedSearch] = useState("");
+  const [reservationBusyId, setReservationBusyId] = useState<number | null>(null);
+  const [confirmForceReleaseId, setConfirmForceReleaseId] = useState<number | null>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
   const noticeTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [actionBusy, setActionBusy] = useState({
@@ -238,6 +218,15 @@ export default function MailPage() {
     refetchInterval: 15000,
   });
 
+  const searchQuery = useQuery({
+    queryKey: ["mail", "search", submittedSearch],
+    queryFn: () =>
+      apiFetch<MailSearchResponse>(
+        `/api/v1/mail/search?q=${encodeURIComponent(submittedSearch)}&limit=25`
+      ),
+    enabled: submittedSearch.length > 0,
+  });
+
   const reservationPaths = useMemo(() => {
     const reservations = reservationsQuery.data?.reservations ?? [];
     const paths = new Set<string>();
@@ -306,7 +295,9 @@ export default function MailPage() {
     queryKey: ["mail", "thread", selectedMessage?.thread_id],
     queryFn: () =>
       apiFetch<ThreadSummaryResponse>(
-        `/api/v1/mail/threads/${selectedMessage?.thread_id}/summary`
+        `/api/v1/mail/threads/${encodeURIComponent(
+          selectedMessage?.thread_id ?? ""
+        )}/summary`
       ),
     enabled: Boolean(selectedMessage?.thread_id),
   });
@@ -437,6 +428,96 @@ export default function MailPage() {
     setStatusNotice,
   ]);
 
+  const handleSearchSubmit = useCallback(
+    (event: React.FormEvent) => {
+      event.preventDefault();
+      setSubmittedSearch(searchInput.trim());
+    },
+    [searchInput]
+  );
+
+  const handleRenewReservation = useCallback(
+    async (entry: Reservation) => {
+      setReservationBusyId(entry.id);
+      try {
+        await apiFetch<ApiEnvelope>(
+          `/api/v1/reservations/${encodeURIComponent(String(entry.id))}/renew`,
+          {
+            method: "POST",
+            body: JSON.stringify({
+              agent_name: entry.agent_name,
+              extend_seconds: 1800,
+            }),
+          }
+        );
+        void queryClient.invalidateQueries({ queryKey: ["reservations"] });
+        setStatusNotice({
+          type: "success",
+          message: `Renewed reservation #${entry.id} (+30m).`,
+        });
+      } catch (error) {
+        setStatusNotice({ type: "error", message: getErrorMessage(error) });
+      } finally {
+        setReservationBusyId(null);
+      }
+    },
+    [queryClient, setStatusNotice]
+  );
+
+  const handleReleaseReservation = useCallback(
+    async (entry: Reservation) => {
+      setReservationBusyId(entry.id);
+      try {
+        await apiFetch<ApiEnvelope>(
+          `/api/v1/reservations/${encodeURIComponent(String(entry.id))}/release?agent_name=${encodeURIComponent(
+            entry.agent_name
+          )}`,
+          { method: "POST" }
+        );
+        void queryClient.invalidateQueries({ queryKey: ["reservations"] });
+        setStatusNotice({
+          type: "success",
+          message: `Released reservation #${entry.id}.`,
+        });
+      } catch (error) {
+        setStatusNotice({ type: "error", message: getErrorMessage(error) });
+      } finally {
+        setReservationBusyId(null);
+      }
+    },
+    [queryClient, setStatusNotice]
+  );
+
+  const handleForceReleaseReservation = useCallback(
+    async (entry: Reservation) => {
+      setReservationBusyId(entry.id);
+      try {
+        await apiFetch<ApiEnvelope>(
+          `/api/v1/reservations/${encodeURIComponent(String(entry.id))}/force-release`,
+          {
+            method: "POST",
+            body: JSON.stringify({
+              agent_name: agentName || entry.agent_name,
+              note: "Operator force-release via Web Cockpit",
+              notify_previous: true,
+            }),
+          }
+        );
+        setConfirmForceReleaseId((prev) => (prev === entry.id ? null : prev));
+        void queryClient.invalidateQueries({ queryKey: ["reservations"] });
+        setStatusNotice({
+          type: "success",
+          message: `Force-released reservation #${entry.id}.`,
+        });
+      } catch (error) {
+        setStatusNotice({ type: "error", message: getErrorMessage(error) });
+      } finally {
+        setReservationBusyId(null);
+      }
+    },
+    [agentName, queryClient, setStatusNotice]
+  );
+
   const connectionError =
     agentsQuery.error ??
     inboxQuery.error ??
@@ -501,6 +582,95 @@ export default function MailPage() {
           {notice.message}
         </div>
       )}
+
+      {/* Cross-Thread Mail Search */}
+      <section className="rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 p-4 space-y-3">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+          <div>
+            <h2 className="text-base font-semibold text-gray-900 dark:text-white">
+              Cross-Thread Mail Search
+            </h2>
+            <p className="text-xs text-gray-500 dark:text-gray-400">
+              Search subjects, threads, and bodies across the Agent Mail archive.
+            </p>
+          </div>
+          {submittedSearch && (
+            <span className="text-xs text-gray-500 dark:text-gray-400">
+              {searchQuery.data?.count ?? 0} match{(searchQuery.data?.count ?? 0) === 1 ? "" : "es"} for &ldquo;{submittedSearch}&rdquo;
+            </span>
+          )}
+        </div>
+
+        <form onSubmit={handleSearchSubmit} className="flex flex-wrap gap-2">
+          <input
+            aria-label="Search Agent Mail"
+            value={searchInput}
+            onChange={(event) => setSearchInput(event.target.value)}
+            placeholder="Search by bead ID, thread, or keyword..."
+            className="flex-1 min-w-[14rem] rounded-md border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 px-3 py-1.5 text-sm text-gray-900 dark:text-white"
+          />
+          <button
+            type="submit"
+            disabled={!searchInput.trim() || searchQuery.isFetching}
+            className="px-3 py-1.5 rounded-md text-xs font-medium bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50"
+          >
+            {searchQuery.isFetching ? "Searching…" : "Search Mail"}
+          </button>
+          {submittedSearch && (
+            <button
+              type="button"
+              onClick={() => {
+                setSearchInput("");
+                setSubmittedSearch("");
+              }}
+              className="px-3 py-1.5 rounded-md text-xs font-medium border border-gray-200 dark:border-gray-700 text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700"
+            >
+              Clear
+            </button>
+          )}
+        </form>
+
+        {searchQuery.error && (
+          <div className="rounded border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700 dark:border-red-800 dark:bg-red-900/20 dark:text-red-300">
+            {getErrorMessage(searchQuery.error)}
+          </div>
+        )}
+
+        {submittedSearch && !searchQuery.isFetching && !searchQuery.error && (searchQuery.data?.results?.length ?? 0) === 0 && (
+          <div className="text-xs text-gray-500 dark:text-gray-400">
+            No archived mail matched &ldquo;{submittedSearch}&rdquo;.
+          </div>
+        )}
+
+        {(searchQuery.data?.results?.length ?? 0) > 0 && (
+          <div className="grid gap-2 sm:grid-cols-2">
+            {searchQuery.data?.results.map((hit) => (
+              <button
+                key={hit.id}
+                type="button"
+                onClick={() => {
+                  if (messageList.some((m) => m.id === hit.id)) {
+                    setSelectedMessageId(hit.id);
+                  }
+                }}
+                className="text-left rounded border border-gray-200 dark:border-gray-700 bg-gray-50/70 dark:bg-gray-900/40 px-3 py-2 hover:border-blue-400 transition-colors"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-semibold text-gray-900 dark:text-white truncate">
+                    {hit.subject}
+                  </span>
+                  <span className={`px-2 py-0.5 rounded-full text-[11px] ${importanceBadge(hit.importance)}`}>
+                    {hit.importance}
+                  </span>
+                </div>
+                <div className="mt-1 text-[11px] text-gray-500 dark:text-gray-400">
+                  From {hit.from} · Thread {hit.thread_id || "—"} · {formatShortDate(hit.created_ts)}
+                </div>
+              </button>
+            ))}
+          </div>
+        )}
+      </section>
 
       <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)]">
         <section className="space-y-4">
@@ -856,12 +1026,81 @@ export default function MailPage() {
                       .filter(Boolean)
                       .join(" · ") || "—"}
                   </div>
+
+                  <div className="space-y-1.5 border-t border-gray-200 dark:border-gray-700 pt-2">
+                    {group.entries.map((entry) => {
+                      const isBusy = reservationBusyId === entry.id;
+                      const isConfirmingForce = confirmForceReleaseId === entry.id;
+                      return (
+                        <div
+                          key={entry.id}
+                          className="flex flex-wrap items-center justify-between gap-2 text-xs"
+                        >
+                          <span className="font-mono text-gray-600 dark:text-gray-300">
+                            #{entry.id} · {entry.agent_name}
+                          </span>
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <button
+                              type="button"
+                              disabled={isBusy}
+                              aria-label={`Renew reservation ${entry.id}`}
+                              onClick={() => void handleRenewReservation(entry)}
+                              className="rounded border border-gray-300 dark:border-gray-600 px-2 py-0.5 text-[11px] font-medium text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-50"
+                            >
+                              Renew (+30m)
+                            </button>
+                            <button
+                              type="button"
+                              disabled={isBusy}
+                              aria-label={`Release reservation ${entry.id}`}
+                              onClick={() => void handleReleaseReservation(entry)}
+                              className="rounded border border-amber-300 dark:border-amber-700 px-2 py-0.5 text-[11px] font-medium text-amber-800 dark:text-amber-300 hover:bg-amber-50 dark:hover:bg-amber-900/20 disabled:opacity-50"
+                            >
+                              Release
+                            </button>
+                            {!isConfirmingForce ? (
+                              <button
+                                type="button"
+                                disabled={isBusy}
+                                aria-label={`Force release reservation ${entry.id}`}
+                                onClick={() => setConfirmForceReleaseId(entry.id)}
+                                className="rounded border border-red-300 dark:border-red-700 px-2 py-0.5 text-[11px] font-medium text-red-700 dark:text-red-300 hover:bg-red-50 dark:hover:bg-red-900/20 disabled:opacity-50"
+                              >
+                                Force Release
+                              </button>
+                            ) : (
+                              <span className="inline-flex items-center gap-1">
+                                <button
+                                  type="button"
+                                  disabled={isBusy}
+                                  aria-label={`Confirm force release reservation ${entry.id}`}
+                                  onClick={() => void handleForceReleaseReservation(entry)}
+                                  className="rounded bg-red-600 px-2 py-0.5 text-[11px] font-medium text-white hover:bg-red-700 disabled:opacity-50"
+                                >
+                                  Confirm Force
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setConfirmForceReleaseId(null)}
+                                  className="text-[11px] text-gray-500 dark:text-gray-400 hover:underline"
+                                >
+                                  Cancel
+                                </button>
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
                 </div>
               );
             })}
           </div>
         )}
       </section>
+
+      <MailContactsPanel selectedAgentName={agentName} />
     </div>
   );
 }

@@ -1712,11 +1712,12 @@ func DefaultXFConfig() XFConfig {
 
 // ModelsConfig holds model alias configuration for each agent type
 type ModelsConfig struct {
-	DefaultClaude string `toml:"default_claude"` // Default model for Claude
-	DefaultCodex  string `toml:"default_codex"`  // Default model for Codex
-	DefaultGemini string `toml:"default_gemini"` // Default model for Gemini
-	DefaultGrok   string `toml:"default_grok"`   // Optional Grok Build default; empty delegates to the CLI
-	DefaultOllama string `toml:"default_ollama"` // Default model for Ollama
+	DefaultClaude      string `toml:"default_claude"`      // Default model for Claude
+	DefaultCodex       string `toml:"default_codex"`       // Default model for Codex
+	DefaultGemini      string `toml:"default_gemini"`      // Default model for Gemini
+	DefaultAntigravity string `toml:"default_antigravity"` // Default model for Antigravity (agy)
+	DefaultGrok        string `toml:"default_grok"`        // Optional Grok Build default; empty delegates to the CLI
+	DefaultOllama      string `toml:"default_ollama"`      // Default model for Ollama
 	// DefaultOpencode is the optional OpenCode default; empty delegates model
 	// selection to OpenCode's own config (ntm#261).
 	DefaultOpencode string            `toml:"default_opencode"`
@@ -1744,12 +1745,13 @@ func DefaultModels() ModelsConfig {
 		// Empty: no --model is injected, so Claude Code launches with its own
 		// default / saved model and context setting. A hard-coded model ID went
 		// stale with every model release (ntm#15, #71, #78, #196, #334).
-		DefaultClaude:   "",
-		DefaultCodex:    DefaultCodexModel,
-		DefaultGemini:   "gemini-3-pro-preview",
-		DefaultGrok:     "",
-		DefaultOllama:   "llama3",
-		DefaultOpencode: "",
+		DefaultClaude:      "",
+		DefaultCodex:       DefaultCodexModel,
+		DefaultGemini:      "gemini-3-pro-preview",
+		DefaultAntigravity: models.DefaultAntigravityModel,
+		DefaultGrok:        "",
+		DefaultOllama:      "llama3",
+		DefaultOpencode:    "",
 		// Empty: omp's own config (modelRoles.default) chooses the model and
 		// no --model is injected.
 		DefaultOmp: "",
@@ -1814,10 +1816,9 @@ func canonicalModelLookupAgentType(agentType string) string {
 	}
 }
 
-// AntigravityRequiredModel is the ONLY model agy (Antigravity CLI) may run on.
-// agy is hard-pinned to it everywhere (never an Anthropic/other tier) per
-// the model guard (bd-47kjh.1.7); it is intentionally NOT user-configurable.
-const AntigravityRequiredModel = "Gemini 4 Argon (High)"
+// AntigravityRequiredModel is the default model agy (Antigravity CLI) runs on
+// unless overridden in [models] default_antigravity.
+const AntigravityRequiredModel = models.DefaultAntigravityModel
 
 // GetModelName resolves a model alias to its full model name.
 // Returns the alias itself if no mapping is found.
@@ -1858,9 +1859,12 @@ func (m *ModelsConfig) AliasesFor(agentType string) map[string]string {
 func (m *ModelsConfig) GetModelName(agentType, alias string) string {
 	normalizedAgentType := canonicalModelLookupAgentType(agentType)
 
-	// agy is hard-pinned: ignore any requested alias/model and always resolve to
-	// the single allowed model (model guard, bd-47kjh.1.7).
+	// agy ignores per-flag alias overrides and resolves through [models]
+	// default_antigravity (falling back to models.DefaultAntigravityModel).
 	if normalizedAgentType == "antigravity" {
+		if m != nil && strings.TrimSpace(m.DefaultAntigravity) != "" {
+			return strings.TrimSpace(m.DefaultAntigravity)
+		}
 		return AntigravityRequiredModel
 	}
 
@@ -2315,12 +2319,12 @@ func ValidateEncryptionConfig(cfg *EncryptionConfig) error {
 		return nil
 	}
 	switch cfg.KeySource {
-	case "env", "file", "command":
+	case "env", "file", "command", "keyring":
 		// valid
 	case "":
 		return fmt.Errorf("encryption.key_source is required when encryption is enabled")
 	default:
-		return fmt.Errorf("invalid encryption.key_source %q: must be env, file, or command", cfg.KeySource)
+		return fmt.Errorf("invalid encryption.key_source %q: must be env, file, command, or keyring", cfg.KeySource)
 	}
 	switch cfg.KeyFormat {
 	case "hex", "base64", "":
@@ -2350,33 +2354,41 @@ type SendConfig struct {
 
 // PromptsConfig holds per-agent-type default prompts (bd-2ywo).
 type PromptsConfig struct {
-	CCDefault      string `toml:"cc_default"`       // Default prompt for Claude agents
-	CCDefaultFile  string `toml:"cc_default_file"`  // File path for Claude default prompt
-	CodDefault     string `toml:"cod_default"`      // Default prompt for Codex agents
-	CodDefaultFile string `toml:"cod_default_file"` // File path for Codex default prompt
-	GmiDefault     string `toml:"gmi_default"`      // Default prompt for Gemini agents
-	GmiDefaultFile string `toml:"gmi_default_file"` // File path for Gemini default prompt
-	AgyDefault     string `toml:"agy_default"`      // Default prompt for Antigravity (agy) agents
-	AgyDefaultFile string `toml:"agy_default_file"` // File path for Antigravity default prompt
-	OmpDefault     string `toml:"omp_default"`      // Default prompt for Oh My Pi (omp) agents
-	OmpDefaultFile string `toml:"omp_default_file"` // File path for Oh My Pi default prompt
+	CCDefault       string `toml:"cc_default"`        // Default prompt for Claude agents
+	CCDefaultFile   string `toml:"cc_default_file"`   // File path for Claude default prompt
+	CodDefault      string `toml:"cod_default"`       // Default prompt for Codex agents
+	CodDefaultFile  string `toml:"cod_default_file"`  // File path for Codex default prompt
+	GmiDefault      string `toml:"gmi_default"`       // Default prompt for Gemini agents
+	GmiDefaultFile  string `toml:"gmi_default_file"`  // File path for Gemini default prompt
+	AgyDefault      string `toml:"agy_default"`       // Default prompt for Antigravity (agy) agents
+	AgyDefaultFile  string `toml:"agy_default_file"`  // File path for Antigravity default prompt
+	OmpDefault      string `toml:"omp_default"`       // Default prompt for Oh My Pi (omp) agents
+	OmpDefaultFile  string `toml:"omp_default_file"`  // File path for Oh My Pi default prompt
+	GrokDefault     string `toml:"grok_default"`      // Default prompt for Grok Build (grok) agents
+	GrokDefaultFile string `toml:"grok_default_file"` // File path for Grok Build default prompt
+	OcDefault       string `toml:"oc_default"`        // Default prompt for OpenCode (oc) agents
+	OcDefaultFile   string `toml:"oc_default_file"`   // File path for OpenCode default prompt
 }
 
-// ResolveForType returns the default prompt for a given agent type string (cc, cod, gmi, agy, omp).
+// ResolveForType returns the default prompt for a given agent type string (cc, cod, gmi, agy, omp, grok, oc).
 // It reads from the inline string first, falling back to the file if configured.
 func (p PromptsConfig) ResolveForType(agentType string) (string, error) {
-	var val, filePath string
-	switch agentType {
-	case "cc":
-		val, filePath = p.CCDefault, p.CCDefaultFile
-	case "cod":
-		val, filePath = p.CodDefault, p.CodDefaultFile
-	case "gmi":
-		val, filePath = p.GmiDefault, p.GmiDefaultFile
-	case "agy":
-		val, filePath = p.AgyDefault, p.AgyDefaultFile
-	case "omp":
-		val, filePath = p.OmpDefault, p.OmpDefaultFile
+	var val, filePath, keyPrefix string
+	switch agent.AgentType(agentType).Canonical() {
+	case agent.AgentTypeClaudeCode:
+		val, filePath, keyPrefix = p.CCDefault, p.CCDefaultFile, "cc"
+	case agent.AgentTypeCodex:
+		val, filePath, keyPrefix = p.CodDefault, p.CodDefaultFile, "cod"
+	case agent.AgentTypeGemini:
+		val, filePath, keyPrefix = p.GmiDefault, p.GmiDefaultFile, "gmi"
+	case agent.AgentTypeAntigravity:
+		val, filePath, keyPrefix = p.AgyDefault, p.AgyDefaultFile, "agy"
+	case agent.AgentTypeOmp:
+		val, filePath, keyPrefix = p.OmpDefault, p.OmpDefaultFile, "omp"
+	case agent.AgentTypeGrok:
+		val, filePath, keyPrefix = p.GrokDefault, p.GrokDefaultFile, "grok"
+	case agent.AgentTypeOpencode:
+		val, filePath, keyPrefix = p.OcDefault, p.OcDefaultFile, "oc"
 	default:
 		return "", nil
 	}
@@ -2386,7 +2398,7 @@ func (p PromptsConfig) ResolveForType(agentType string) (string, error) {
 	if filePath != "" {
 		data, err := os.ReadFile(filePath)
 		if err != nil {
-			return "", fmt.Errorf("reading prompts.%s_default_file: %w", agentType, err)
+			return "", fmt.Errorf("reading prompts.%s_default_file: %w", keyPrefix, err)
 		}
 		return strings.TrimSpace(string(data)), nil
 	}
@@ -4000,6 +4012,26 @@ func Print(cfg *Config, w io.Writer) error {
 	} else {
 		fmt.Fprintln(w, "# omp_default_file = \"\"")
 	}
+	if cfg.Prompts.GrokDefault != "" {
+		fmt.Fprintf(w, "grok_default = %q\n", cfg.Prompts.GrokDefault)
+	} else {
+		fmt.Fprintln(w, "# grok_default = \"\"")
+	}
+	if cfg.Prompts.GrokDefaultFile != "" {
+		fmt.Fprintf(w, "grok_default_file = %q\n", cfg.Prompts.GrokDefaultFile)
+	} else {
+		fmt.Fprintln(w, "# grok_default_file = \"\"")
+	}
+	if cfg.Prompts.OcDefault != "" {
+		fmt.Fprintf(w, "oc_default = %q\n", cfg.Prompts.OcDefault)
+	} else {
+		fmt.Fprintln(w, "# oc_default = \"\"")
+	}
+	if cfg.Prompts.OcDefaultFile != "" {
+		fmt.Fprintf(w, "oc_default_file = %q\n", cfg.Prompts.OcDefaultFile)
+	} else {
+		fmt.Fprintln(w, "# oc_default_file = \"\"")
+	}
 	fmt.Fprintln(w)
 
 	// Write models configuration
@@ -4008,6 +4040,7 @@ func Print(cfg *Config, w io.Writer) error {
 	fmt.Fprintf(w, "default_claude = %q  # Empty passes no --model: Claude Code uses its own default/saved model\n", cfg.Models.DefaultClaude)
 	fmt.Fprintf(w, "default_codex = %q\n", cfg.Models.DefaultCodex)
 	fmt.Fprintf(w, "default_gemini = %q\n", cfg.Models.DefaultGemini)
+	fmt.Fprintf(w, "default_antigravity = %q\n", cfg.Models.DefaultAntigravity)
 	fmt.Fprintf(w, "default_grok = %q  # Empty delegates model selection to Grok Build\n", cfg.Models.DefaultGrok)
 	fmt.Fprintf(w, "default_opencode = %q  # Empty delegates model selection to OpenCode's own config\n", cfg.Models.DefaultOpencode)
 	fmt.Fprintf(w, "default_omp = %q  # Empty delegates model selection to omp's own config (modelRoles.default)\n", cfg.Models.DefaultOmp)
@@ -4901,6 +4934,8 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 			return cfg.Models.DefaultCodex, nil
 		case "default_gemini":
 			return cfg.Models.DefaultGemini, nil
+		case "default_antigravity":
+			return cfg.Models.DefaultAntigravity, nil
 		case "default_grok":
 			return cfg.Models.DefaultGrok, nil
 		case "default_opencode":
@@ -5291,6 +5326,14 @@ func GetValue(cfg *Config, path string) (interface{}, error) {
 			return cfg.Prompts.OmpDefault, nil
 		case "omp_default_file":
 			return cfg.Prompts.OmpDefaultFile, nil
+		case "grok_default":
+			return cfg.Prompts.GrokDefault, nil
+		case "grok_default_file":
+			return cfg.Prompts.GrokDefaultFile, nil
+		case "oc_default":
+			return cfg.Prompts.OcDefault, nil
+		case "oc_default_file":
+			return cfg.Prompts.OcDefaultFile, nil
 		}
 	case "spawn_pacing":
 		if len(parts) < 2 {
@@ -5788,6 +5831,7 @@ func Diff(cfg *Config) []ConfigDiff {
 	addDiff("models.default_claude", defaults.Models.DefaultClaude, cfg.Models.DefaultClaude)
 	addDiff("models.default_codex", defaults.Models.DefaultCodex, cfg.Models.DefaultCodex)
 	addDiff("models.default_gemini", defaults.Models.DefaultGemini, cfg.Models.DefaultGemini)
+	addDiff("models.default_antigravity", defaults.Models.DefaultAntigravity, cfg.Models.DefaultAntigravity)
 	addDiff("models.default_grok", defaults.Models.DefaultGrok, cfg.Models.DefaultGrok)
 	addDiff("models.default_opencode", defaults.Models.DefaultOpencode, cfg.Models.DefaultOpencode)
 	addDiff("models.default_omp", defaults.Models.DefaultOmp, cfg.Models.DefaultOmp)
@@ -5928,6 +5972,10 @@ func Diff(cfg *Config) []ConfigDiff {
 	addDiff("prompts.agy_default_file", defaults.Prompts.AgyDefaultFile, cfg.Prompts.AgyDefaultFile)
 	addDiff("prompts.omp_default", defaults.Prompts.OmpDefault, cfg.Prompts.OmpDefault)
 	addDiff("prompts.omp_default_file", defaults.Prompts.OmpDefaultFile, cfg.Prompts.OmpDefaultFile)
+	addDiff("prompts.grok_default", defaults.Prompts.GrokDefault, cfg.Prompts.GrokDefault)
+	addDiff("prompts.grok_default_file", defaults.Prompts.GrokDefaultFile, cfg.Prompts.GrokDefaultFile)
+	addDiff("prompts.oc_default", defaults.Prompts.OcDefault, cfg.Prompts.OcDefault)
+	addDiff("prompts.oc_default_file", defaults.Prompts.OcDefaultFile, cfg.Prompts.OcDefaultFile)
 
 	// Context Rotation
 	addDiff("context_rotation.rotate_threshold", defaults.ContextRotation.RotateThreshold, cfg.ContextRotation.RotateThreshold)

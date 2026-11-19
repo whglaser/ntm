@@ -1,6 +1,6 @@
 {
   "source": "chi-router-walk",
-  "count": 181,
+  "count": 270,
   "endpoints": [
     {
       "method": "GET",
@@ -10,7 +10,8 @@
     {
       "method": "GET",
       "path": "/api/robot/health",
-      "handler": "handleRobotHealth"
+      "handler": "handleRobotHealth",
+      "robot_schema": "health"
     },
     {
       "method": "GET",
@@ -88,6 +89,11 @@
     },
     {
       "method": "GET",
+      "path": "/api/v1/analytics",
+      "handler": "handleGetAnalyticsV1"
+    },
+    {
+      "method": "GET",
       "path": "/api/v1/approvals/",
       "handler": "handleApprovalsListV1"
     },
@@ -117,6 +123,11 @@
       "handler": "handleApprovalDenyV1"
     },
     {
+      "method": "POST",
+      "path": "/api/v1/assign",
+      "handler": "handleRecommendAssignV1"
+    },
+    {
       "method": "GET",
       "path": "/api/v1/attention/digest",
       "handler": "handleAttentionDigestV1"
@@ -135,6 +146,26 @@
       "method": "GET",
       "path": "/api/v1/attention/stream",
       "handler": "handleAttentionStreamV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/audit",
+      "handler": "handleListAuditRecordsV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/audit/sessions",
+      "handler": "handleGetSessionAuditV1"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/audit/verify",
+      "handler": "handleVerifySessionAuditV1"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/auth/ws-ticket",
+      "handler": "handleIssueWSTicketV1"
     },
     {
       "method": "GET",
@@ -294,6 +325,16 @@
     },
     {
       "method": "GET",
+      "path": "/api/v1/config/validate",
+      "handler": "handleConfigValidateGetV1"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/config/validate",
+      "handler": "handleConfigValidatePostV1"
+    },
+    {
+      "method": "GET",
       "path": "/api/v1/deps",
       "handler": "handleDepsV1"
     },
@@ -303,9 +344,119 @@
       "handler": "handleDoctorV1"
     },
     {
+      "method": "POST",
+      "path": "/api/v1/ensemble/compare",
+      "handler": "handleEnsembleCompareV1"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/ensemble/estimate",
+      "handler": "handleEnsembleEstimateV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ensemble/modes",
+      "handler": "handleEnsembleModesV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ensemble/presets",
+      "handler": "handleEnsemblePresetsV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ensemble/runs",
+      "handler": "handleEnsembleRunsV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ensemble/sessions/{session}",
+      "handler": "handleEnsembleSessionV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ensemble/sessions/{session}/provenance",
+      "handler": "handleEnsembleProvenanceV1"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/ensemble/sessions/{session}/stop",
+      "handler": "handleEnsembleStopV1"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/ensemble/sessions/{session}/synthesize",
+      "handler": "handleEnsembleSynthesizeV1"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/ensemble/spawn",
+      "handler": "handleEnsembleSpawnV1"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/ensemble/suggest",
+      "handler": "handleEnsembleSuggestV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/grep",
+      "handler": "handleGlobalGrepV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/handoffs",
+      "handler": "handleListHandoffsV1"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/handoffs",
+      "handler": "handleCreateHandoffV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/handoffs/latest",
+      "handler": "handleLatestHandoffV1"
+    },
+    {
       "method": "GET",
       "path": "/api/v1/health",
       "handler": "handleHealthV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/health/backpressure",
+      "handler": "handleHealthBackpressureV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/hooks",
+      "handler": "handleHooksStatusV1"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/hooks/run",
+      "handler": "handleHooksRunV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/incidents",
+      "handler": "handleListIncidentsV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/incidents/{id}",
+      "handler": "handleGetIncidentV1"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/incidents/{id}/resolve",
+      "handler": "handleResolveIncidentV1"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/incidents/{id}/status",
+      "handler": "handleUpdateIncidentStatusV1"
     },
     {
       "method": "GET",
@@ -326,6 +477,11 @@
       "method": "GET",
       "path": "/api/v1/jobs/{id}",
       "handler": "handleGetJob"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/kernel/commands",
+      "handler": "handleKernelCommands"
     },
     {
       "method": "GET",
@@ -454,8 +610,23 @@
     },
     {
       "method": "GET",
+      "path": "/api/v1/metrics/export",
+      "handler": "handleMetricsExportV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/models",
+      "handler": "handleLocalModelsV1"
+    },
+    {
+      "method": "GET",
       "path": "/api/v1/openapi.json",
       "handler": "handleOpenAPISpec"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/personas",
+      "handler": "handlePersonasListV1"
     },
     {
       "method": "GET",
@@ -519,6 +690,11 @@
     },
     {
       "method": "GET",
+      "path": "/api/v1/plugins",
+      "handler": "handlePluginsListV1"
+    },
+    {
+      "method": "GET",
       "path": "/api/v1/policy/",
       "handler": "handlePolicyGetV1"
     },
@@ -538,6 +714,12 @@
       "handler": "handlePolicyAutomationUpdateV1"
     },
     {
+      "method": "GET",
+      "path": "/api/v1/policy/decisions",
+      "handler": "handlePolicyDecisionsV1",
+      "robot_schema": "policy_decisions"
+    },
+    {
       "method": "POST",
       "path": "/api/v1/policy/reset",
       "handler": "handlePolicyResetV1"
@@ -546,6 +728,44 @@
       "method": "POST",
       "path": "/api/v1/policy/validate",
       "handler": "handlePolicyValidateV1"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/prompt/preflight",
+      "handler": "handlePromptPreflightV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/quota",
+      "handler": "handleGetQuotaStatusV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/recipes",
+      "handler": "handleRecipesListV1"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/redact/preview",
+      "handler": "handleRedactPreviewV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/requests/{id}",
+      "handler": "handleGetRequestStatusV1",
+      "robot_schema": "action_status"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/requests/{id}/cancel",
+      "handler": "handleCancelRequestV1",
+      "robot_schema": "cancel_request"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/requests/{id}/wait",
+      "handler": "handleWaitRequestV1",
+      "robot_schema": "wait_request"
     },
     {
       "method": "DELETE",
@@ -603,7 +823,7 @@
       "method": "GET",
       "path": "/api/v1/robot/attention",
       "handler": "handleRobotAttentionV1",
-      "robot_schema": "digest"
+      "robot_schema": "attention"
     },
     {
       "method": "GET",
@@ -660,6 +880,11 @@
       "robot_schema": "triage"
     },
     {
+      "method": "POST",
+      "path": "/api/v1/route",
+      "handler": "handleRecommendRouteV1"
+    },
+    {
       "method": "GET",
       "path": "/api/v1/safety/blocked",
       "handler": "handleSafetyBlockedV1"
@@ -683,6 +908,31 @@
       "method": "POST",
       "path": "/api/v1/safety/uninstall",
       "handler": "handleSafetyUninstallV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/saved-sessions",
+      "handler": "handleSavedSessionsListV1"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/saved-sessions",
+      "handler": "handleSavedSessionsSaveV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/saved-sessions/{name}",
+      "handler": "handleSavedSessionsShowV1"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/saved-sessions/{name}/archive",
+      "handler": "handleSavedSessionsArchiveV1"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/saved-sessions/{name}/unarchive",
+      "handler": "handleSavedSessionsUnarchiveV1"
     },
     {
       "method": "GET",
@@ -715,9 +965,39 @@
       "handler": "handleRunScan"
     },
     {
+      "method": "POST",
+      "path": "/api/v1/scanner/scan",
+      "handler": "handleRunScan"
+    },
+    {
       "method": "GET",
       "path": "/api/v1/scanner/status",
       "handler": "handleScannerStatus"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/sequences",
+      "handler": "handleSequencesCreateV1"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/sequences/{name}/advance",
+      "handler": "handleSequencesAdvanceV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/sequences/{name}/next",
+      "handler": "handleSequencesNextV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/session-templates",
+      "handler": "handleSessionTemplatesListV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/session-templates/{name}",
+      "handler": "handleSessionTemplatesShowV1"
     },
     {
       "method": "GET",
@@ -730,9 +1010,19 @@
       "handler": "handleCreateSessionV1"
     },
     {
+      "method": "DELETE",
+      "path": "/api/v1/sessions/{id}",
+      "handler": "handleDeleteSessionV1"
+    },
+    {
       "method": "GET",
       "path": "/api/v1/sessions/{id}",
       "handler": "handleSessionV1"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/sessions/{id}/adopt",
+      "handler": "handleSessionAdoptV1"
     },
     {
       "method": "POST",
@@ -741,12 +1031,98 @@
     },
     {
       "method": "GET",
-      "path": "/api/v1/sessions/{id}/events"
+      "path": "/api/v1/sessions/{id}/context",
+      "handler": "handleSessionContextV1"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/sessions/{id}/controller",
+      "handler": "handleSessionControllerV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/sessions/{id}/coordinator",
+      "handler": "handleSessionCoordinatorV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/sessions/{id}/coordinator/conflicts",
+      "handler": "handleSessionCoordinatorConflictsV1"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/sessions/{id}/coordinator/digest",
+      "handler": "handleSessionCoordinatorDigestV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/sessions/{id}/diff",
+      "handler": "handleSessionDiffV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/sessions/{id}/errors",
+      "handler": "handleSessionErrorsV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/sessions/{id}/events",
+      "handler": "handleSessionEventsRouteV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/sessions/{id}/extract",
+      "handler": "handleSessionExtractV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/sessions/{id}/files",
+      "handler": "handleSessionFilesV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/sessions/{id}/grep",
+      "handler": "handleSessionGrepV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/sessions/{id}/health",
+      "handler": "handleSessionHealthV1"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/sessions/{id}/interrupt",
+      "handler": "handleSessionInterruptV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/sessions/{id}/mapping",
+      "handler": "handleSessionMappingV1"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/sessions/{id}/rebalance",
+      "handler": "handleSessionRebalanceV1"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/sessions/{id}/review-queue",
+      "handler": "handleSessionReviewQueueV1"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/sessions/{id}/scale",
+      "handler": "handleSessionScaleV1"
     },
     {
       "method": "GET",
       "path": "/api/v1/sessions/{id}/status",
       "handler": "handleSessionStatusV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/sessions/{id}/summary",
+      "handler": "handleSessionSummaryV1"
     },
     {
       "method": "POST",
@@ -894,8 +1270,88 @@
     },
     {
       "method": "GET",
+      "path": "/api/v1/summaries",
+      "handler": "handleListSummariesV1"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/support-bundle",
+      "handler": "handleCreateSupportBundleV1"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/swarm/lab/run",
+      "handler": "handleSwarmLabRunV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/swarm/lab/scenarios",
+      "handler": "handleSwarmLabScenariosV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/timelines",
+      "handler": "handleListTimelinesV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/timelines/stats",
+      "handler": "handleTimelineStatsV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/timelines/{sessionId}",
+      "handler": "handleGetSessionTimelineV1"
+    },
+    {
+      "method": "GET",
       "path": "/api/v1/version",
       "handler": "handleVersionV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/webhooks/outbox",
+      "handler": "handleWebhookOutboxListV1"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/webhooks/outbox/{record}/archive",
+      "handler": "handleWebhookOutboxArchiveV1"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/webhooks/outbox/{record}/retry",
+      "handler": "handleWebhookOutboxRetryV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/workflows",
+      "handler": "handleWorkflowsListV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/workflows/{name}",
+      "handler": "handleWorkflowsShowV1"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/worktrees",
+      "handler": "handleListWorktreesV1"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/worktrees",
+      "handler": "handleCreateWorktreeV1"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/worktrees/{agent}",
+      "handler": "handleDeleteWorktreeV1"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/worktrees/{agent}/merge",
+      "handler": "handleMergeWorktreeV1"
     },
     {
       "method": "GET",
