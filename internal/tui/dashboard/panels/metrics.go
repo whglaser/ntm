@@ -543,3 +543,8 @@ func lookupVelocity(report *ensemble.VelocityReport, modeID string) float64 {
 	}
 	return -1
 }
+
+// HasError returns true if there's an active error.
+func (m *MetricsPanel) HasError() bool {
+	return m.err != nil
+}

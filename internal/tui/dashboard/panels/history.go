@@ -1125,3 +1125,8 @@ func (m *HistoryPanel) View() string {
 
 	return mainContent
 }
+
+// HasError returns true if there's an active error
+func (m *HistoryPanel) HasError() bool {
+	return m.err != nil
+}

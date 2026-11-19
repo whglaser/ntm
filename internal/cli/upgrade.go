@@ -1630,3 +1630,9 @@ func upgradeShellRCFile(filePath string) error {
 
 	return nil
 }
+
+// JSON returns a machine-readable JSON representation of the error
+func (e *upgradeError) JSON() string {
+	data, _ := json.MarshalIndent(e, "", "  ")
+	return string(data)
+}

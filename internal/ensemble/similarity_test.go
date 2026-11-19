@@ -3,7 +3,6 @@ package ensemble
 import (
 	"bytes"
 	"encoding/json"
-	"strings"
 	"testing"
 )
 

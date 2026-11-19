@@ -669,3 +669,217 @@ func (s *Store) ReplayEvents(sessionID string, fromID int64, handler func(EventL
 	}
 	return nil
 }
+
+// RecordAuditEvent inserts an audit event and returns its ID.
+func (s *Store) RecordAuditEvent(event *AuditEvent) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now().UTC()
+	if event.Ts.IsZero() {
+		event.Ts = now
+	}
+	if event.RetentionClass == "" {
+		event.RetentionClass = RetentionClassStandard
+	}
+	if event.ExpiresAt == nil {
+		event.ExpiresAt = defaultAuditExpiry(event.RetentionClass, now)
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("begin audit event transaction: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	id, err := recordAuditEventTx(tx, event, now)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit audit event transaction: %w", err)
+	}
+	committed = true
+
+	return id, nil
+}
+
+// UpsertAuditActor records display metadata for a known actor.
+func (s *Store) UpsertAuditActor(actor *AuditActor) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if actor == nil {
+		return fmt.Errorf("upsert audit actor: nil actor")
+	}
+	if actor.FirstSeenAt.IsZero() {
+		actor.FirstSeenAt = time.Now().UTC()
+	}
+	if actor.LastSeenAt.IsZero() {
+		actor.LastSeenAt = actor.FirstSeenAt
+	}
+
+	_, err := s.db.Exec(`
+		INSERT INTO audit_actors (
+			actor_type, actor_id, display_name, description,
+			first_seen_at, last_seen_at, event_count, known_origins
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(actor_type, actor_id) DO UPDATE SET
+			display_name = COALESCE(NULLIF(excluded.display_name, ''), audit_actors.display_name),
+			description = COALESCE(NULLIF(excluded.description, ''), audit_actors.description),
+			first_seen_at = MIN(audit_actors.first_seen_at, excluded.first_seen_at),
+			last_seen_at = MAX(audit_actors.last_seen_at, excluded.last_seen_at),
+			event_count = MAX(audit_actors.event_count, excluded.event_count),
+			known_origins = COALESCE(NULLIF(excluded.known_origins, ''), audit_actors.known_origins)`,
+		actor.ActorType, actor.ActorID, nullableString(actor.DisplayName), nullableString(actor.Description),
+		actor.FirstSeenAt, actor.LastSeenAt, actor.EventCount, nullableString(actor.KnownOrigins),
+	)
+	if err != nil {
+		return fmt.Errorf("upsert audit actor: %w", err)
+	}
+	return nil
+}
+
+// GetAuditActor retrieves actor metadata by actor identity.
+func (s *Store) GetAuditActor(actorType, actorID string) (*AuditActor, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	actor := &AuditActor{}
+	err := s.db.QueryRow(`
+		SELECT actor_type, actor_id, COALESCE(display_name, ''), COALESCE(description, ''),
+			first_seen_at, last_seen_at, event_count, COALESCE(known_origins, '')
+		FROM audit_actors
+		WHERE actor_type = ? AND actor_id = ?`, actorType, actorID,
+	).Scan(
+		&actor.ActorType, &actor.ActorID, &actor.DisplayName, &actor.Description,
+		&actor.FirstSeenAt, &actor.LastSeenAt, &actor.EventCount, &actor.KnownOrigins,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get audit actor: %w", err)
+	}
+	return actor, nil
+}
+
+// GetActorActivity returns audit events for a specific actor since the cutoff.
+func (s *Store) GetActorActivity(actorType, actorID string, since time.Time) ([]AuditEvent, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if since.IsZero() {
+		since = time.Unix(0, 0).UTC()
+	}
+
+	rows, err := s.db.Query(`
+		SELECT id, ts, actor_type, COALESCE(actor_id, ''), COALESCE(actor_origin, ''),
+			COALESCE(request_id, ''), COALESCE(correlation_id, ''),
+			category, event_type, severity, entity_type, entity_id,
+			COALESCE(previous_state, ''), COALESCE(new_state, ''), change_summary,
+			COALESCE(reason, ''), COALESCE(evidence, ''), COALESCE(disclosure_state, ''),
+			retention_class, expires_at
+		FROM audit_events
+		WHERE actor_type = ? AND actor_id = ? AND ts >= ?
+		ORDER BY ts DESC, id DESC`, actorType, actorID, since)
+	if err != nil {
+		return nil, fmt.Errorf("get actor activity: %w", err)
+	}
+	defer rows.Close()
+
+	var events []AuditEvent
+	for rows.Next() {
+		var event AuditEvent
+		if err := rows.Scan(
+			&event.ID, &event.Ts, &event.ActorType, &event.ActorID, &event.ActorOrigin,
+			&event.RequestID, &event.CorrelationID, &event.Category, &event.EventType,
+			&event.Severity, &event.EntityType, &event.EntityID, &event.PreviousState,
+			&event.NewState, &event.ChangeSummary, &event.Reason, &event.Evidence,
+			&event.DisclosureState, &event.RetentionClass, &event.ExpiresAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan actor activity: %w", err)
+		}
+		events = append(events, event)
+	}
+	return events, rows.Err()
+}
+
+// GetRequestTrace returns all audit events for a request ID.
+func (s *Store) GetRequestTrace(requestID string) ([]AuditEvent, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rows, err := s.db.Query(`
+		SELECT id, ts, actor_type, COALESCE(actor_id, ''), COALESCE(actor_origin, ''),
+			COALESCE(request_id, ''), COALESCE(correlation_id, ''),
+			category, event_type, severity, entity_type, entity_id,
+			COALESCE(previous_state, ''), COALESCE(new_state, ''), change_summary,
+			COALESCE(reason, ''), COALESCE(evidence, ''), COALESCE(disclosure_state, ''),
+			retention_class, expires_at
+		FROM audit_events
+		WHERE request_id = ?
+		ORDER BY ts ASC`, requestID)
+	if err != nil {
+		return nil, fmt.Errorf("get request trace: %w", err)
+	}
+	defer rows.Close()
+
+	var events []AuditEvent
+	for rows.Next() {
+		var event AuditEvent
+		if err := rows.Scan(
+			&event.ID, &event.Ts, &event.ActorType, &event.ActorID, &event.ActorOrigin,
+			&event.RequestID, &event.CorrelationID, &event.Category, &event.EventType,
+			&event.Severity, &event.EntityType, &event.EntityID, &event.PreviousState,
+			&event.NewState, &event.ChangeSummary, &event.Reason, &event.Evidence,
+			&event.DisclosureState, &event.RetentionClass, &event.ExpiresAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan audit event: %w", err)
+		}
+		events = append(events, event)
+	}
+	return events, rows.Err()
+}
+
+// GetDegradedSources returns sources that are unavailable or unhealthy.
+func (s *Store) GetDegradedSources() ([]SourceHealth, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rows, err := s.db.Query(`
+		SELECT source_name, available, healthy, COALESCE(reason, ''),
+			last_success_at, last_failure_at, last_check_at,
+			latency_ms, avg_latency_ms, COALESCE(version, ''),
+			consecutive_failures, COALESCE(last_error, ''), COALESCE(last_error_code, '')
+		FROM source_health
+		WHERE available = 0 OR healthy = 0
+		ORDER BY source_name`)
+	if err != nil {
+		return nil, fmt.Errorf("list degraded sources: %w", err)
+	}
+	defer rows.Close()
+
+	var results []SourceHealth
+	for rows.Next() {
+		var health SourceHealth
+		var available, healthy int
+		if err := rows.Scan(
+			&health.SourceName, &available, &healthy, &health.Reason,
+			&health.LastSuccessAt, &health.LastFailureAt, &health.LastCheckAt,
+			&health.LatencyMs, &health.AvgLatencyMs, &health.Version,
+			&health.ConsecutiveFailures, &health.LastError, &health.LastErrorCode,
+		); err != nil {
+			return nil, fmt.Errorf("scan degraded source: %w", err)
+		}
+		health.Available = available == 1
+		health.Healthy = healthy == 1
+		results = append(results, health)
+	}
+	return results, rows.Err()
+}

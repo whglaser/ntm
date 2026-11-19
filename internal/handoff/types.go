@@ -245,3 +245,13 @@ func (h *Handoff) HasChanges() bool {
 func (h *Handoff) TotalFileChanges() int {
 	return len(h.Files.Created) + len(h.Files.Modified) + len(h.Files.Deleted)
 }
+
+// IsComplete returns true if the handoff is marked as complete.
+func (h *Handoff) IsComplete() bool {
+	return h.Status == StatusComplete
+}
+
+// IsBlocked returns true if the handoff is marked as blocked.
+func (h *Handoff) IsBlocked() bool {
+	return h.Status == StatusBlocked
+}

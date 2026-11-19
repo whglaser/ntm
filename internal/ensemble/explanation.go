@@ -1,10 +1,19 @@
 package ensemble
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
 )
+
+// JSON returns the explanation layer as indented JSON.
+func (layer *ExplanationLayer) JSON() ([]byte, error) {
+	if layer == nil {
+		return nil, fmt.Errorf("nil explanation layer")
+	}
+	return json.MarshalIndent(layer, "", "  ")
+}
 
 // ExplanationLayer provides reasoning transparency for synthesis conclusions.
 type ExplanationLayer struct {

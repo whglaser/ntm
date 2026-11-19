@@ -3,6 +3,7 @@ package robot
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/Dicklesworthstone/ntm/internal/agent"
@@ -57,11 +58,19 @@ type AdoptedAgentCounts struct {
 	Omp      int `json:"omp"`
 	Ollama   int `json:"ollama"`
 	User     int `json:"user"`
+
+	// Plugins holds counts for registered plugin agent types (e.g. pi), keyed
+	// by canonical plugin name, so adopt reports them like built-ins.
+	Plugins map[string]int `json:"plugins,omitempty"`
 }
 
 // Total returns the total number of adopted panes across all types.
 func (a AdoptedAgentCounts) Total() int {
-	return a.CC + a.Cod + a.Gmi + a.Agy + a.Grok + a.Cursor + a.Windsurf + a.Aider + a.Opencode + a.Omp + a.Ollama + a.User
+	total := a.CC + a.Cod + a.Gmi + a.Agy + a.Grok + a.Cursor + a.Windsurf + a.Aider + a.Opencode + a.Omp + a.Ollama + a.User
+	for _, count := range a.Plugins {
+		total += count
+	}
+	return total
 }
 
 // Summary formats non-zero adopted pane counts in canonical harness order.
@@ -72,6 +81,16 @@ func (a AdoptedAgentCounts) Summary() string {
 		if count > 0 {
 			parts = append(parts, fmt.Sprintf("%s:%d", agentType, count))
 		}
+	}
+	pluginNames := make([]string, 0, len(a.Plugins))
+	for name, count := range a.Plugins {
+		if count > 0 {
+			pluginNames = append(pluginNames, name)
+		}
+	}
+	sort.Strings(pluginNames)
+	for _, name := range pluginNames {
+		parts = append(parts, fmt.Sprintf("%s:%d", name, a.Plugins[name]))
 	}
 	if len(parts) == 0 {
 		return "none"
@@ -106,6 +125,11 @@ func (a *AdoptedAgentCounts) Increment(agentType agent.AgentType) {
 		a.Ollama++
 	case agent.AgentTypeUser:
 		a.User++
+	default:
+		if a.Plugins == nil {
+			a.Plugins = make(map[string]int)
+		}
+		a.Plugins[string(agentType.Canonical())]++
 	}
 }
 
@@ -137,7 +161,7 @@ func (a AdoptedAgentCounts) CountFor(agentType agent.AgentType) int {
 	case agent.AgentTypeUser:
 		return a.User
 	default:
-		return 0
+		return a.Plugins[string(agentType.Canonical())]
 	}
 }
 

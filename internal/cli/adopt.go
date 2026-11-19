@@ -7,7 +7,6 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -16,6 +15,7 @@ import (
 	agentpkg "github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/kernel"
 	"github.com/Dicklesworthstone/ntm/internal/output"
+	"github.com/Dicklesworthstone/ntm/internal/plugins"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
 	"github.com/Dicklesworthstone/ntm/internal/spawnidentity"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
@@ -460,12 +460,13 @@ func runAdopt(opts AdoptOptions) error {
 		panesByBareIndex[p.Index] = append(panesByBareIndex[p.Index], p)
 	}
 
-	if err := validateAdoptAssignments(opts.PaneAssignments); err != nil {
+	if err := validateAdoptAssignments(opts.PaneAssignments, opts.Types); err != nil {
 		return failAdopt(err, robot.ErrCodeInvalidFlag)
 	}
 
 	adoptedPanes := []AdoptedPaneInfo{}
 	counts := AdoptedAgentCounts{}
+	types := opts.Types
 	// Dedupe by agent type so a plugin alias sharing its name's pane list is
 	// adopted once, in the order the command registered the flags.
 	adoptOrder := make([]agentpkg.AgentType, 0, len(types))
@@ -644,7 +645,7 @@ func executeAdoptRobot(ctx context.Context, input robot.AdoptInput) (*robot.Adop
 			}
 			assignments[canon] = append(assignments[canon], specs...)
 		}
-		if err := validateAdoptAssignments(assignments); err != nil {
+		if err := validateAdoptAssignments(assignments, nil); err != nil {
 			return newErrOut(
 				fmt.Errorf("invalid adopt input: %w", err),
 				robot.ErrCodeInvalidFlag,

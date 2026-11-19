@@ -910,3 +910,124 @@ func sendGracefulExit(client *tmux.Client, pane tmux.Pane) error {
 		return client.SendKeys(pane.ID, "\x03", false)
 	}
 }
+
+// VerifyGeometry checks if panes in a session have uniform geometry.
+// Returns geometry information and whether panes are uniformly sized.
+// Tolerance allows for small variations (e.g., 1-2 cells difference).
+func (o *SessionOrchestrator) VerifyGeometry(sessionName string, tolerance int) (*GeometryResult, error) {
+	client := o.tmuxClient()
+
+	panes, err := client.GetPanes(sessionName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get panes for session %q: %w", sessionName, err)
+	}
+
+	if len(panes) == 0 {
+		return &GeometryResult{
+			SessionName: sessionName,
+			PaneCount:   0,
+			IsUniform:   true,
+		}, nil
+	}
+
+	result := &GeometryResult{
+		SessionName: sessionName,
+		PaneCount:   len(panes),
+		Geometries:  make([]PaneGeometry, len(panes)),
+		IsUniform:   true,
+	}
+
+	// Collect geometries
+	var minWidth, maxWidth, minHeight, maxHeight int
+	for i, pane := range panes {
+		result.Geometries[i] = PaneGeometry{
+			Width:  pane.Width,
+			Height: pane.Height,
+		}
+
+		if i == 0 {
+			minWidth, maxWidth = pane.Width, pane.Width
+			minHeight, maxHeight = pane.Height, pane.Height
+		} else {
+			if pane.Width < minWidth {
+				minWidth = pane.Width
+			}
+			if pane.Width > maxWidth {
+				maxWidth = pane.Width
+			}
+			if pane.Height < minHeight {
+				minHeight = pane.Height
+			}
+			if pane.Height > maxHeight {
+				maxHeight = pane.Height
+			}
+		}
+	}
+
+	result.MaxWidthDelta = maxWidth - minWidth
+	result.MaxHeightDelta = maxHeight - minHeight
+
+	// Check if within tolerance
+	if result.MaxWidthDelta > tolerance || result.MaxHeightDelta > tolerance {
+		result.IsUniform = false
+	}
+
+	return result, nil
+}
+
+// RebalanceGeometry reapplies tiled layout to ensure uniform pane sizes.
+func (o *SessionOrchestrator) RebalanceGeometry(sessionName string) error {
+	client := o.tmuxClient()
+
+	if !client.SessionExists(sessionName) {
+		return fmt.Errorf("session %q does not exist", sessionName)
+	}
+
+	return client.ApplyTiledLayout(sessionName)
+}
+
+// EnsureUniformGeometry verifies geometry and rebalances if needed.
+// Returns the final geometry state after any corrections.
+func (o *SessionOrchestrator) EnsureUniformGeometry(sessionName string, tolerance int) (*GeometryResult, error) {
+	// First check current geometry
+	result, err := o.VerifyGeometry(sessionName, tolerance)
+	if err != nil {
+		return nil, err
+	}
+
+	// If already uniform, return
+	if result.IsUniform {
+		return result, nil
+	}
+
+	// Rebalance and verify again
+	if err := o.RebalanceGeometry(sessionName); err != nil {
+		return result, fmt.Errorf("failed to rebalance geometry: %w", err)
+	}
+
+	// Re-verify after rebalancing
+	return o.VerifyGeometry(sessionName, tolerance)
+}
+
+// GetAverageGeometry calculates the average pane dimensions for a session.
+func (o *SessionOrchestrator) GetAverageGeometry(sessionName string) (*PaneGeometry, error) {
+	panes, err := o.tmuxClient().GetPanes(sessionName)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(panes) == 0 {
+		return nil, fmt.Errorf("session %q has no panes", sessionName)
+	}
+
+	var totalWidth, totalHeight int
+	for _, pane := range panes {
+		totalWidth += pane.Width
+		totalHeight += pane.Height
+	}
+
+	return &PaneGeometry{
+		Width:  totalWidth / len(panes),
+		Height: totalHeight / len(panes),
+	}, nil
+}

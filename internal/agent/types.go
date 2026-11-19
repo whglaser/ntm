@@ -315,3 +315,35 @@ func DefaultParserConfig() ParserConfig {
 		SampleLength:        500,
 	}
 }
+
+// DisplayName returns a human-readable name for the agent type.
+func (t AgentType) DisplayName() string {
+	switch t.Canonical() {
+	case AgentTypeClaudeCode:
+		return "Claude Code"
+	case AgentTypeCodex:
+		return "Codex CLI"
+	case AgentTypeGemini:
+		return "Gemini CLI"
+	case AgentTypeAntigravity:
+		return "Antigravity CLI"
+	case AgentTypeGrok:
+		return "Grok Build"
+	case AgentTypeOllama:
+		return "Ollama"
+	case AgentTypeCursor:
+		return "Cursor"
+	case AgentTypeWindsurf:
+		return "Windsurf"
+	case AgentTypeAider:
+		return "Aider"
+	case AgentTypeOpencode:
+		return "Opencode"
+	case AgentTypeOmp:
+		return "Oh My Pi"
+	case AgentTypeUser:
+		return "User"
+	default:
+		return "Unknown"
+	}
+}

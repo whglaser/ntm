@@ -89,3 +89,14 @@ func (c *Client) search(ctx context.Context, opts SearchOptions, agents []string
 
 	return &response, nil
 }
+
+// SearchForContext searches for relevant past context
+func (c *Client) SearchForContext(ctx context.Context, query, workspace string) (*SearchResponse, error) {
+	return c.Search(ctx, SearchOptions{
+		Query:     query,
+		Workspace: workspace,
+		Since:     "30d",
+		Limit:     5,
+		Fields:    "summary",
+	})
+}

@@ -137,3 +137,12 @@ func (c *Client) IsInstalled() bool {
 	}
 	return true // Assume custom executor is working
 }
+
+// SearchQuick performs a simple search with defaults
+func (c *Client) SearchQuick(ctx context.Context, query string) (*SearchResponse, error) {
+	return c.Search(ctx, SearchOptions{
+		Query:  query,
+		Limit:  10,
+		Fields: "summary",
+	})
+}

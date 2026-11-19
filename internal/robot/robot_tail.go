@@ -1050,6 +1050,10 @@ type ActivityOptions struct {
 	AgentTypes    []string     // Optional: filter to specific agent types (claude, codex, antigravity, grok, gemini)
 	Store         *state.Store `json:"-"`
 	ExplicitStore bool         `json:"-"`
+	// StatusDetector supplies the pane's authoritative OSC 7501 state when one
+	// exists. The CLI wires a tap-backed detector; nil keeps scrape-only
+	// classification. It is not serialized.
+	StatusDetector ProgramStatusDetector `json:"-" yaml:"-" toml:"-"`
 }
 
 // ActivityOutput represents the output for --robot-activity
@@ -1072,15 +1076,17 @@ type ActivityOutput struct {
 
 // AgentActivityInfo contains activity state for a single agent pane.
 type AgentActivityInfo struct {
-	Pane             string   `json:"pane"`                        // pane index as string
-	PaneIdx          int      `json:"pane_idx"`                    // pane index as int
-	AgentType        string   `json:"agent_type"`                  // claude, codex, antigravity, grok, gemini, or another supported type
-	State            string   `json:"state"`                       // GENERATING, WAITING, THINKING, ERROR, STALLED, UNKNOWN
-	Confidence       float64  `json:"confidence"`                  // 0.0-1.0
-	Velocity         float64  `json:"velocity"`                    // chars/sec
-	StateSince       string   `json:"state_since,omitempty"`       // RFC3339 timestamp
-	DetectedPatterns []string `json:"detected_patterns,omitempty"` // pattern names that matched
-	LastOutput       string   `json:"last_output,omitempty"`       // RFC3339 timestamp of last output
+	Pane             string   `json:"pane"`                         // pane index as string
+	PaneIdx          int      `json:"pane_idx"`                     // pane index as int
+	AgentType        string   `json:"agent_type"`                   // claude, codex, antigravity, grok, gemini, or another supported type
+	State            string   `json:"state"`                        // GENERATING, WAITING, THINKING, ERROR, STALLED, UNKNOWN
+	StateSource      string   `json:"state_source,omitempty"`       // scrape|osc
+	ReportAgeSeconds float64  `json:"report_age_seconds,omitempty"` // age of the deciding OSC report; absent for scrape
+	Confidence       float64  `json:"confidence"`                   // 0.0-1.0
+	Velocity         float64  `json:"velocity"`                     // chars/sec
+	StateSince       string   `json:"state_since,omitempty"`        // RFC3339 timestamp
+	DetectedPatterns []string `json:"detected_patterns,omitempty"`  // pattern names that matched
+	LastOutput       string   `json:"last_output,omitempty"`        // RFC3339 timestamp of last output
 
 	// PanePID is the tmux shell PID (`#{pane_pid}`) of the pane this
 	// observation came from. Populated additively so callers can detect a
@@ -1336,7 +1342,13 @@ func GetActivity(opts ActivityOptions) (*ActivityOutput, error) {
 				err = fmt.Errorf("current pane observation is %s", paneObservation.Current.Freshness)
 			}
 		}
-		if err != nil {
+		// The agent's own OSC 7501 report outranks the scrape, and it can decide
+		// the pane even when the capture could not be read at all.
+		activity, _ = ApplyProgramStatus(opts.StatusDetector, pane.ID, agentType, activity)
+		if activity == nil {
+			if err == nil {
+				err = fmt.Errorf("classifier returned no activity for pane %s", pane.ID)
+			}
 			// Include with unknown state on error, plus per-pane
 			// capture provenance so a watchdog can distinguish
 			// "this pane was classified UNKNOWN" from "this pane's
@@ -1366,6 +1378,8 @@ func GetActivity(opts ActivityOptions) (*ActivityOutput, error) {
 			PaneIdx:               pane.Index,
 			AgentType:             activity.AgentType,
 			State:                 string(activity.State),
+			StateSource:           activity.StateSource,
+			ReportAgeSeconds:      activity.ReportAgeSeconds,
 			Confidence:            activity.Confidence,
 			Velocity:              activity.Velocity,
 			DetectedPatterns:      activity.DetectedPatterns,

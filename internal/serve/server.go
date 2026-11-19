@@ -30,6 +30,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
 	approvalpkg "github.com/Dicklesworthstone/ntm/internal/approval"
 	"github.com/Dicklesworthstone/ntm/internal/events"
+	"github.com/Dicklesworthstone/ntm/internal/programstatus"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
 	"github.com/Dicklesworthstone/ntm/internal/state"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
@@ -593,6 +594,10 @@ func (s *Server) buildRouter() chi.Router {
 
 		// Streaming stats endpoint
 		r.With(s.RequirePermission(PermReadHealth)).Get("/streaming/stats", s.handleStreamingStatsV1)
+
+		// Latest OSC 7501 program-status report per pane, captured from raw
+		// pipe-pane output (never from scraped pane content).
+		r.With(s.RequirePermission(PermReadHealth)).Get("/streaming/program-status", s.handleProgramStatusV1)
 
 		// Metrics export endpoint
 		r.With(s.RequirePermission(PermReadHealth)).Get("/metrics/export", s.handleMetricsExportV1)

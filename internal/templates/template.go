@@ -154,3 +154,13 @@ func (t *Template) Validate(ctx ExecutionContext) error {
 	}
 	return nil
 }
+
+// HasVariable checks if a variable is defined in the template.
+func (t *Template) HasVariable(name string) bool {
+	for _, v := range t.Variables {
+		if v.Name == name {
+			return true
+		}
+	}
+	return false
+}

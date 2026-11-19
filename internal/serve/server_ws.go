@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,8 +16,10 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/gorilla/websocket"
 
+	"github.com/Dicklesworthstone/ntm/internal/programstatus"
 	"github.com/Dicklesworthstone/ntm/internal/redaction"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
+	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
 // ============================================================================
@@ -534,7 +537,7 @@ func (s *Server) handleStartPaneStreamV1(w http.ResponseWriter, r *http.Request)
 	}
 	topic := streamTopicForTarget(target)
 
-	if err := s.streamManager.StartStream(target); err != nil {
+	if err := s.programStatusTap.Ensure(target); err != nil {
 		writeErrorResponse(w, http.StatusInternalServerError, ErrCodeInternalError, err.Error(), nil, reqID)
 		return
 	}
@@ -565,7 +568,7 @@ func (s *Server) handleStopPaneStreamV1(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	s.streamManager.StopStream(target)
+	s.programStatusTap.StopStream(target)
 
 	writeSuccessResponse(w, http.StatusOK, map[string]interface{}{
 		"target":  target,
@@ -584,10 +587,96 @@ func streamTopicForTarget(target string) string {
 func (s *Server) handleStreamingStatsV1(w http.ResponseWriter, r *http.Request) {
 	reqID := requestIDFromContext(r.Context())
 
-	stats := s.streamManager.Stats()
-	stats["active_targets"] = s.streamManager.ListActive()
+	stats := s.programStatusTap.Stats()
+	stats["active_targets"] = s.programStatusTap.ListActive()
+	if observer := s.programStatusTap.Observer(); observer != nil {
+		stats["program_status_panes"] = observer.Len()
+	}
 
 	writeSuccessResponse(w, http.StatusOK, stats, reqID)
+}
+
+// publishPaneStreamEvent fans one raw tap event out to its WebSocket and
+// program-status subscribers. It is the tap handler for the server's stream
+// capture: the tap has already decoded the OSC 7501 reports, so this method
+// never re-parses the bytes.
+//
+// The decoded reports are the agent's own statements, never a scrape: polling
+// events (IsFull) carry rendered screen captures that a terminal has already
+// consumed, so the tap never produces reports for them.
+func (s *Server) publishPaneStreamEvent(event tmux.StreamEvent, reports []programstatus.Event) {
+	for _, status := range reports {
+		s.publishProgramStatus(status)
+	}
+	s.wsHub.Publish(streamTopicForTarget(event.Target), "pane.output", map[string]interface{}{
+		"lines":   event.Lines,
+		"seq":     event.Seq,
+		"ts":      event.Timestamp.UTC().Format(time.RFC3339Nano),
+		"is_full": event.IsFull,
+	})
+}
+
+// publishProgramStatus broadcasts one decoded report to WebSocket
+// subscribers of the pane's stream topic.
+func (s *Server) publishProgramStatus(status programstatus.Event) {
+	s.wsHub.Publish(streamTopicForTarget(status.PaneID), "pane.status", map[string]interface{}{
+		"pane":        status.PaneID,
+		"state":       string(status.State),
+		"app":         status.App,
+		"kind":        status.Kind,
+		"message":     status.Message,
+		"source":      "osc",
+		"observed_at": status.ObservedAt.UTC().Format(time.RFC3339Nano),
+	})
+}
+
+// programStatusEntry is the REST representation of a stored report.
+type programStatusEntry struct {
+	Pane       string              `json:"pane"`
+	State      programstatus.State `json:"state,omitempty"`
+	App        string              `json:"app,omitempty"`
+	Kind       string              `json:"kind,omitempty"`
+	Message    string              `json:"message,omitempty"`
+	ObservedAt string              `json:"observed_at,omitempty"`
+}
+
+// handleProgramStatusV1 handles GET /api/v1/streaming/program-status.
+// It returns the latest OSC 7501 report observed on each streamed pane. An
+// optional ?pane= filter selects one target. Panes with no observed report
+// are absent rather than reported as unknown: callers fall back to their
+// scrape-based status source for those.
+func (s *Server) handleProgramStatusV1(w http.ResponseWriter, r *http.Request) {
+	reqID := requestIDFromContext(r.Context())
+	filter := strings.TrimSpace(r.URL.Query().Get("pane"))
+
+	statuses := make([]programStatusEntry, 0)
+	if observer := s.programStatusTap.Observer(); observer != nil {
+		snapshot := observer.Snapshot()
+		panes := make([]string, 0, len(snapshot))
+		for paneID := range snapshot {
+			panes = append(panes, paneID)
+		}
+		sort.Strings(panes)
+		for _, paneID := range panes {
+			if filter != "" && paneID != filter {
+				continue
+			}
+			status := snapshot[paneID]
+			statuses = append(statuses, programStatusEntry{
+				Pane:       paneID,
+				State:      status.State,
+				App:        status.App,
+				Kind:       status.Kind,
+				Message:    status.Message,
+				ObservedAt: status.ObservedAt.UTC().Format(time.RFC3339Nano),
+			})
+		}
+	}
+
+	writeSuccessResponse(w, http.StatusOK, map[string]interface{}{
+		"statuses": statuses,
+		"count":    len(statuses),
+	}, reqID)
 }
 
 // ============================================================================

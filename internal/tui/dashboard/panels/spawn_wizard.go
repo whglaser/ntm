@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/lipgloss"
@@ -487,4 +488,25 @@ func parseCount(s string) int {
 		return 0
 	}
 	return n
+}
+
+// Keybindings returns the wizard keybindings for help display.
+func (sw *SpawnWizard) Keybindings() []Keybinding {
+	return []Keybinding{
+		{
+			Key:         key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "select/confirm")),
+			Description: "Select option or confirm",
+			Action:      "select",
+		},
+		{
+			Key:         key.NewBinding(key.WithKeys("shift+tab"), key.WithHelp("shift+tab", "back")),
+			Description: "Go to previous step",
+			Action:      "back",
+		},
+		{
+			Key:         key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", "cancel")),
+			Description: "Cancel wizard",
+			Action:      "cancel",
+		},
+	}
 }

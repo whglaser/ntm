@@ -190,3 +190,5 @@ func workflowFrame(title, content string, width, height int, focused bool, borde
 	}
 	return style.Render(lipgloss.NewStyle().Bold(true).Render(title) + "\n" + content)
 }
+
+func (p *WorkflowPanel) HasData() bool { return p.data.State != nil || p.err != nil }

@@ -450,3 +450,5 @@ func formatTokenShort(tokens int) string {
 	}
 	return fmt.Sprintf("%.1fM", float64(tokens)/1000000.0)
 }
+
+func (c *CostPanel) HasError() bool { return c.err != nil }

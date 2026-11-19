@@ -580,3 +580,22 @@ func (p *PromptInjector) InjectToSessionWithContext(ctx context.Context, session
 
 	return p.InjectBatchWithContext(ctx, targets, prompt)
 }
+
+// WithStaggerDelay sets a custom stagger delay and returns the PromptInjector for chaining.
+func (p *PromptInjector) WithStaggerDelay(delay time.Duration) *PromptInjector {
+	p.StaggerDelay = delay
+	return p
+}
+
+// WithRateLimitTracker sets a rate limit tracker for adaptive delays.
+func (p *PromptInjector) WithRateLimitTracker(tracker *ratelimit.RateLimitTracker) *PromptInjector {
+	p.RateLimitTracker = tracker
+	return p
+}
+
+// WithAdaptiveDelay enables or disables adaptive delay learning.
+// When enabled, the RateLimitTracker must be set.
+func (p *PromptInjector) WithAdaptiveDelay(enabled bool) *PromptInjector {
+	p.UseAdaptiveDelay = enabled
+	return p
+}

@@ -295,6 +295,11 @@ const (
 	AssignmentError AssignmentStatus = "error"
 )
 
+// IsTerminal returns true if this is a final status (done or error).
+func (s AssignmentStatus) IsTerminal() bool {
+	return s == AssignmentDone || s == AssignmentError
+}
+
 // String returns the status as a string.
 func (s AssignmentStatus) String() string {
 	return string(s)

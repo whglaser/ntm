@@ -3,6 +3,7 @@ package handoff
 import (
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"gopkg.in/yaml.v3"
 )

@@ -223,3 +223,65 @@ func diversityNote(score float64) string {
 	}
 	return "good diversity"
 }
+
+// GetHighRedundancyPairs returns pairs above the given similarity threshold.
+func (r *RedundancyAnalysis) GetHighRedundancyPairs(threshold float64) []PairSimilarity {
+	if r == nil {
+		return nil
+	}
+
+	var result []PairSimilarity
+	for _, pair := range r.PairwiseScores {
+		if pair.Similarity >= threshold {
+			result = append(result, pair)
+		}
+	}
+	return result
+}
+
+// SuggestReplacements suggests alternative modes for redundant pairs.
+func (r *RedundancyAnalysis) SuggestReplacements(catalog *ModeCatalog) []string {
+	if r == nil || catalog == nil {
+		return nil
+	}
+
+	highRedundancy := r.GetHighRedundancyPairs(0.5)
+	if len(highRedundancy) == 0 {
+		return []string{"No high-redundancy pairs found - mode selection is diverse"}
+	}
+
+	var suggestions []string
+	suggestedModes := make(map[string]bool)
+
+	for _, pair := range highRedundancy {
+		modeA := catalog.GetMode(pair.ModeA)
+		modeB := catalog.GetMode(pair.ModeB)
+		if modeA == nil || modeB == nil {
+			continue
+		}
+		if modeA.Category == modeB.Category {
+			for _, cat := range AllCategories() {
+				if cat == modeA.Category {
+					continue
+				}
+				alternatives := catalog.ListByCategory(cat)
+				for _, alt := range alternatives {
+					if alt.Tier == TierCore && !suggestedModes[alt.ID] {
+						suggestions = append(suggestions, fmt.Sprintf("Consider replacing %s with %s (%s) for more diverse analysis",
+							pair.ModeB, alt.ID, alt.Category))
+						suggestedModes[alt.ID] = true
+						break
+					}
+				}
+				if len(suggestions) > 0 {
+					break
+				}
+			}
+		}
+	}
+
+	if len(suggestions) == 0 {
+		suggestions = append(suggestions, "Redundant modes span multiple categories - consider domain-specific alternatives")
+	}
+	return suggestions
+}

@@ -2705,6 +2705,14 @@ func (s *Store) GCExpiredAuditEvents() (int64, error) {
 	return rowsAffected(result, err, "gc expired audit events")
 }
 
+// RecordAuditDecision inserts a compact decision-history record.
+func (s *Store) RecordAuditDecision(decision *AuditDecision) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return recordAuditDecisionExec(s.db, decision)
+}
+
 // GCExpiredAuditDecisions deletes expired decision-history entries.
 func (s *Store) GCExpiredAuditDecisions() (int64, error) {
 	s.mu.Lock()
@@ -2714,6 +2722,26 @@ func (s *Store) GCExpiredAuditDecisions() (int64, error) {
 		DELETE FROM audit_decision_log
 		WHERE expires_at IS NOT NULL AND expires_at < datetime('now')`)
 	return rowsAffected(result, err, "gc expired audit decisions")
+}
+
+// CompactAuditDecisionLog keeps only the most recent maxRows decisions.
+func (s *Store) CompactAuditDecisionLog(maxRows int) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if maxRows <= 0 {
+		return 0, nil
+	}
+
+	result, err := s.db.Exec(`
+		DELETE FROM audit_decision_log
+		WHERE id NOT IN (
+			SELECT id
+			FROM audit_decision_log
+			ORDER BY decision_at DESC, id DESC
+			LIMIT ?
+		)`, maxRows)
+	return rowsAffected(result, err, "compact audit decision log")
 }
 
 // =============================================================================

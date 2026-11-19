@@ -954,6 +954,9 @@ func dispatchRobotInspectionAndOps(cmd *cobra.Command, args []string) bool {
 			Panes:      paneFilter,
 			AgentTypes: agentTypes,
 		}
+		source, stopProgramStatus := programStatusSourceForSession(cmd.Context(), session)
+		defer stopProgramStatus()
+		opts.StatusDetector = programStatusDetector(source)
 		if err := robot.PrintActivity(opts); err != nil {
 			recordRobotProcessExit(err)
 		}
@@ -1043,6 +1046,9 @@ func dispatchRobotInspectionAndOps(cmd *cobra.Command, args []string) bool {
 			ProductivityWindow: productivityWindow,
 			ConvergedStreak:    robotConvergedStreak,
 		}
+		source, stopProgramStatus := programStatusSourceForSession(cmd.Context(), session)
+		defer stopProgramStatus()
+		opts.StatusDetector = programStatusDetector(source)
 		exitCode := robot.PrintWaitContext(cmd.Context(), opts)
 		recordLegacyRobotExit(exitCode)
 		return true

@@ -184,6 +184,28 @@ func parseMinIntOutput(output string) (int, error) {
 	return minVal, nil
 }
 
+func formatPaneTargetWithWindow(session string, windowIndex int, paneIndex int) string {
+	return fmt.Sprintf("%s:%d.%d", session, windowIndex, paneIndex)
+}
+
+func swarmTmuxPaneIndex(basePaneIndex, planPaneIndex int) (int, error) {
+	if planPaneIndex < 0 {
+		return 0, fmt.Errorf("plan pane index must be >= 0, got %d", planPaneIndex)
+	}
+	if planPaneIndex == 0 {
+		return basePaneIndex, nil
+	}
+	return basePaneIndex + (planPaneIndex - 1), nil
+}
+
+func swarmPaneTargetFromPlanIndex(session string, targeting swarmSessionTargeting, planPaneIndex int) (string, error) {
+	tmuxPaneIndex, err := swarmTmuxPaneIndex(targeting.BasePaneIndex, planPaneIndex)
+	if err != nil {
+		return "", err
+	}
+	return formatPaneTargetWithWindow(session, targeting.WindowIndex, tmuxPaneIndex), nil
+}
+
 // DefaultAgentCommands maps agent types to their default binary names.
 var DefaultAgentCommands = map[string]string{
 	"cc":       "claude",       // Claude Code CLI

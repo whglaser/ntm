@@ -809,3 +809,12 @@ func (a *CAAMAdapter) HasMultipleAccounts(ctx context.Context) bool {
 	}
 	return status.AccountsCount > 1
 }
+
+// GetActiveAccount returns the currently active account
+func (a *CAAMAdapter) GetActiveAccount(ctx context.Context) (*CAAMAccount, error) {
+	status, err := a.GetStatus(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return status.ActiveAccount, nil
+}

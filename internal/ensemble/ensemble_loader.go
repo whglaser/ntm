@@ -281,3 +281,8 @@ func GlobalEnsembleRegistry() (*EnsembleRegistry, error) {
 	})
 	return globalRegistry, globalRegistryErr
 }
+
+// Count returns the number of ensembles.
+func (r *EnsembleRegistry) Count() int {
+	return len(r.ensembles)
+}

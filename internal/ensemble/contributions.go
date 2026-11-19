@@ -1,9 +1,15 @@
 package ensemble
 
 import (
+	"encoding/json"
 	"sort"
 	"time"
 )
+
+// JSON returns the report as indented JSON.
+func (r *ContributionReport) JSON() ([]byte, error) {
+	return json.MarshalIndent(r, "", "  ")
+}
 
 // ContributionScore tracks a single mode's contribution to the ensemble.
 type ContributionScore struct {

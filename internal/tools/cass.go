@@ -342,3 +342,8 @@ func (a *CASSAdapter) runCommand(ctx context.Context, args ...string) (json.RawM
 
 	return output, nil
 }
+
+// GetCapabilities returns cass capabilities info
+func (a *CASSAdapter) GetCapabilities(ctx context.Context) (json.RawMessage, error) {
+	return a.runCommand(ctx, "capabilities", "--json")
+}

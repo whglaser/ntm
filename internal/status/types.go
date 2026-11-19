@@ -287,3 +287,26 @@ func (o SessionObservation) SafeToDispatch(paneID string) bool {
 func (s *AgentStatus) IsHealthy() bool {
 	return s.State == StateIdle || s.State == StateWorking
 }
+
+// IdleDuration returns how long the agent has been idle since LastActive
+func (s *AgentStatus) IdleDuration() time.Duration {
+	return time.Since(s.LastActive)
+}
+
+// Message returns a human-readable description of the error
+func (e ErrorType) Message() string {
+	switch e {
+	case ErrorRateLimit:
+		return "Rate limited - too many requests"
+	case ErrorCrash:
+		return "Agent crashed"
+	case ErrorAuth:
+		return "Authentication error"
+	case ErrorConnection:
+		return "Connection error"
+	case ErrorGeneric:
+		return "Error detected"
+	default:
+		return ""
+	}
+}

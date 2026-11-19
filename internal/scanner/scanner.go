@@ -406,3 +406,17 @@ func QuickScanWithOptions(ctx context.Context, path string, opts ScanOptions) (*
 	}
 	return scanner.Scan(ctx, path, opts)
 }
+
+// ScanStaged runs UBS on staged files only.
+func (s *Scanner) ScanStaged(ctx context.Context, dir string) (*ScanResult, error) {
+	opts := DefaultOptions()
+	opts.StagedOnly = true
+	return s.Scan(ctx, dir, opts)
+}
+
+// ScanDiff runs UBS on modified files only.
+func (s *Scanner) ScanDiff(ctx context.Context, dir string) (*ScanResult, error) {
+	opts := DefaultOptions()
+	opts.DiffOnly = true
+	return s.Scan(ctx, dir, opts)
+}

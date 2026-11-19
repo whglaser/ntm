@@ -20,6 +20,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/agentmail"
 	"github.com/Dicklesworthstone/ntm/internal/models"
 	"github.com/Dicklesworthstone/ntm/internal/notify"
+	"github.com/Dicklesworthstone/ntm/internal/persona"
 	"github.com/Dicklesworthstone/ntm/internal/redaction"
 	"github.com/Dicklesworthstone/ntm/internal/util"
 	"github.com/Dicklesworthstone/ntm/internal/worksource"
@@ -6337,4 +6338,26 @@ func Validate(cfg *Config) []error {
 	}
 
 	return errs
+}
+
+// IsPersonaName checks if the given name is a known persona by searching
+// built-in personas, user personas (~/.config/ntm/personas.toml), and
+// project personas (.ntm/personas.toml).
+//
+// Note: loads the persona registry from disk on each call. Avoid calling
+// in tight loops; cache the result if checking multiple names.
+func (c *Config) IsPersonaName(name string) bool {
+	if name == "" {
+		return false
+	}
+	projectDir := ""
+	if c != nil {
+		projectDir = c.GetProjectDir("")
+	}
+	registry, err := persona.LoadRegistry(projectDir)
+	if err != nil || registry == nil {
+		return false
+	}
+	p, ok := registry.Get(name)
+	return ok && p != nil
 }

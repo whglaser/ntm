@@ -1664,3 +1664,13 @@ func IsValidStrategy(name StrategyName) bool {
 		return false
 	}
 }
+
+// GetAllReservations returns all cached reservations.
+func (rc *ReservationCache) GetAllReservations() []agentmail.FileReservation {
+	rc.mu.RLock()
+	defer rc.mu.RUnlock()
+
+	result := make([]agentmail.FileReservation, len(rc.reservations))
+	copy(result, rc.reservations)
+	return result
+}

@@ -421,3 +421,6 @@ func fitToHeight(content string, targetHeight int) string {
 	}
 	return strings.Join(lines, "\n")
 }
+
+// Init implements tea.Model.
+func (m ModeVisualization) Init() tea.Cmd { return nil }
